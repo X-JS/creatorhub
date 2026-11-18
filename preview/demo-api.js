@@ -4,7 +4,7 @@
   const realFetch = window.fetch.bind(window);
   const engineDefaults = {
     xhs_read_mode: "api", douyin_read_mode: "hybrid", douyin_write_mode: "browser",
-    tiktok_read_mode: "native",
+    tiktok_read_mode: "native", channels_read_mode: "auto",
     douyin_profile_mode: "hybrid", douyin_followers_mode: "hybrid",
     douyin_dm_sync_mode: "hybrid", douyin_creator_danmaku_mode: "hybrid",
     douyin_publish_mode: "browser",
@@ -33,6 +33,77 @@
     native_write_require_verified_proxy: true, native_write_proxy_max_age_seconds: 86400,
   };
   const engineValues = { ...engineDefaults };
+  const channelsProto = {
+    connection_mode: "none",
+    proxy_enabled: false,
+    proxy_port: 2023,
+    proxy_running: false,
+    ca_trusted: false,
+    cdp_endpoint: "",
+    cdp_endpoint_file: "",
+    bridge_running: false,
+  };
+  function channelsProtoPayload() {
+    const readMode = engineValues.channels_read_mode || "auto";
+    const configured = Boolean(channelsProto.proxy_enabled || channelsProto.cdp_endpoint || channelsProto.cdp_endpoint_file);
+    const protocolUsable = channelsProto.proxy_enabled ? channelsProto.proxy_running : configured;
+    return {
+      platform: "shipinhao",
+      read_mode: readMode,
+      configured,
+      proxy_configured: Boolean(channelsProto.proxy_enabled),
+      endpoint_configured: Boolean(channelsProto.cdp_endpoint),
+      endpoint_file_configured: Boolean(channelsProto.cdp_endpoint_file),
+      config: {
+        read_mode: readMode,
+        connection_mode: channelsProto.connection_mode,
+        proxy_enabled: Boolean(channelsProto.proxy_enabled),
+        proxy_port: Number(channelsProto.proxy_port || 2023),
+        cdp_endpoint: channelsProto.cdp_endpoint,
+        cdp_endpoint_file: channelsProto.cdp_endpoint_file,
+        configured,
+        endpoint_file_info: channelsProto.cdp_endpoint_file
+          ? { path: channelsProto.cdp_endpoint_file, exists: channelsProto.bridge_running, valid: channelsProto.bridge_running, server_pid: channelsProto.bridge_running ? 1001 : null, server_running: channelsProto.bridge_running, error: channelsProto.bridge_running ? "" : "口令文件不存在" }
+          : null,
+        saved_fields: configured ? ["channels_proxy_enabled"] : [],
+      },
+      bridge: {
+        running: channelsProto.bridge_running,
+        bind_host: "127.0.0.1",
+        debug_listening_port: channelsProto.bridge_running ? 9421 : null,
+        cdp_listening_port: channelsProto.bridge_running ? 9422 : null,
+        allowed_native_pids: channelsProto.bridge_running ? [1001] : [],
+        native_connected: false,
+        cdp_connected: false,
+        commands_forwarded: 0,
+        results_forwarded: 0,
+        rejected_connections_or_packets: 0,
+        wechat_processes: [],
+      },
+      proxy: {
+        running: channelsProto.proxy_running,
+        state: channelsProto.proxy_running ? "waiting_wechat" : "stopped",
+        listen_host: "127.0.0.1",
+        proxy_port: Number(channelsProto.proxy_port || 2023),
+        system_proxy_managed: channelsProto.proxy_running,
+        system_proxy: { supported: true, proxy_enable: channelsProto.proxy_running, proxy_server: channelsProto.proxy_running ? `127.0.0.1:${channelsProto.proxy_port}` : "" },
+        ca: { exists: channelsProto.ca_trusted, trusted: channelsProto.ca_trusted, thumbprint: channelsProto.ca_trusted ? "DEMO1234567890" : "", store: channelsProto.ca_trusted ? "CurrentUser\\Root" : "" },
+        connected_pages: 0,
+        ready_pages: 0,
+        pages: [],
+        commands_forwarded: 0,
+        commands_succeeded: 0,
+      },
+      capabilities: {
+        account_works: true,
+        keyword_search: protocolUsable && readMode !== "browser",
+        creator_works: protocolUsable && readMode !== "browser",
+        full_comment_threads: protocolUsable && readMode !== "browser",
+        encrypted_video_decode: true,
+        share_preview: true,
+      },
+    };
+  }
   const now = Math.floor(Date.now() / 1000);
   const iso = (secondsAgo) => new Date(Date.now() - secondsAgo * 1000).toISOString().replace(/Z$/, "");
 
@@ -189,6 +260,10 @@
 
   function getData(url) {
     const path = url.pathname;
+    if (path === "/api/agent/settings") return { display_name:"", models:[], enabled:false, mcp_enabled:false, provider:"openai_compatible", base_url:"", model:"", api_key_set:false, tool_calling:true, output_token_parameter:"max_tokens", timeout_seconds:45, max_rounds:4, max_output_tokens:2048 };
+    if (path === "/api/agent/channels") return { active_channel_id:"default", channels:[{id:"default", display_name:"", models:[], enabled:false, mcp_enabled:false, provider:"openai_compatible", base_url:"", model:"", api_key_set:false, api_path_mode:"auto", tool_calling:true, output_token_parameter:"max_tokens", timeout_seconds:45, max_rounds:4, max_output_tokens:2048}] };
+    if (path === "/api/agent/runs") return [];
+    if (path === "/api/agent/context") return { accounts:{accounts:[]}, tasks:{tasks:[]}, metrics:{accounts:0, task_status_counts:{}} };
     const platform = url.searchParams.get("platform") || "douyin";
     if (path === "/api/overview/summary") return {
       platform, accounts: accounts.filter(item => item.platform === platform).length,
@@ -225,6 +300,8 @@
     if (/^\/api\/share-download\/history\/\d+\/preview$/.test(path)) return { media_type: "video", cover_url: "", medias: [] };
     if (path === "/api/notifications") return [{ id: 91, name: "演示通知渠道", type: "bark", enabled: true, config: {} }];
     if (path === "/api/settings") return { download_dir: "data/media", video_quality: "highest", ai_enabled: false, ai_base_url: "", ai_model: "", ai_temperature: "0.9", ai_prompt: "", ai_api_key_set: false };
+    if (path === "/api/channels/protocol/status" || path === "/api/channels/protocol/config") return channelsProtoPayload();
+    if (path === "/api/channels/protocol/discover") return { endpoints: [], wechat_processes: [], bridge: channelsProtoPayload().bridge };
     if (path === "/api/settings/engine") return {values: {...engineValues}, defaults: engineDefaults, saved_fields: [], apply_scope: "next_operation"};
     if (path === "/api/settings/transport-matrix") return transportMatrix();
     if (path === "/api/hub/summary") return { works: 3, following: 20, fans: 168, dm: 4 };
@@ -239,6 +316,28 @@
   }
 
   function actionData(path) {
+    if (path === "/api/channels/protocol/probe") return { ok: false, ready: false, configured: false, error: "在线演示模式不连接本机微信进程" };
+    if (path === "/api/channels/protocol/proxy/start") {
+      channelsProto.proxy_running = true;
+      channelsProto.proxy_enabled = true;
+      channelsProto.connection_mode = "proxy";
+      return { ok: true, ...getData(new URL("/api/channels/protocol/status", window.location.href)) };
+    }
+    if (path === "/api/channels/protocol/proxy/stop") {
+      channelsProto.proxy_running = false;
+      return { ok: true, ...getData(new URL("/api/channels/protocol/status", window.location.href)) };
+    }
+    if (path === "/api/channels/protocol/proxy/cert/install") {
+      channelsProto.ca_trusted = true;
+      return { ok: true, message: "演示模式已模拟信任本地 CA", ...getData(new URL("/api/channels/protocol/status", window.location.href)) };
+    }
+    if (path === "/api/channels/protocol/proxy/cert/uninstall") {
+      channelsProto.ca_trusted = false;
+      return { ok: true, message: "演示模式已移除根证书信任", ...getData(new URL("/api/channels/protocol/status", window.location.href)) };
+    }
+    if (path === "/api/channels/protocol/config" || path === "/api/channels/protocol/bridge/start" || path === "/api/channels/protocol/bridge/stop") {
+      return getData(new URL("/api/channels/protocol/status", window.location.href));
+    }
     if (path === "/api/share-download/links") return { count: 1, links: [{ platform: "douyin", host: "v.douyin.com", url: "https://v.douyin.com/DEMO/" }] };
     if (path === "/api/share-download") return { ok: true, results: [{ ok: true, platform: "douyin", title: "示例作品", author: "示例创作者", media_type: "video", media_count: 1, output_dir: "data/media/demo", files: [] }] };
     if (/\/run-now$/.test(path)) return { ok: true, created: 1, candidates: 1, review: true, new: 1, new_comments: 1 };
@@ -251,6 +350,9 @@
     const raw = typeof input === "string" ? input : input && input.url;
     const url = new URL(raw || "", window.location.href);
     if (!url.pathname.startsWith("/api/")) return realFetch(input, init);
+    if (url.pathname.startsWith("/api/agent/") && (init?.method || "GET").toUpperCase() !== "GET") {
+      return new Response(JSON.stringify({detail:"静态演示不连接模型、不保存密钥。请在本地运行 CreatorHub 后使用 AI 助手。"}), {status:403, headers:{"Content-Type":"application/json"}});
+    }
     await new Promise((resolve) => setTimeout(resolve, 90));
     const method = String((init && init.method) || "GET").toUpperCase();
     if (method === "GET" && url.pathname === "/api/reports/share-download-history.xlsx") {
@@ -263,6 +365,26 @@
       });
     }
     if (method === "PUT" && url.pathname === "/api/settings/engine") Object.assign(engineValues, JSON.parse(init.body));
+    if (url.pathname === "/api/channels/protocol/config") {
+      if (method === "PUT") {
+        const body = JSON.parse(init.body || "{}");
+        if (body.channels_read_mode) engineValues.channels_read_mode = body.channels_read_mode;
+        if (body.connection_mode) channelsProto.connection_mode = body.connection_mode;
+        if (body.connection_mode === "proxy") channelsProto.proxy_enabled = true;
+        else if (body.connection_mode) channelsProto.proxy_enabled = false;
+        if ("channels_proxy_enabled" in body) channelsProto.proxy_enabled = Boolean(body.channels_proxy_enabled);
+        if ("channels_proxy_port" in body && body.channels_proxy_port) channelsProto.proxy_port = Number(body.channels_proxy_port);
+        if ("channels_cdp_endpoint" in body) channelsProto.cdp_endpoint = body.channels_cdp_endpoint || "";
+        if ("channels_cdp_endpoint_file" in body) channelsProto.cdp_endpoint_file = body.channels_cdp_endpoint_file || "";
+      } else if (method === "DELETE") {
+        channelsProto.connection_mode = "none";
+        channelsProto.proxy_enabled = false;
+        channelsProto.proxy_port = 2023;
+        channelsProto.cdp_endpoint = "";
+        channelsProto.cdp_endpoint_file = "";
+      }
+      return new Response(JSON.stringify(channelsProtoPayload()), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
+    }
     const data = method === "GET" || url.pathname === "/api/settings/engine" ? getData(url) : actionData(url.pathname);
     return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
   };

@@ -101,6 +101,9 @@ class WindowsReleaseTests(unittest.TestCase):
         dependencies = next(s for s in steps if s.get('name') == 'Install build dependencies')['run']
         self.assertIn(' pytest ', dependencies)
         checks = next(s for s in steps if s.get('name') == 'Test monitor API and frontend contracts')['run']
+        self.assertIn('faulthandler_timeout=90', checks)
+        monitor_gate = next(s for s in steps if s.get('name') == 'Test monitor API and frontend contracts')
+        self.assertEqual(monitor_gate['timeout-minutes'], '10')
         for test in ('test_monitor_accounts.py', 'test_monitor_intervals.py', 'test_engine_settings.py', 'test_web_optimizations.py'):
             self.assertIn(test, checks)
         smoke = (ROOT / 'desktop/smoke_windows.py').read_text(encoding='utf-8')
@@ -123,6 +126,23 @@ class WindowsReleaseTests(unittest.TestCase):
                      'test_tiktok_download.py', 'test_tiktok_actions.py',
                      'test_kuaishou_current.py', 'test_signature_protocols.py',
                      'test_web_status_labels.py'):
+            self.assertIn(f'tests/{test}', checks)
+            self.assertTrue((ROOT / 'tests' / test).is_file())
+
+    def test_channels_and_agent_regressions_gate_packaging(self):
+        steps = self.jobs['windows']['steps']
+        names = [step.get('name', step.get('uses')) for step in steps]
+        gate = 'Test Channels protocol and AI assistant'
+        self.assertLess(names.index(gate), names.index('Package Python, application and offline guide'))
+        checks = next(step['run'] for step in steps if step.get('name') == gate)
+        self.assertIn('python -m pytest', checks)
+        for test in ('test_channels_capabilities.py', 'test_channels_proxy.py',
+                     'test_channels_protocol_ui.py', 'test_channels_login.py',
+                     'test_channels_repost.py', 'test_channels_sync.py',
+                     'test_agent_catalog.py', 'test_agent_channels.py',
+                     'test_agent_conversations.py', 'test_agent_provider_settings.py',
+                     'test_agent_response_formats.py', 'test_agent_streaming.py',
+                     'test_agent_telemetry.py'):
             self.assertIn(f'tests/{test}', checks)
             self.assertTrue((ROOT / 'tests' / test).is_file())
 

@@ -96,16 +96,36 @@ def test_bundled_node_does_not_need_system_node(tmp_path, monkeypatch):
     assert find_node() == str(node)
 
 
-def test_frozen_execjs_uses_absolute_node_with_empty_path(monkeypatch):
+@pytest.mark.parametrize("frozen", [True, False])
+def test_execjs_uses_absolute_node_and_utf8_even_with_ansi_locale(monkeypatch, frozen):
     import shutil
     from app.platforms.xhs import creator_sign
     node = shutil.which("node")
     assert node, "Build tests require Node (the installer bundles its own runtime)"
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "frozen", frozen, raising=False)
     monkeypatch.setattr(creator_sign, "find_node", lambda: node)
     monkeypatch.setattr(creator_sign, "_JS_CACHE", {})
     monkeypatch.setenv("PATH", "")
-    assert creator_sign._ctx("xhs_rap.js").eval("1 + 1") == 2
+    # Match English Windows even when the test interpreter itself uses UTF-8.
+    monkeypatch.setattr(subprocess, "_text_encoding", lambda: "cp1252")
+    context = creator_sign._ctx("xhs_rap.js")
+    assert context.eval("1 + 1") == 2
+    assert context.eval("'中文输入输出😀'") == "中文输入输出😀"
+    import execjs
+    with pytest.raises(execjs.ProgramError, match="中文错误"):
+        context.exec_("throw new Error('中文错误')")
+
+
+def test_execjs_pipe_has_a_bounded_runtime(monkeypatch):
+    from app.platforms.xhs import creator_sign
+    monkeypatch.setattr(creator_sign, "find_node", lambda: "node")
+    monkeypatch.setattr(creator_sign, "_JS_CACHE", {})
+    run = Mock(side_effect=subprocess.TimeoutExpired("node", 30))
+    monkeypatch.setattr(creator_sign.subprocess, "run", run)
+    with pytest.raises(subprocess.TimeoutExpired):
+        creator_sign._ctx("xhs_rap.js").eval("1 + 1")
+    assert run.call_args.kwargs["encoding"] == "utf-8"
+    assert run.call_args.kwargs["timeout"] == 30
 
 
 def test_windows_and_mac_bundles_exclude_unused_heavy_dependencies():
@@ -116,8 +136,16 @@ def test_windows_and_mac_bundles_exclude_unused_heavy_dependencies():
             assert options[index - 1] == "--exclude-module"
         assert options[options.index("app") - 1] == "--collect-submodules"
         assert options[options.index("pywebview") - 1] == "--copy-metadata"
+        assert options[options.index("cryptography") - 1] == "--copy-metadata"
     mac = dependency_options("macos")
     assert mac[mac.index("pythonnet") - 1] == "--exclude-module"
+
+
+def test_runtime_requirements_declare_channels_proxy_and_bridge_dependencies():
+    root = Path(__file__).resolve().parents[1]
+    reqs = (root / "requirements.txt").read_text(encoding="utf-8")
+    assert "cryptography>=" in reqs
+    assert "websockets>=13" in reqs
 
 
 def test_update_restart_does_not_replay_tasks(tmp_path):
