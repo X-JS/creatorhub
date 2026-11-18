@@ -44,6 +44,7 @@ config.yaml
 # 内部方案文档(不随公开仓库发布)
 docs/
 
+<<<<<<< Updated upstream
 # 品牌图标设计稿(暂不随仓库提交)
 assets/brand/
 
@@ -52,3 +53,9 @@ _ref/
 
 # pytest 临时目录(系统临时目录不可写时会落到项目根目录)
 pytest-of-*/
+=======
+# AI
+.ua/
+graphify-out/
+.playwright-mcp/
+>>>>>>> Stashed changes
