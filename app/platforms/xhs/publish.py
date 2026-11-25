@@ -5,6 +5,7 @@ import asyncio
 import contextvars
 import inspect
 import json
+import logging
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import ExitStack
@@ -15,7 +16,7 @@ from ...browser.identity import Identity
 from ...browser.manager import BrowserManager
 from .._submit import notify_stage as _notify_stage
 from .browser_writes import XhsWriteOutcome, publish_xhs_browser
-from .client import XhsApiError, cookie_str_from_state, has_a1
+from .client import XhsApiError, cookie_str_from_state, extract_b1_from_state, has_a1
 from .deadline import PublishCancelEvent, deadline_after, remaining_seconds, timeout_error
 from .media import snapshot_publish_files, validate_publish_files
 from .responses import validate_payload
@@ -44,9 +45,8 @@ def _creator_response_error(response):
 def _api_privacy_type(visibility: str) -> int:
     """Creator's privacy_info.type: 0=public, 1=private.
 
-    Keep an explicit map instead of inheriting an upstream demo's default.
-    See ReaJason/xhs core.py create_note(is_private) and Spider_XHS's payload
-    builders. Additional scopes need their own verified API contract first.
+    Keep an explicit visibility map so unsupported scopes fail fast unless
+    their dedicated API contract has been verified.
     """
     values = {"public": 0, "private": 1}
     key = str(visibility or "").strip().lower()
@@ -57,6 +57,7 @@ def _api_privacy_type(visibility: str) -> int:
 
 def _publish_api_sync(cookie_str: str, media_type: str, title: str, desc: str,
                       files: List[str], topics: List[str], proxy: str = "", *,
+                      user_agent: str = "", storage_state_json: str = "",
                       visibility: str = "public", on_submit=None,
                       cancel_event: threading.Event | None = None,
                       preserve_error: bool = False, deadline: float | None = None,
@@ -106,8 +107,15 @@ def _publish_api_sync(cookie_str: str, media_type: str, title: str, desc: str,
             # Close HTTP transports before deleting the private snapshots.
             blobs = stack.enter_context(snapshot_publish_files(
                 media_type, files, check_active=check_active))
-            api = XhsCreatorApi(cookie_str, proxy=proxy, cancel_event=cancel_event,
-                                deadline=deadline)
+            api = XhsCreatorApi(
+                cookie_str,
+                proxy=proxy,
+                user_agent=user_agent,
+                b1=extract_b1_from_state(storage_state_json),
+                storage_state=storage_state_json,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
             stack.callback(api.close)
             if media_type == "video":
                 ok, msg, j = api.post_note(media_type="video", title=title, desc=desc,
@@ -134,6 +142,7 @@ async def publish_xhs(mgr: BrowserManager, identity: Identity, storage_state_jso
                       timeout_seconds: int = 180,
                       mode: str = "browser",
                       visibility: str = "public",
+                      user_agent: str = "",
                       on_submit=None, preserve_error: bool = False,
                       on_stage=None
                       ) -> Tuple[bool, str, str | XhsApiError]:
@@ -149,6 +158,7 @@ async def publish_xhs(mgr: BrowserManager, identity: Identity, storage_state_jso
         return False, "", str(exc)
     cookie_str = cookie_str_from_state(storage_state_json)
     proxy = identity.proxy if identity else ""
+    effective_ua = str(user_agent or (getattr(identity, "ua", "") if identity else "") or "").strip()
     title = (title or "").strip()[:20]
     desc = (desc or "")[:1000]
     tags = [t.strip().lstrip("#") for t in (topics or "").split(",") if t.strip()]
@@ -207,6 +217,7 @@ async def publish_xhs(mgr: BrowserManager, identity: Identity, storage_state_jso
 
     work = partial(
         _publish_api_sync, cookie_str, media_type, title, desc, files, tags, proxy,
+        user_agent=effective_ua, storage_state_json=storage_state_json,
         visibility=visibility, on_submit=notify_from_worker, cancel_event=cancel_event,
         preserve_error=preserve_error, deadline=deadline, verify_signing=True)
     # Keep the executor future outside all_tasks(): loop-wide task cancellation
@@ -239,8 +250,67 @@ async def publish_xhs(mgr: BrowserManager, identity: Identity, storage_state_jso
         timeout_handle.cancel()
 
 
-async def creator_check(storage_state_json: str, proxy: str = "", *,
-                        preserve_error: bool = False):
+async def creator_check_with_state(
+    storage_state_json: str,
+    proxy: str = "",
+    user_agent: str = "",
+    *,
+    preserve_error: bool = False,
+):
+    """校验创作者登录态，并在有效时同步导出刷新后的 creator_storage_state。
+
+    返回 ``(valid, error, refreshed_state, changed)``。
+    """
+    cookie_str = cookie_str_from_state(storage_state_json)
+    if not has_a1(cookie_str):
+        error = XhsApiError(
+            "登录态缺少 a1", category="auth", signal="auth_expired")
+        return False, (error if preserve_error else str(error)), None, False
+    try:
+        from . import creator_sign
+        if not creator_sign.available():
+            return None, "creator_sign_unavailable", None, False
+    except Exception as exc:
+        return None, (exc if preserve_error else str(exc)), None, False
+
+    def _run():
+        from .creator_api import XhsCreatorApi
+        api = XhsCreatorApi(
+            cookie_str,
+            proxy=proxy,
+            user_agent=user_agent,
+            b1=extract_b1_from_state(storage_state_json),
+            storage_state=storage_state_json,
+        )
+        try:
+            result = api.ping(detailed=True)
+            if len(result) == 3:
+                ok, msg, response = result
+            else:
+                ok, msg = result
+                response = {"success": ok, "msg": msg}
+            refreshed, changed = (
+                api.export_refreshed_state(storage_state_json)
+                if ok else (None, False)
+            )
+            return ok, msg, response, refreshed, changed
+        finally:
+            api.close()
+
+    try:
+        ok, msg, response, refreshed, changed = await asyncio.to_thread(_run)
+        if ok:
+            return True, "", refreshed, bool(changed)
+        error = _creator_response_error(response)
+        valid = False if isinstance(error, XhsApiError) and error.category == "auth" else None
+        return valid, (error if preserve_error else str(error)), None, False
+    except Exception as exc:
+        valid = False if isinstance(exc, XhsApiError) and exc.category == "auth" else None
+        return valid, (exc if preserve_error else str(exc)), None, False
+
+
+async def creator_check(storage_state_json: str, proxy: str = "",
+                        user_agent: str = "", *, preserve_error: bool = False):
     """校验创作者登录态。True=有效,False=确已失效,None=不确定(网络/环境,勿据此判失效)。"""
     cookie_str = cookie_str_from_state(storage_state_json)
     if not has_a1(cookie_str):
@@ -256,7 +326,13 @@ async def creator_check(storage_state_json: str, proxy: str = "", *,
 
     def _run():
         from .creator_api import XhsCreatorApi
-        api = XhsCreatorApi(cookie_str, proxy=proxy)
+        api = XhsCreatorApi(
+            cookie_str,
+            proxy=proxy,
+            user_agent=user_agent,
+            b1=extract_b1_from_state(storage_state_json),
+            storage_state=storage_state_json,
+        )
         try:
             result = api.ping(detailed=True)
             if len(result) == 3:
@@ -277,8 +353,8 @@ async def creator_check(storage_state_json: str, proxy: str = "", *,
         return (valid, exc) if preserve_error else valid
 
 
-async def creator_profile(storage_state_json: str, proxy: str = "", *,
-                          preserve_error: bool = False):
+async def creator_profile(storage_state_json: str, proxy: str = "",
+                          user_agent: str = "", *, preserve_error: bool = False):
     """用创作平台接口拿账号资料(昵称/小红书号/头像/粉丝/笔记数)。返回 parsed dict 或 None。"""
     cookie_str = cookie_str_from_state(storage_state_json)
     if not has_a1(cookie_str):
@@ -292,7 +368,13 @@ async def creator_profile(storage_state_json: str, proxy: str = "", *,
 
     def _run():
         from .creator_api import XhsCreatorApi, parse_creator_user
-        api = XhsCreatorApi(cookie_str, proxy=proxy)
+        api = XhsCreatorApi(
+            cookie_str,
+            proxy=proxy,
+            user_agent=user_agent,
+            b1=extract_b1_from_state(storage_state_json),
+            storage_state=storage_state_json,
+        )
         try:
             ok, d, response = api.my_info(detailed=True)
             if ok and d:
@@ -308,17 +390,21 @@ async def creator_profile(storage_state_json: str, proxy: str = "", *,
 
 
 _LIST_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+            "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
 
 
-async def list_published(storage_state_json: str, proxy: str = "") -> Tuple[bool, str, list]:
+async def list_published(storage_state_json: str, proxy: str = "",
+                         user_agent: str = "") -> Tuple[bool, str, list]:
     """获取该账号「已发布作品列表」。用网页 user_posted 接口(按自己的 user_id 拉,
     与监控同一套,稳定可靠);创作平台 note/user/posted 接口已不稳定,不再用。"""
     cookie_str = cookie_str_from_state(storage_state_json)
     if not has_a1(cookie_str):
         return False, "登录态缺少 a1,请重新登录", []
     from .client import XhsApiClient, XhsApiError
-    client = XhsApiClient(cookie_str, _LIST_UA, proxy=proxy)
+    eff_ua = str(user_agent or "").strip() or _LIST_UA
+    client = XhsApiClient(
+        cookie_str, eff_ua, proxy=proxy, storage_state=storage_state_json
+    )
     # 1) 取自己的 user_id
     uid = ""
     try:
@@ -327,7 +413,9 @@ async def list_published(storage_state_json: str, proxy: str = "") -> Tuple[bool
     except Exception:
         uid = ""
     if not uid:
-        prof = await creator_profile(storage_state_json, proxy=proxy)   # 创作平台资料兜底
+        prof = await creator_profile(
+            storage_state_json, proxy=proxy, user_agent=eff_ua
+        )   # 创作平台资料兜底
         uid = (prof or {}).get("sec_uid") or ""
     if not uid:
         return False, "拿不到账号 user_id(请先「刷新资料」或重新登录)", []
@@ -335,8 +423,11 @@ async def list_published(storage_state_json: str, proxy: str = "") -> Tuple[bool
     try:
         d = await client.notes_by_creator(uid)
         notes = d.get("notes") or []
-        print(f"[xhs_published_web] uid={uid} got={len(notes)} "
-              f"note0_keys={list(notes[0].keys()) if notes else []}")
+        logging.getLogger("creatorhub.publish.xhs").debug(
+            "xhs_published_web got=%d note0_keys=%s",
+            len(notes),
+            list(notes[0].keys()) if notes else [],
+        )
         return True, "ok", notes
     except XhsApiError as e:
         return False, str(e), []

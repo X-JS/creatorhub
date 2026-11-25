@@ -1,11 +1,14 @@
-"""抖音 Web 客户端。对应逆向 internal/douyin.NativeClient。
+"""抖音 Web API 异步直连客户端。
 负责:拼接公共参数 + a_bogus 签名 + 携带 Cookie 请求 douyin.com Web API。
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import logging
+import random
 import time
 import urllib.parse
 import uuid
@@ -31,7 +34,8 @@ from .web_session import (
     DETAIL_ORIGINS, DETAIL_PATH, cookie_header, cookie_value,
     observed_detail_context, read_state,
 )
-from ...netfp import impersonate_for_ua
+from ...browser.manager import normalize_proxy
+from ...netfp import curl_proxy_url, impersonate_for_ua
 
 BASE = "https://www.douyin.com"
 WRITE_BASE = "https://www-hj.douyin.com"
@@ -49,6 +53,9 @@ SECURE_SDK_WRITE_PATHS = frozenset({
 SEARCH_STREAM_PATH = "/aweme/v1/web/general/search/stream/"
 SEARCH_SINGLE_PATH = "/aweme/v1/web/general/search/single/"
 SEARCH_PATHS = frozenset({SEARCH_SINGLE_PATH, SEARCH_STREAM_PATH})
+SEARCH_MAX_PAGE_SIZE = 20
+SEARCH_PAGE_DELAY_RANGE = (0.65, 1.25)
+SEARCH_EMPTY_RETRY_DELAYS = (1.6, 3.0)
 
 
 def cookie_from_state(storage_state_json: str) -> str:
@@ -94,6 +101,59 @@ DEFAULT_PARAMS = {
 }
 
 
+def _ua_client_params(ua: str) -> Dict[str, str]:
+    """Derive coherent OS, browser, Client-Hints, and pc_libra_divert params from UA."""
+    s = str(ua or "")
+    is_mac = "Macintosh" in s or "Mac OS" in s
+    is_linux = not is_mac and ("Linux" in s and "Android" not in s)
+    if is_mac:
+        browser_platform = "MacIntel"
+        os_name = "Mac OS"
+        m_mac = re.search(r"Mac OS X (\d+[._]\d+(?:[._]\d+)?)", s)
+        os_version = m_mac.group(1).replace(".", "_") if m_mac else "10_15_7"
+        pc_libra_divert = "Mac"
+        ch_platform = '"macOS"'
+    elif is_linux:
+        browser_platform = "Linux x86_64"
+        os_name = "Linux"
+        os_version = ""
+        pc_libra_divert = "Windows"
+        ch_platform = '"Linux"'
+    else:
+        browser_platform = "Win32"
+        os_name = "Windows"
+        os_version = "10"
+        pc_libra_divert = "Windows"
+        ch_platform = '"Windows"'
+
+    is_edge = "Edg/" in s
+    browser_name = "Edge" if is_edge else "Chrome"
+    m_chr = re.search(r"Chrome/(\d+)", s)
+    m_edg = re.search(r"Edg/(\d+)", s)
+    browser_major = (
+        int(m_edg.group(1))
+        if (is_edge and m_edg)
+        else (int(m_chr.group(1)) if m_chr else 130)
+    )
+    engine_major = int(m_chr.group(1)) if m_chr else browser_major
+    brand = "Microsoft Edge" if is_edge else "Google Chrome"
+    return {
+        "browser_platform": browser_platform,
+        "browser_name": browser_name,
+        "browser_version": f"{browser_major}.0.0.0",
+        "engine_version": f"{engine_major}.0.0.0",
+        "os_name": os_name,
+        "os_version": os_version,
+        "pc_libra_divert": pc_libra_divert,
+        "sec-ch-ua": (
+            f'"Chromium";v="{engine_major}", "{brand}";v="{browser_major}", '
+            '"Not_A Brand";v="99"'
+        ),
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": ch_platform,
+    }
+
+
 class DouyinClient:
     def __init__(self, cookie: str, user_agent: str, timeout: float = 20.0,
                  proxy: str = "", *, locale: str = "zh-CN",
@@ -103,13 +163,14 @@ class DouyinClient:
         self.cookie = cookie or ""
         self.ua = user_agent
         self.timeout = timeout
-        self.proxy = (proxy or "").strip()
+        self.proxy = curl_proxy_url(proxy) if proxy else ""
         self.locale = str(locale or "zh-CN")
         self.accept_language = (str(accept_language or "").strip()
                                 or f"{self.locale},{self.locale.split('-', 1)[0]};q=0.9")
         self.screen_width = max(320, int(screen_width or 1536))
         self.screen_height = max(240, int(screen_height or 864))
-        self.impersonate = impersonate_for_ua(user_agent)  # TLS 指纹复刻,绕 JA3 风控
+        self.impersonate = impersonate_for_ua(user_agent)  # 对齐浏览器 TLS 握手指纹
+        self._ua_params = _ua_client_params(self.ua)
         self._session: AsyncSession | None = None
         self._ms_token: str | None = None
         self._token_source = ""
@@ -146,7 +207,7 @@ class DouyinClient:
         if self._session is not None:
             yield self
             return
-        self._session = AsyncSession(impersonate=self.impersonate)
+        self._session = AsyncSession(impersonate=self.impersonate, trust_env=False)
         try:
             yield self
         finally:
@@ -161,6 +222,9 @@ class DouyinClient:
             "Referer": referer,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": self.accept_language,
+            "sec-ch-ua": self._ua_params["sec-ch-ua"],
+            "sec-ch-ua-mobile": self._ua_params["sec-ch-ua-mobile"],
+            "sec-ch-ua-platform": self._ua_params["sec-ch-ua-platform"],
             "Cookie": cookie_header(self._cookies, url),
         }
         parsed = urllib.parse.urlsplit(url)
@@ -241,6 +305,11 @@ class DouyinClient:
                 if webid.isdigit() and len(webid) <= 32:
                     result["webid"] = webid
             break
+        if "webid" not in result:
+            seed_cookie = self.cookie or cookie_header(self._cookies, BASE + "/")
+            digest = hashlib.sha256(f"{seed_cookie}|{self.ua}".encode("utf-8")).digest()
+            tail = int.from_bytes(digest[:16], "big") % (10 ** 17)
+            result["webid"] = f"73{tail:017d}"
         visitor = cookie_value(self._cookies, BASE + "/", "s_v_web_id")
         if visitor and len(visitor) <= 256 and not re.search(r"[\s;&]", visitor):
             result.update(verifyFp=visitor, fp=visitor)
@@ -373,22 +442,23 @@ class DouyinClient:
             q = dict(self.detail_context.get("params") or {})
         else:
             q = dict(DEFAULT_PARAMS)
+            ua_info = _ua_client_params(self.ua)
             # Cookie, UA, locale and viewport belong to the same account.
             q.update({
                 "screen_width": str(self.screen_width),
                 "screen_height": str(self.screen_height),
                 "browser_language": self.locale,
+                "browser_platform": ua_info["browser_platform"],
+                "browser_name": ua_info["browser_name"],
+                "browser_version": ua_info["browser_version"],
+                "engine_version": ua_info["engine_version"],
+                "os_name": ua_info["os_name"],
+                "os_version": ua_info["os_version"],
             })
-            # Keep query browser versions aligned with the account's UA.
-            m = re.search(r"Chrome/(\d+)", self.ua or "")
-            if m:
-                ver = f"{m.group(1)}.0.0.0"
-                q["browser_version"] = ver
-                q["engine_version"] = ver
             q.update(self._account_query)
             if self._normalized_path(path) in SECURE_SDK_WRITE_PATHS:
                 q.update({
-                    "pc_libra_divert": "Windows",
+                    "pc_libra_divert": ua_info["pc_libra_divert"],
                     "update_version_code": "170400",
                     "support_h265": "0",
                     "support_dash": "0",
@@ -425,7 +495,7 @@ class DouyinClient:
     def _abogus_fingerprint(self) -> str:
         """Build the signer fingerprint from the account's stable viewport."""
         width, height = self.screen_width, self.screen_height
-        platform = "MacIntel" if "Macintosh" in self.ua else "Win32"
+        platform = _ua_client_params(self.ua)["browser_platform"]
         return (
             f"{width}|{height}|{width + 24}|{height + 80}|0|0|0|0|"
             f"{width}|{height}|{width}|{height}|{width}|{height}|24|24|"
@@ -442,7 +512,7 @@ class DouyinClient:
                                   "rejection_reason": "missing_uifid", "request_sent": False}
             return []
         owned = self._session is None
-        cli = self._session or AsyncSession(impersonate=self.impersonate)
+        cli = self._session or AsyncSession(impersonate=self.impersonate, trust_env=False)
         try:
             await self._prepare_ms_token(self._api_origin(path) + path)
             url = self._build_url(path, params)
@@ -471,8 +541,13 @@ class DouyinClient:
                     self.last_error, reason = detail_http_error(r.status_code, r.content)
                     if reason:
                         self.last_response["rejection_reason"] = reason
-                print(f"[dy-client] {path} → HTTP {r.status_code} len={len(r.content)}"
-                      f"{' (空 body:多半被风控拒,非无数据)' if r.status_code == 200 else ''}")
+                logging.getLogger("creatorhub.douyin.client").warning(
+                    "%s -> HTTP %s len=%d%s",
+                    path,
+                    r.status_code,
+                    len(r.content),
+                    " (空 body:多半触发风控拦截)" if r.status_code == 200 else "",
+                )
                 return []
             try:
                 payload = r.json()
@@ -494,7 +569,12 @@ class DouyinClient:
                 self.last_error = ("risk:verification_required:html" if re.search(
                     r"<title[^>]*>[^<]*(?:验证码中间页|安全验证|人机验证)", body, re.I)
                     else "invalid_json")
-                print(f"[dy-client] {path} → 非 JSON len={len(r.content)}")
+                logging.getLogger("creatorhub.douyin.client").warning(
+                    "%s -> 非 JSON 响应 (%s, len=%d)",
+                    path,
+                    self.last_error,
+                    len(r.content),
+                )
                 return []
         except Exception as exc:
             self.last_error = f"network:{type(exc).__name__}"
@@ -522,7 +602,7 @@ class DouyinClient:
         self.last_response = {}
         self.last_write_uncertain = False
         owned = self._session is None
-        cli = self._session or AsyncSession(impersonate=self.impersonate)
+        cli = self._session or AsyncSession(impersonate=self.impersonate, trust_env=False)
         try:
             await self._prepare_ms_token(self._api_origin(path) + path)
             # a_bogus hashes the exact application/x-www-form-urlencoded body.
@@ -712,7 +792,7 @@ class DouyinClient:
         self.last_error = ""
         self.last_write_uncertain = False
         owned = self._session is None
-        cli = self._session or AsyncSession(impersonate=self.impersonate)
+        cli = self._session or AsyncSession(impersonate=self.impersonate, trust_env=False)
         referer = f"{BASE}/user/{target_sec_uid or target_uid}"
         try:
             body = build_create_conversation_request(
@@ -765,7 +845,7 @@ class DouyinClient:
         self.last_error = ""
         self.last_write_uncertain = False
         owned = self._session is None
-        cli = self._session or AsyncSession(impersonate=self.impersonate)
+        cli = self._session or AsyncSession(impersonate=self.impersonate, trust_env=False)
         try:
             body = build_send_request(
                 str(conv_id), int(conv_type or 1), int(conv_short_id), str(ticket),
@@ -858,7 +938,7 @@ class DouyinClient:
 
         self.last_error = ""
         owned = self._session is None
-        cli = self._session or AsyncSession(impersonate=self.impersonate)
+        cli = self._session or AsyncSession(impersonate=self.impersonate, trust_env=False)
         try:
             body = build_init_request(
                 int(time.time() * 1_000_000), **self._im_request_options())
@@ -917,6 +997,16 @@ class DouyinClient:
                 await cli.close()
                 self._ms_token = None
 
+    @staticmethod
+    def _as_bool_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "none", "null"}
+        return bool(value)
+
     async def search_awemes_page(self, keyword: str, *, offset: int = 0,
                                  count: int = 20, search_sort: str = "general",
                                  publish_time: str = "all",
@@ -925,17 +1015,18 @@ class DouyinClient:
         from ...browser.fetcher import extract_search_awemes
         sort_codes = {"general": "0", "most_liked": "1", "latest": "2"}
         time_codes = {"all": "0", "day": "1", "week": "7", "half_year": "180"}
+        current_offset = max(0, int(offset or 0))
         params = {
             "keyword": keyword,
             "search_channel": "aweme_general",
             "search_source": "tab_search",
             "query_correct_type": "1",
             "is_filter_search": "0",
-            "offset": max(0, int(offset or 0)),
-            "count": max(1, min(50, int(count or 15))),
+            "offset": current_offset,
+            "count": max(1, min(SEARCH_MAX_PAGE_SIZE, int(count or 15))),
             "list_type": "multi",
             "search_id": self._search_id,
-            "need_filter_settings": "1",
+            "need_filter_settings": "1" if current_offset == 0 else "0",
             "enable_history": "1",
             "from_group_id": "",
             "type": "video" if content_type == "video" else None,
@@ -963,15 +1054,18 @@ class DouyinClient:
                 SEARCH_STREAM_PATH, stream_params,
                 referer=f"{BASE}/search/{urllib.parse.quote(keyword, safe='')}")
         if not payloads:
-            return {"items": [], "has_more": False, "offset": offset,
-                    "error": self.last_error or "empty_response"}
+            return {"items": [], "has_more": False, "offset": current_offset,
+                    "raw_count": 0, "error": self.last_error or "empty_response"}
         found: Dict[str, dict] = {}
         has_more = False
-        next_offset = offset
+        server_next_offset = 0
+        raw_entry_count = 0
         for data in payloads:
             next_search_id = str(
                 (data.get("extra") or {}).get("logid")
-                or (data.get("log_pb") or {}).get("impr_id") or "")
+                or (data.get("log_pb") or {}).get("impr_id")
+                or data.get("search_id")
+                or "")
             if next_search_id:
                 self._search_id = next_search_id
             code = data.get("status_code")
@@ -981,51 +1075,136 @@ class DouyinClient:
                 if str(code) in {"8", "2483"} or any(word in marker for word in (
                         "未登录", "登录后", "请先登录", "login")):
                     self.last_error = "logged_out"
-                    return {"items": [], "has_more": False, "offset": offset,
-                            "error": "logged_out"}
+                    return {"items": [], "has_more": False, "offset": current_offset,
+                            "raw_count": 0, "error": "logged_out"}
                 if any(word in marker for word in (
                         "verify", "captcha", "risk", "验证", "风控")):
                     self.last_error = "verification_required"
-                    return {"items": [], "has_more": False, "offset": offset,
-                            "error": "verification_required"}
+                    return {"items": [], "has_more": False, "offset": current_offset,
+                            "raw_count": 0, "error": "verification_required"}
                 self.last_error = f"api_rejected:status_code={code}"
-                return {"items": [], "has_more": False, "offset": offset,
-                        "error": self.last_error}
+                return {"items": [], "has_more": False, "offset": current_offset,
+                        "raw_count": 0, "error": self.last_error}
             nil_info = data.get("search_nil_info") or {}
             marker = " ".join(str(nil_info.get(k) or "") for k in
                               ("search_nil_type", "search_nil_item", "text_type"))
             if any(word in marker.casefold() for word in ("verify", "captcha", "risk")):
                 self.last_error = "verification_required"
-                return {"items": [], "has_more": False, "offset": offset,
-                        "error": "verification_required"}
+                return {"items": [], "has_more": False, "offset": current_offset,
+                        "raw_count": 0, "error": "verification_required"}
+            for list_key in ("data", "aweme_list"):
+                raw_list = data.get(list_key)
+                if isinstance(raw_list, list):
+                    raw_entry_count += len(raw_list)
             for item in extract_search_awemes(data):
                 found.setdefault(str(item.get("aweme_id") or ""), item)
-            has_more = has_more or bool(data.get("has_more") or data.get("has_more_item"))
-            next_offset = max(next_offset, int(data.get("offset") or 0))
+            has_more = (
+                has_more
+                or self._as_bool_flag(data.get("has_more"))
+                or self._as_bool_flag(data.get("has_more_item"))
+            )
+            # 抖音 general/search/single 与 stream 响应的下一页游标字段通常是 cursor，
+            # 兼容 offset / next_offset，且不再用当前 offset 兜底短路递增逻辑。
+            for cursor_key in ("cursor", "offset", "next_offset"):
+                cursor_val = self._pos_int(data.get(cursor_key))
+                if cursor_val > server_next_offset:
+                    server_next_offset = cursor_val
         items = [item for key, item in found.items() if key]
+        step = max(len(items), raw_entry_count)
+        computed_offset = (
+            server_next_offset
+            if server_next_offset > current_offset
+            else (current_offset + step if step > 0 else current_offset)
+        )
         return {"items": items,
                 "has_more": has_more,
-                "offset": next_offset or (offset + len(items)),
+                "offset": computed_offset,
+                "raw_count": raw_entry_count,
                 "error": ""}
 
     async def search_awemes(self, keyword: str, *, max_results: int = 20,
-                            max_pages: int = 3, search_sort: str = "general",
+                            max_pages: int = 3, stagnant_pages: int = 3,
+                            search_sort: str = "general",
                             publish_time: str = "all", content_type: str = "all",
-                            min_likes: int = 0, min_comments: int = 0) -> tuple[List[dict], str]:
-        """分页搜索并做本地筛选；返回 (作品列表, 可回退原因)。"""
-        import time
+                            min_likes: int = 0, min_comments: int = 0,
+                            page_delay_seconds: float | None = None) -> tuple[List[dict], str]:
+        """分页搜索并做本地筛选；返回 (作品列表, 可回退或截断原因)。"""
         # search_id belongs to one keyword pagination chain, not the account.
         self._search_id = ""
         found: Dict[str, dict] = {}
+        seen_raw_ids: Set[str] = set()
         offset = 0
-        for _ in range(max(1, min(10, int(max_pages or 1)))):
+        raw_candidates_seen = 0
+        stagnant = 0
+        pages_fetched = 0
+        stop_reason = "max_pages"
+        truncation_error = ""
+        max_pages_limit = max(1, min(40, int(max_pages or 1)))
+        stagnant_limit = max(1, min(8, int(stagnant_pages or 3)))
+        # 抖音网页端搜索单页 count 超过 20 会触发网关参数异常/验证码风控；
+        # 存在本地筛选门槛时按满页 20 条拉取，避免小上限叠加高赞门槛导致扫描效率过低。
+        has_local_filter = bool(
+            publish_time != "all"
+            or content_type != "all"
+            or int(min_likes or 0) > 0
+            or int(min_comments or 0) > 0
+        )
+        page_size = (
+            SEARCH_MAX_PAGE_SIZE
+            if has_local_filter
+            else min(SEARCH_MAX_PAGE_SIZE, max(1, int(max_results or SEARCH_MAX_PAGE_SIZE)))
+        )
+        for page_index in range(max_pages_limit):
+            if page_index > 0:
+                delay = (random.uniform(*SEARCH_PAGE_DELAY_RANGE)
+                         if page_delay_seconds is None
+                         else max(0.0, float(page_delay_seconds)))
+                if delay > 0:
+                    await asyncio.sleep(delay)
             page = await self.search_awemes_page(
-                keyword, offset=offset, count=min(50, max_results),
+                keyword, offset=offset, count=page_size,
                 search_sort=search_sort, publish_time=publish_time,
                 content_type=content_type)
-            if page.get("error"):
-                return list(found.values())[:max_results], str(page["error"])
-            for item in page.get("items") or []:
+            page_error = str(page.get("error") or "")
+            if page_error and page_index > 0 and page_error in {"empty_body", "empty_response"}:
+                # 后续分页偶发空包时先温和退避重试，避免瞬时限速导致直接截断。
+                for retry_base in SEARCH_EMPTY_RETRY_DELAYS:
+                    retry_delay = (
+                        0.0
+                        if page_delay_seconds is not None and float(page_delay_seconds) <= 0
+                        else retry_base * random.uniform(0.9, 1.25)
+                    )
+                    if retry_delay > 0:
+                        await asyncio.sleep(retry_delay)
+                    page = await self.search_awemes_page(
+                        keyword, offset=offset, count=page_size,
+                        search_sort=search_sort, publish_time=publish_time,
+                        content_type=content_type)
+                    page_error = str(page.get("error") or "")
+                    if not page_error:
+                        break
+            if page_error:
+                if found and page_error in {"empty_body", "empty_response"}:
+                    stop_reason = f"partial_{page_error}"
+                    truncation_error = (
+                        f"第 {page_index + 1} 页返回空响应({page_error})，"
+                        f"已保留前 {len(found)} 条符合条件的作品"
+                    )
+                    logging.getLogger("creatorhub.douyin.client").warning(
+                        "抖音搜索分页提前截断: keyword=%r page=%d offset=%d raw_seen=%d matched=%d err=%s",
+                        keyword, page_index + 1, offset, raw_candidates_seen, len(found), page_error,
+                    )
+                    break
+                return list(found.values())[:max_results], page_error
+            pages_fetched += 1
+            page_items = page.get("items") or []
+            new_raw_in_page = 0
+            for item in page_items:
+                aid = str(item.get("aweme_id") or "")
+                if aid and aid not in seen_raw_ids:
+                    seen_raw_ids.add(aid)
+                    new_raw_in_page += 1
+                raw_candidates_seen += 1
                 stats = item.get("statistics") or {}
                 if content_type == "video" and not item.get("video"):
                     continue
@@ -1040,21 +1219,37 @@ class DouyinClient:
                     created = int(item.get("create_time") or 0)
                     if created and created < time.time() - windows.get(publish_time, 0):
                         continue
-                aid = str(item.get("aweme_id") or "")
                 if aid:
                     found.setdefault(aid, item)
-            if len(found) >= max_results or not page.get("has_more"):
+            stagnant = stagnant + 1 if new_raw_in_page == 0 else 0
+            if len(found) >= max_results:
+                stop_reason = "max_results"
                 break
-            next_offset = int(page.get("offset") or offset + len(page.get("items") or []))
+            if not page.get("has_more"):
+                stop_reason = "no_more"
+                break
+            if stagnant >= stagnant_limit:
+                stop_reason = "stagnant"
+                break
+            page_step = max(len(page_items), int(page.get("raw_count") or 0))
+            next_offset = int(page.get("offset") or 0)
+            if next_offset <= offset and page_step > 0:
+                next_offset = offset + page_step
             if next_offset <= offset:
+                stop_reason = "offset_stalled"
                 break
             offset = next_offset
-        items = list(found.values())[:max_results]
+        items = list(found.values())
         if search_sort == "latest":
             items.sort(key=lambda x: int(x.get("create_time") or 0), reverse=True)
         elif search_sort == "most_liked":
             items.sort(key=lambda x: int((x.get("statistics") or {}).get("digg_count") or 0), reverse=True)
-        return items, ("empty_response" if not items else "")
+        items = items[:max_results]
+        logging.getLogger("creatorhub.douyin.client").info(
+            "抖音搜索完成: keyword=%r pages=%d raw_unique=%d matched=%d stop=%s",
+            keyword, pages_fetched, len(seen_raw_ids), len(items), stop_reason,
+        )
+        return items, (truncation_error or ("" if (items or raw_candidates_seen > 0) else "empty_response"))
 
     async def fetch_all_video_list(self, sec_uid: str, max_pages: int = 10,
                                    count: int = 20) -> List[dict]:
@@ -1080,7 +1275,7 @@ class DouyinClient:
             cursor = nxt
         return out
 
-    # ── 用户资料(对应 NativeClient.FetchProfile)──
+    # ── 用户资料 ──
     async def fetch_self_profile(self) -> Optional[dict]:
         """读取当前 Cookie 对应账号，不依赖已知 sec_uid。"""
         data = await self._get_json(
@@ -1189,7 +1384,7 @@ class DouyinClient:
             "nickname": str(user.get("nickname") or ""),
         }
 
-    # ── 作品列表(对应 NativeClient.FetchVideoList)──
+    # ── 作品列表 ──
     async def fetch_video_list(self, sec_uid: str, max_cursor: int = 0,
                                count: int = 20) -> Dict[str, Any]:
         data = await self._get_json(
@@ -1212,7 +1407,7 @@ class DouyinClient:
 
     async def fetch_all_new_videos(self, sec_uid: str, known_ids: set,
                                    max_pages: int = 5) -> List[dict]:
-        """对应 NativeClient.FetchAllNewVideos:翻页直到遇到已知作品。"""
+        """按游标翻页抓取新增作品，遇到已知作品即停止。"""
         new_items: List[dict] = []
         cursor = 0
         for _ in range(max_pages):
@@ -1231,7 +1426,7 @@ class DouyinClient:
             cursor = page["max_cursor"]
         return new_items
 
-    # ── 作品详情(对应 NativeClient.FetchVideoDetail)──
+    # ── 作品详情 ──
     async def fetch_video_detail(self, aweme_id: str) -> Optional[dict]:
         data = await self._get_json(
             "/aweme/v1/web/aweme/detail/",
@@ -1244,7 +1439,7 @@ class DouyinClient:
         item, self.last_error = parse_detail_response(data, aweme_id)
         return item
 
-    # ── 评论(直连 comment/list + reply,分页拉全量;参考 CommentAll)──
+    # ── 评论(直连 comment/list + reply 分页拉取)──
     async def fetch_comments_page(self, aweme_id: str, cursor: int = 0,
                                   count: int = 20) -> dict:
         data = await self._get_json(
@@ -1464,16 +1659,35 @@ class DouyinClient:
         max_time = int(time.time())
         reported_total = 0
         stagnant_pages = 0
+        consecutive_empty_pages = 0
+        probed_below_time: Optional[int] = None
+        deep_fan_cap = lambda: (
+            not following and page_index >= 200 and len(seen) >= 3000
+        )
         for page_index in range(page_limit):
             page = await self._follow_page(path, user_id, sec_uid, offset, max_time,
                                            count, source_type=1)
+            if (not page and self.last_error and page_index > 0
+                    and not self.last_error.startswith(("logged_out", "api_signature:"))):
+                for attempt in range(2):
+                    if page_delay > 0:
+                        await asyncio.sleep(min(1.2, max(0.3, page_delay * (attempt + 2))))
+                    page = await self._follow_page(
+                        path, user_id, sec_uid, offset, max_time,
+                        count, source_type=1)
+                    if page or not self.last_error:
+                        break
             if not page and self.last_error:
+                if deep_fan_cap():
+                    self.last_error = f"platform_cap:{self.last_error}"
                 self.last_follow_meta.update(
                     complete=False, stop_reason=self.last_error)
                 break
             status_code = page.get("status_code")
             if status_code not in (None, 0, "0"):
-                self.last_error = f"api_status_{status_code}"
+                raw_err = f"api_status_{status_code}"
+                self.last_error = (f"platform_cap:{raw_err}"
+                                   if deep_fan_cap() else raw_err)
                 self.last_follow_meta.update(
                     complete=False, stop_reason=self.last_error)
                 break
@@ -1484,25 +1698,48 @@ class DouyinClient:
             new = 0
             fresh: List[dict] = []
             for u in users:
-                uid = str(u.get("uid") or u.get("sec_uid") or "")
+                raw_uid = str(u.get("uid") or "")
+                sec_u = str(u.get("sec_uid") or u.get("secUid") or "")
+                uid = sec_u if (not raw_uid or raw_uid == "0") else raw_uid
                 if uid and uid not in seen:
                     seen.add(uid)
                     fresh.append(u)
                     if collect:
                         out.append(u)
                     new += 1
+            consecutive_empty_pages = (consecutive_empty_pages + 1) if not users else 0
             has_more = bool(page.get("has_more"))
+            next_max_time, next_offset, cursor_advanced = (
+                self._next_follow_cursor(
+                    page, max_time, offset, count, len(users),
+                    first_page=(page_index == 0),
+                )
+                if has_more else (max_time, offset, False)
+            )
             reached_reported_total = (
                 has_more and (not users or new == 0)
                 and reported_total > 0 and len(seen) >= reported_total
             )
-            if reached_reported_total:
+            # 大粉丝量/老账号列表中常含已注销或平台隐藏用户，实际可拉取总数低于 reported_total；
+            # 当已抓到有效数据且末尾确认返回空数组、游标不再推进（或连续空页）时视为正常到底。
+            exhausted_empty_tail = (
+                has_more and len(seen) > 0 and not users
+                and (
+                    consecutive_empty_pages >= 3
+                    or (
+                        not cursor_advanced
+                        and (offset == 0 or probed_below_time == max_time or max_time <= 1)
+                    )
+                )
+            )
+            if reached_reported_total or exhausted_empty_tail:
                 has_more = False
             meta = {
                 "pages": page_index + 1,
                 "fetched": len(seen),
                 "has_more": has_more,
                 "complete": not has_more,
+                "capped": bool(not has_more and reported_total > len(seen) > 0),
                 "stop_reason": "complete" if not has_more else "paging",
             }
             self.last_follow_meta = meta
@@ -1512,16 +1749,22 @@ class DouyinClient:
                     await callback_result
             if not has_more:
                 break
-            next_max_time, next_offset, cursor_advanced = self._next_follow_cursor(
-                page, max_time, offset, count, len(users),
-                first_page=(page_index == 0),
-            )
             if not users or new == 0:
                 stagnant_pages += 1
+                if (not cursor_advanced and stagnant_pages < 3
+                        and len(seen) > 0 and max_time > 1
+                        and probed_below_time != max_time):
+                    probed_below_time = max_time
+                    next_max_time = max_time - 1
+                    next_offset = 0
+                    cursor_advanced = True
                 if not cursor_advanced or stagnant_pages >= 3:
-                    self.last_error = "pagination_stalled"
+                    self.last_error = (
+                        "platform_cap:pagination_stalled"
+                        if deep_fan_cap() else "pagination_stalled"
+                    )
                     self.last_follow_meta.update(
-                        complete=False, stop_reason="pagination_stalled")
+                        complete=False, stop_reason=self.last_error)
                     break
             else:
                 stagnant_pages = 0

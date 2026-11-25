@@ -13,16 +13,38 @@ from .models import AppSetting
 
 ENGINE_SETTINGS_KEY = "engine.runtime.v1"
 
+# Concurrency semaphores are initialized once at engine startup, so edits to
+# these fields persist immediately and take effect on next restart.
+RESTART_REQUIRED_FIELDS = frozenset({
+    "worker_pool_size",
+    "scan_concurrency",
+    "active_accounts",
+})
+
 
 class EngineSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
+    worker_pool_size: int | None = Field(None, ge=1, le=16)
+    scan_concurrency: int | None = Field(None, ge=1, le=16)
+    active_accounts: int | None = Field(None, ge=1, le=32)
+    max_live_contexts: int | None = Field(None, ge=1, le=32)
+    resident_browser_sessions: bool | None = None
+    browser_session_idle_seconds: int | None = Field(None, ge=0, le=86400)
+
     xhs_read_mode: Literal["browser", "api"] | None = None
+    rednote_read_mode: Literal["browser", "hybrid", "api"] | None = None
     douyin_read_mode: Literal["hybrid", "api", "browser"] | None = None
     tiktok_read_mode: Literal["auto", "native", "browser"] | None = None
     channels_read_mode: Literal["auto", "protocol", "browser"] | None = None
     bilibili_read_mode: Literal["hybrid", "api", "browser"] | None = None
     bilibili_write_mode: Literal["hybrid", "api", "browser"] | None = None
+    instagram_read_mode: Literal["hybrid", "api", "browser"] | None = None
+    instagram_write_mode: Literal["hybrid", "api", "browser"] | None = None
+    twitter_read_mode: Literal["hybrid", "api", "browser"] | None = None
+    twitter_write_mode: Literal["browser"] | None = None
+    facebook_read_mode: Literal["hybrid", "api", "browser"] | None = None
+    facebook_write_mode: Literal["browser"] | None = None
     douyin_profile_mode: Literal["hybrid", "api", "browser"] | None = None
     douyin_followers_mode: Literal["hybrid", "api", "browser"] | None = None
     douyin_dm_sync_mode: Literal["hybrid", "api", "browser"] | None = None
@@ -46,6 +68,7 @@ class EngineSettingsPatch(BaseModel):
     xhs_item_gap_seconds: float | None = Field(None, ge=0, le=120)
     xhs_request_jitter: float | None = Field(None, ge=0, le=1)
     xhs_publish_mode: Literal["browser", "api"] | None = None
+    rednote_publish_mode: Literal["browser", "api"] | None = None
     xhs_comment_write_mode: Literal["browser", "api", "manual"] | None = None
     xhs_comment_review_before_publish: bool | None = None
     work_health_enabled: bool | None = None
@@ -59,6 +82,10 @@ class EngineSettingsPatch(BaseModel):
     # remain outside this allowlist.
     scan_interval_seconds: int | None = Field(None, ge=1, le=86400)
     idle_keepalive_hours: float | None = Field(None, ge=0, le=168)
+    keepalive_cookie_sync_enabled: bool | None = None
+    bilibili_auto_cookie_refresh: bool | None = None
+    shipinhao_keepalive_interval_seconds: int | None = Field(None, ge=0, le=86400)
+    keepalive_notify_on_invalid: bool | None = None
     danmaku_probe_step_seconds: float | None = Field(None, ge=0.1, le=60)
     danmaku_max_probe_points: int | None = Field(None, ge=1, le=1000)
     danmaku_max_records_per_scan: int | None = Field(None, ge=0, le=100000)
@@ -77,6 +104,11 @@ class EngineSettingsPatch(BaseModel):
     action_hourly_cap_per_account: int | None = Field(None, ge=0, le=10000)
     action_min_gap_seconds: int | None = Field(None, ge=0, le=86400)
     verify_proxy_region: bool | None = None
+    strict_proxy_required: bool | None = None
+    forbid_same_platform_shared_proxy: bool | None = None
+    quiet_hours_enabled: bool | None = None
+    quiet_hours_include_reads: bool | None = None
+    quiet_hours_wake_jitter_minutes: int | None = Field(None, ge=0, le=120)
     native_write_gate_enabled: bool | None = None
     native_write_require_system_chrome: bool | None = None
     native_write_require_verified_proxy: bool | None = None
@@ -113,6 +145,7 @@ def _export(cfg: Config, saved: dict) -> dict:
         "values": {key: getattr(cfg.engine, key) for key in fields},
         "defaults": {key: getattr(defaults, key) for key in fields},
         "saved_fields": sorted(saved),
+        "restart_required_fields": sorted(RESTART_REQUIRED_FIELDS),
         "apply_scope": "next_operation",
     }
 
@@ -126,7 +159,7 @@ def save_engine_settings(cfg: Config, payload: dict) -> dict:
     """Validate and persist one atomic patch BEFORE changing live config.
 
     Store only edited fields: config.yaml remains the base configuration for
-    everything else. No credentials, paths or restart-only engine fields are
+    everything else. No credentials, paths or browser executable selections are
     accepted by this endpoint.
     """
     patch = _validated_patch(payload)
@@ -141,6 +174,8 @@ def save_engine_settings(cfg: Config, payload: dict) -> dict:
             session.commit()
         for key, value in patch.items():
             setattr(cfg.engine, key, value)
+        if "browser_session_idle_seconds" in patch:
+            cfg.engine.xhs_cdp_idle_seconds = None
         return _export(cfg, merged)
     return export_engine_settings(cfg)
 
@@ -150,4 +185,6 @@ def load_persisted_engine_settings(cfg: Config) -> bool:
         patch = _read_patch(session)
     for key, value in patch.items():
         setattr(cfg.engine, key, value)
+    if "browser_session_idle_seconds" in patch:
+        cfg.engine.xhs_cdp_idle_seconds = None
     return bool(patch)

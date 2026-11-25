@@ -9,6 +9,7 @@
 """
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime
 from typing import Dict
@@ -23,6 +24,7 @@ from ..platforms.bilibili import BilibiliClient, cookie_str_from_state, receive_
 
 # 非聊天正文的消息类型(已读回执等),不入库/不推
 _SKIP_MSG_TYPES = {50001, 50002}
+_im_log = logging.getLogger("creatorhub.im")
 
 
 class ImReceiverManager:
@@ -80,30 +82,45 @@ class ImReceiverManager:
                 pass
 
     async def _run(self, account_id: int):
+        from .. import runtime as app_runtime
+        from ..risk import OperationKind
         # 等 uid(允许"先开面板后同步"):最多轮询 ~30s 读 DB,同步存下 uid 即自愈
-        uid, identity = "", None
+        uid, identity, proxy, ua = "", None, "", ""
         for _ in range(15):
             with get_session() as s:
                 acc = s.get(DouyinAccount, account_id)
                 if not acc or acc.platform != "douyin":
-                    print(f"[im-ws] _run account={account_id} 非抖音/不存在,跳过")
+                    _im_log.debug("实时私信跳过非抖音/不存在账号 account=%s", account_id)
                     return
                 uid = acc.uid
+                proxy = str(acc.proxy or "").strip()
                 identity = self.browser.identity_for(acc)
+                ua = (
+                    self.browser.direct_request_user_agent(identity)
+                    if callable(getattr(self.browser, "direct_request_user_agent", None))
+                    else str(acc.ua or "")
+                )
             if uid:
                 break
             st = self._accts.get(account_id)
-            if not st or not st["queues"]:      # 订阅者都走了就别等了
+            if not st or not st["queues"]:
                 return
             await asyncio.sleep(2)
-        print(f"[im-ws] _run account={account_id} uid={uid!r}")
         if not uid:
-            print(f"[im-ws] account {account_id} 无 uid,点一次「同步」存下 uid 即自动接上")
+            _im_log.info("抖音实时私信等待账号 #%s 同步 uid 后自动连接", account_id)
             return
+        if not proxy:
+            _im_log.debug("抖音账号 #%s 未绑定代理，使用本机直连建立实时私信连接", account_id)
+        if app_runtime.engine is not None:
+            decision = app_runtime.engine.risk.preflight(account_id, OperationKind.READ_LIGHT)
+            if not decision.allowed:
+                _im_log.debug("抖音实时私信受风控/休眠门禁延后(account=%s): %s", account_id, decision.reason)
+                return
         try:
-            cookie = await _douyin_cookie_str(self.browser, identity)
+            async with self.browser.lock_for(account_id):
+                cookie = await _douyin_cookie_str(self.browser, identity)
         except Exception as e:
-            print(f"[im-ws] account {account_id} 取 cookie 失败: {e!r}")
+            _im_log.warning("抖音实时私信获取账号 #%s Cookie 失败: %r", account_id, e)
             return
 
         def on_msg(m):
@@ -113,25 +130,47 @@ class ImReceiverManager:
             st = self._accts.get(account_id)
             return not st or not st["queues"]
 
-        await receive_messages(cookie, uid, on_msg, self_uid=uid,
-                               should_stop=should_stop)
+        try:
+            await receive_messages(
+                cookie, uid, on_msg, self_uid=uid,
+                should_stop=should_stop,
+                proxy=proxy, user_agent=ua, strict_proxy=False,
+            )
+        except TypeError:
+            await receive_messages(cookie, uid, on_msg, self_uid=uid,
+                                   should_stop=should_stop)
 
     async def _run_bilibili(self, account_id: int):
+        from .. import runtime as app_runtime
+        from ..risk import OperationKind
         with get_session() as s:
             acc = s.get(DouyinAccount, account_id)
             if not acc or acc.platform != "bilibili":
                 return
             identity = self.browser.identity_for(acc)
-            ua = str(acc.ua or "")
-            proxy = str(acc.proxy or "")
+            ua = (
+                self.browser.direct_request_user_agent(identity)
+                if callable(getattr(self.browser, "direct_request_user_agent", None))
+                else str(acc.ua or (app_runtime.cfg.engine.user_agent if app_runtime.cfg else ""))
+            )
+            proxy = str(acc.proxy or "").strip()
+            account_seed = str(acc.fp_seed or acc.id or "")
             self_uid = str(acc.uid or acc.sec_uid or "")
             fallback_cookie = cookie_str_from_state(acc.storage_state or acc.cookie or "")
+        if not proxy:
+            _im_log.debug("B站账号 #%s 未绑定代理，使用本机直连建立实时私信连接", account_id)
+        if app_runtime.engine is not None:
+            decision = app_runtime.engine.risk.preflight(account_id, OperationKind.READ_LIGHT)
+            if not decision.allowed:
+                _im_log.debug("B站实时私信受风控/休眠门禁延后(account=%s): %s", account_id, decision.reason)
+                return
         try:
-            cookie = await _bili_cookie_str(self.browser, identity)
+            async with self.browser.lock_for(account_id):
+                cookie = await _bili_cookie_str(self.browser, identity)
         except Exception:
             cookie = fallback_cookie
         if not cookie:
-            print(f"[bili-im-ws] account {account_id} 无有效 Cookie，跳过实时私信连接")
+            _im_log.warning("B站账号 #%s 缺少有效 Cookie，跳过实时私信连接", account_id)
             return
 
         begin_ts = int(time.time() * 1_000_000)
@@ -142,7 +181,10 @@ class ImReceiverManager:
 
         async def on_watch_notify():
             nonlocal begin_ts, self_uid
-            client = BilibiliClient(cookie, ua, proxy=proxy)
+            try:
+                client = BilibiliClient(cookie, ua, proxy=proxy, account_seed=account_seed)
+            except TypeError:
+                client = BilibiliClient(cookie, ua, proxy=proxy)
             async with client.session_scope():
                 if not self_uid and client.self_mid:
                     self_uid = client.self_mid
@@ -204,13 +246,24 @@ class ImReceiverManager:
                             platform="bilibili",
                         )
 
-        await receive_bili_broadcast(
-            cookie,
-            ua,
-            on_watch_notify,
-            should_stop=should_stop,
-            proxy=proxy,
-        )
+        try:
+            await receive_bili_broadcast(
+                cookie,
+                ua,
+                on_watch_notify,
+                should_stop=should_stop,
+                proxy=proxy,
+                account_seed=account_seed,
+                strict_proxy=False,
+            )
+        except TypeError:
+            await receive_bili_broadcast(
+                cookie,
+                ua,
+                on_watch_notify,
+                should_stop=should_stop,
+                proxy=proxy,
+            )
 
     def _handle(self, account_id: int, m: dict, *, platform: str = "douyin"):
         if m.get("msg_type") in _SKIP_MSG_TYPES or not m.get("text"):
@@ -251,7 +304,7 @@ class ImReceiverManager:
                     s.add(conv)
                 s.commit()
         except Exception as e:
-            print(f"[im-ws] 入库失败: {e!r}")
+            _im_log.warning("实时私信入库失败(account=%s): %r", account_id, e)
         # 推给 SSE 订阅者
         st = self._accts.get(account_id)
         if st:

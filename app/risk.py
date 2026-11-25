@@ -88,8 +88,12 @@ def _kind_value(kind: OperationKind | str) -> str:
     return kind.value if isinstance(kind, OperationKind) else str(kind)
 
 
-def network_key(proxy: str) -> str:
-    """Return a non-secret stable key for a network exit."""
+def network_key(proxy: str, exit_ip: str = "") -> str:
+    """Return a non-secret stable key for a network exit (prefers verified exit IP)."""
+    clean_ip = str(exit_ip or "").strip()
+    if clean_ip:
+        digest = hashlib.sha256(clean_ip.encode("utf-8")).hexdigest()
+        return f"ip:{digest}"
     raw = normalize_proxy(str(proxy or "").strip())
     if not raw:
         return "direct"
@@ -142,7 +146,7 @@ def classify_platform_error(
         return RiskCategory.BUSINESS, "ambiguous_browser_result"
     auth_markers = (
         "登录态已失效", "登录已失效", "未登录", "logged_out", "login expired",
-        "session expired", "cookie expired",
+        "session expired", "cookie expired", "login_required",
     )
     if any(marker in text for marker in auth_markers):
         return RiskCategory.AUTH, "auth_expired"
@@ -150,7 +154,7 @@ def classify_platform_error(
     network_markers = (
         "proxyerror", "proxy error", "proxy_auth", "connection timeout",
         "connecttimeout", "readtimeout", "timed out", "dns", "tls",
-        "connection reset", "connection refused", "networkerror",
+        "connection reset", "connection refused", "networkerror", "network_error:",
     )
     if any(marker in text for marker in network_markers):
         return RiskCategory.NETWORK, "network_failure"
@@ -159,8 +163,9 @@ def classify_platform_error(
         "风控", "频控", "访问频繁", "操作频繁", "环境异常", "验证码", "验证",
         "限流", "安全验证", "设备异常", "账号异常", "滑块", "人机验证",
         "risk", "captcha", "security verification", "human verification", "verifycenter",
-        "website-login/captcha", "rate limit", "too frequent", "http 429",
-        "http 403", "status_code=8", "verification_required",
+        "website-login/captcha", "rate limit", "rate_limit", "too frequent", "http 429",
+        "http 403", "status_code=8", "verification_required", "checkpoint_required",
+        "challenge_required", "feedback_required",
     )
     if any(marker in text for marker in risk_markers):
         return RiskCategory.RISK, ("verification_required"
@@ -194,6 +199,41 @@ class RiskController:
         self._network_locks: dict[str, asyncio.Semaphore] = {}
         self._network_lock_guard = threading.Lock()
         self._rng = random.SystemRandom()
+
+    def _cooldown_active(self) -> bool:
+        return bool(self.policy.enabled and getattr(self.policy, "cooldown_enabled", True))
+
+    def _write_limits_active(self) -> bool:
+        return bool(self.policy.enabled and getattr(self.policy, "write_limits_enabled", True))
+
+    def _pacing_active(self) -> bool:
+        return bool(self.policy.enabled and getattr(self.policy, "pacing_enabled", True))
+
+    def _network_guard_active(self) -> bool:
+        return bool(self.policy.enabled and getattr(self.policy, "network_guard_enabled", True))
+
+    def _jitter_active(self) -> bool:
+        return bool(self.policy.enabled and getattr(self.policy, "jitter_enabled", True))
+
+    def active_modules(self) -> list[str]:
+        """Return currently effective risk-control module keys."""
+        modules: list[str] = []
+        if self.policy.enabled:
+            if self._cooldown_active():
+                modules.append("cooldown")
+            if self._write_limits_active():
+                modules.append("write_limits")
+            if self._pacing_active():
+                modules.append("pacing")
+            if bool(getattr(self.cfg.engine, "quiet_hours_enabled", False)):
+                modules.append("quiet_hours")
+            if self._network_guard_active():
+                modules.append("network_guard")
+            if self._jitter_active():
+                modules.append("jitter")
+        if bool(getattr(self.cfg.engine, "native_write_gate_enabled", False)):
+            modules.append("native_write_gate")
+        return modules
 
     def _record_pacing(self, state: AccountRiskState, kind: OperationKind,
                        now: datetime) -> None:
@@ -272,7 +312,7 @@ class RiskController:
             return None
         window = max(1, int(getattr(
             self.policy, "network_group_risk_window_seconds", 900)))
-        key = network_key(account.proxy)
+        key = network_key(account.proxy, getattr(account, "exit_ip", ""))
         recent_ids = set(session.exec(select(RiskEvent.account_id).where(
             RiskEvent.network_key == key,
             RiskEvent.outcome == RiskCategory.RISK.value,
@@ -294,7 +334,7 @@ class RiskController:
             "命中平台风险，已触发出口组熔断")
         for target in session.exec(select(DouyinAccount)).all():
             if target.identity_mode != "native" \
-                    or network_key(target.proxy) != key:
+                    or network_key(target.proxy, getattr(target, "exit_ip", "")) != key:
                 continue
             target_state = self._state(session, target.id)
             target_state.risk_level = max(1, target_state.risk_level)
@@ -324,17 +364,60 @@ class RiskController:
         local_start = aware.replace(hour=0, minute=0, second=0, microsecond=0)
         return local_start.astimezone(timezone.utc).replace(tzinfo=None)
 
+    @staticmethod
+    def _circadian_offsets_seconds(account: DouyinAccount, local_date_str: str,
+                                   jitter_minutes: int) -> tuple[int, int]:
+        """按「账号 ID + 当地日期」确定性派生当日苏醒延后秒数与入睡提前秒数。
+        同账号当天多次轮询保持稳定，不同账号、不同日期彼此错峰，彻底消除 08:00:00 齐发。"""
+        max_sec = max(0, min(120, int(jitter_minutes or 0))) * 60
+        if max_sec <= 0:
+            return 0, 0
+        seed_raw = f"circadian|{getattr(account, 'id', 0)}|{local_date_str}".encode("utf-8")
+        digest = hashlib.sha256(seed_raw).digest()
+        wake_delay = int.from_bytes(digest[:4], "big") % (max_sec + 1)
+        sleep_shift = (int.from_bytes(digest[4:8], "big") % (max_sec + 1)) - (max_sec // 2)
+        return wake_delay, sleep_shift
+
     def _in_active_window(self, account: DouyinAccount, now: datetime) -> bool:
         engine = self.cfg.engine
-        if not engine.quiet_hours_enabled:
+        if not self.policy.enabled or not engine.quiet_hours_enabled:
             return True
-        start, end = engine.active_hours_start, engine.active_hours_end
+        start, end = int(engine.active_hours_start), int(engine.active_hours_end)
         if end <= start:
             return True
-        hour = now.replace(tzinfo=timezone.utc).astimezone(self._timezone(account)).hour
+        local = now.replace(tzinfo=timezone.utc).astimezone(self._timezone(account))
+        jitter_min = int(getattr(engine, "quiet_hours_wake_jitter_minutes", 0) or 0)
+        wake_sec, sleep_sec = self._circadian_offsets_seconds(
+            account, local.strftime("%Y-%m-%d"), jitter_min
+        )
+        sec_of_day = local.hour * 3600 + local.minute * 60 + local.second
+        start_sec = max(0, min(86399, start * 3600 + wake_sec))
         if end <= 24:
-            return start <= hour < end
-        return hour >= start or hour < (end - 24)
+            end_sec = max(start_sec + 600, min(86400, end * 3600 + sleep_sec))
+            return start_sec <= sec_of_day < end_sec
+        wrap_end_sec = max(0, min(86399, (end - 24) * 3600 + sleep_sec))
+        return sec_of_day >= start_sec or sec_of_day < wrap_end_sec
+
+    def _next_active_window_start_utc(self, account: DouyinAccount, now: datetime) -> datetime:
+        engine = self.cfg.engine
+        tz = self._timezone(account)
+        local = now.replace(tzinfo=timezone.utc).astimezone(tz)
+        jitter_min = int(getattr(engine, "quiet_hours_wake_jitter_minutes", 0) or 0)
+        base_hour = max(0, min(23, int(engine.active_hours_start)))
+        for day_offset in (0, 1):
+            day = (local + timedelta(days=day_offset)).replace(
+                hour=base_hour, minute=0, second=0, microsecond=0
+            )
+            wake_sec, _ = self._circadian_offsets_seconds(
+                account, day.strftime("%Y-%m-%d"), jitter_min
+            )
+            candidate = day + timedelta(seconds=wake_sec)
+            if candidate > local:
+                return candidate.astimezone(timezone.utc).replace(tzinfo=None)
+        fallback = (local + timedelta(days=1)).replace(
+            hour=base_hour, minute=0, second=0, microsecond=0
+        )
+        return fallback.astimezone(timezone.utc).replace(tzinfo=None)
 
     def _limits(self, kind: OperationKind) -> tuple[int, int, int]:
         p = self.policy
@@ -534,110 +617,140 @@ class RiskController:
                             next_at,
                             "auth_probe_gap",
                         )
-            if account.proxy and account.proxy_status in {
-                    "bad", "auth_error", "blocked", "drifted"} \
-                    and kind != OperationKind.LOGIN:
-                return RiskDecision(
-                    False,
-                    "账号绑定代理当前不可用",
-                    now + timedelta(minutes=5),
-                    "proxy_unavailable",
-                )
+            if kind != OperationKind.LOGIN:
+                from .profiles import resolve_pool_proxy_row
+                raw_proxy = str(account.proxy or "").strip()
+                if raw_proxy:
+                    if account.proxy_status in {
+                        "bad", "auth_error", "blocked", "disabled"
+                    }:
+                        return RiskDecision(
+                            False,
+                            "账号当前绑定的代理不可用或已停用（可修复节点、更换代理，或清除代理改用直连）",
+                            now + timedelta(minutes=5),
+                            "proxy_unavailable",
+                        )
+                    pool_row = (
+                        session.get(ProxyPool, account.proxy_id)
+                        if getattr(account, "proxy_id", None)
+                        else resolve_pool_proxy_row(session, raw_proxy)
+                    )
+                    if pool_row is not None and (
+                        not pool_row.enabled
+                        or pool_row.status in {"bad", "auth_error", "blocked", "disabled"}
+                    ):
+                        return RiskDecision(
+                            False,
+                            "代理池中该节点已停用或检测异常（可启用/修复节点，或为账号清除代理改用直连）",
+                            now + timedelta(minutes=5),
+                            "proxy_unavailable",
+                        )
             state = self._state(session, account_id)
-            if state.manual_review_required and kind != OperationKind.LOGIN:
-                return RiskDecision(
-                    False, "平台要求人工验证；请在账号浏览器中处理后人工解除暂停",
-                    signal="manual_review_required")
-            if state.retry_not_before and state.retry_not_before > now \
-                    and kind != OperationKind.LOGIN:
-                return RiskDecision(False, "网络异常后等待再尝试",
-                                    state.retry_not_before, "network_backoff")
-            if state.cooldown_until and state.cooldown_until > now:
-                return RiskDecision(
-                    False,
-                    f"账号处于平台风险冷却期，截止 {state.cooldown_until.isoformat(timespec='seconds')}",
-                    state.cooldown_until,
-                    "cooldown",
-                )
+            if self._cooldown_active():
+                if state.manual_review_required and kind != OperationKind.LOGIN:
+                    return RiskDecision(
+                        False, "平台要求人工验证；请在账号浏览器中处理后人工解除暂停",
+                        signal="manual_review_required")
+                if state.retry_not_before and state.retry_not_before > now \
+                        and kind != OperationKind.LOGIN:
+                    return RiskDecision(False, "网络异常后等待再尝试",
+                                        state.retry_not_before, "network_backoff")
+                if state.cooldown_until and state.cooldown_until > now:
+                    return RiskDecision(
+                        False,
+                        f"账号处于平台风险冷却期，截止 {state.cooldown_until.isoformat(timespec='seconds')}",
+                        state.cooldown_until,
+                        "cooldown",
+                    )
 
-            if state.risk_level > 0 and kind != OperationKind.READ_LIGHT:
-                next_at = state.probe_only_until or state.cooldown_until or now
-                return RiskDecision(
-                    False,
-                    "账号处于渐进恢复阶段，仅允许轻量状态探测",
-                    next_at,
-                    "probe_only",
-                )
+                if state.risk_level > 0 and kind != OperationKind.READ_LIGHT:
+                    next_at = state.probe_only_until or state.cooldown_until or now
+                    return RiskDecision(
+                        False,
+                        "账号处于渐进恢复阶段，仅允许轻量状态探测",
+                        next_at,
+                        "probe_only",
+                    )
 
-            if state.risk_level > 0 and kind == OperationKind.READ_LIGHT \
-                    and state.last_recovery_at:
-                next_probe = state.last_recovery_at + timedelta(
-                    seconds=max(1, self.policy.recovery_probe_gap_seconds))
-                if next_probe > now:
-                    return RiskDecision(False, "恢复探测间隔未到", next_probe, "probe_gap")
+                if state.risk_level > 0 and kind == OperationKind.READ_LIGHT \
+                        and state.last_recovery_at:
+                    next_probe = state.last_recovery_at + timedelta(
+                        seconds=max(1, self.policy.recovery_probe_gap_seconds))
+                    if next_probe > now:
+                        return RiskDecision(False, "恢复探测间隔未到", next_probe, "probe_gap")
 
-            if kind in self._WRITE_KINDS and not self._in_active_window(account, now):
-                local = now.replace(tzinfo=timezone.utc).astimezone(self._timezone(account))
-                next_local = local.replace(
-                    hour=max(0, min(23, self.cfg.engine.active_hours_start)),
-                    minute=0, second=0, microsecond=0)
-                if next_local <= local:
-                    next_local += timedelta(days=1)
-                next_at = next_local.astimezone(timezone.utc).replace(tzinfo=None)
-                return RiskDecision(False, "当前处于非活跃时段", next_at, "quiet_hours")
+            quiet_kinds = set(self._WRITE_KINDS)
+            if (
+                bool(getattr(self.cfg.engine, "quiet_hours_include_reads", False))
+                and not interactive_read
+                and not allow_invalid_probe
+            ):
+                quiet_kinds.update({OperationKind.READ_LIGHT, OperationKind.READ_HEAVY})
+            if kind in quiet_kinds and not self._in_active_window(account, now):
+                next_at = self._next_active_window_start_utc(account, now)
+                return RiskDecision(False, "当前处于夜间休眠时段", next_at, "quiet_hours")
 
-            gap, hourly_cap, daily_cap = self._limits(kind)
             kind_value = kind.value
-            latest = self._latest_success(session, account_id, [kind_value])
-            if latest and gap > 0 and not interactive_read:
-                next_at = latest + timedelta(seconds=gap)
-                if next_at > now:
-                    return RiskDecision(False, "尚未达到该操作最小间隔", next_at, "kind_gap")
+            if kind in {OperationKind.READ_LIGHT, OperationKind.READ_HEAVY}:
+                if self._pacing_active() and not interactive_read:
+                    gap, _, _ = self._limits(kind)
+                    latest = self._latest_success(session, account_id, [kind_value])
+                    if latest and gap > 0:
+                        next_at = latest + timedelta(seconds=gap)
+                        if next_at > now:
+                            return RiskDecision(False, "尚未达到该操作最小间隔", next_at, "kind_gap")
+            elif kind in self._WRITE_KINDS and self._write_limits_active():
+                gap, hourly_cap, daily_cap = self._limits(kind)
+                latest = self._latest_success(session, account_id, [kind_value])
+                if latest and gap > 0:
+                    next_at = latest + timedelta(seconds=gap)
+                    if next_at > now:
+                        return RiskDecision(False, "尚未达到该操作最小间隔", next_at, "kind_gap")
 
-            if kind in self._WRITE_KINDS and state.last_write_at:
-                next_at = state.last_write_at + timedelta(
-                    seconds=self._shared_write_gap())
-                if next_at > now:
-                    return RiskDecision(False, "尚未达到账号共享写操作间隔", next_at,
-                                        "shared_write_gap")
+                shared_gap = self._shared_write_gap()
+                if state.last_write_at and shared_gap > 0:
+                    next_at = state.last_write_at + timedelta(seconds=shared_gap)
+                    if next_at > now:
+                        return RiskDecision(False, "尚未达到账号共享写操作间隔", next_at,
+                                            "shared_write_gap")
 
-            if hourly_cap > 0:
-                count = self._count_successes(
-                    session, account_id, [kind_value], now - timedelta(hours=1))
-                if count >= hourly_cap:
-                    return RiskDecision(False, "已达到账号每小时操作上限",
-                                        now + timedelta(hours=1), "hourly_cap")
-            if daily_cap > 0:
-                day_start = self._local_day_start_utc(account, now)
-                count = self._count_successes(session, account_id, [kind_value], day_start)
-                if count >= daily_cap:
-                    local = now.replace(tzinfo=timezone.utc).astimezone(self._timezone(account))
-                    next_local = (local + timedelta(days=1)).replace(
-                        hour=0, minute=0, second=0, microsecond=0)
-                    next_at = next_local.astimezone(timezone.utc).replace(tzinfo=None)
-                    return RiskDecision(False, "已达到账号每日操作上限", next_at,
-                                        "daily_cap")
+                if hourly_cap > 0:
+                    count = self._count_successes(
+                        session, account_id, [kind_value], now - timedelta(hours=1))
+                    if count >= hourly_cap:
+                        return RiskDecision(False, "已达到账号每小时操作上限",
+                                            now + timedelta(hours=1), "hourly_cap")
+                if daily_cap > 0:
+                    day_start = self._local_day_start_utc(account, now)
+                    count = self._count_successes(session, account_id, [kind_value], day_start)
+                    if count >= daily_cap:
+                        local = now.replace(tzinfo=timezone.utc).astimezone(self._timezone(account))
+                        next_local = (local + timedelta(days=1)).replace(
+                            hour=0, minute=0, second=0, microsecond=0)
+                        next_at = next_local.astimezone(timezone.utc).replace(tzinfo=None)
+                        return RiskDecision(False, "已达到账号每日操作上限", next_at,
+                                            "daily_cap")
 
-            if kind in (OperationKind.SOCIAL, OperationKind.DM):
-                action_kinds = [OperationKind.SOCIAL.value, OperationKind.DM.value]
-                combined_hourly_cap, combined_daily_cap = self._combined_action_caps()
-                hour_count = self._count_successes(
-                    session, account_id, action_kinds, now - timedelta(hours=1))
-                if combined_hourly_cap > 0 and hour_count >= combined_hourly_cap:
-                    return RiskDecision(False, "已达到账号每小时账号动作总上限",
-                                        now + timedelta(hours=1), "combined_hourly_cap")
-                day_count = self._count_successes(
-                    session, account_id, action_kinds,
-                    self._local_day_start_utc(account, now))
-                if combined_daily_cap > 0 and day_count >= combined_daily_cap:
-                    local = now.replace(tzinfo=timezone.utc).astimezone(
-                        self._timezone(account))
-                    next_local = (local + timedelta(days=1)).replace(
-                        hour=0, minute=0, second=0, microsecond=0)
-                    next_at = next_local.astimezone(timezone.utc).replace(tzinfo=None)
-                    return RiskDecision(False, "已达到账号每日账号动作总上限",
-                                        next_at, "combined_daily_cap")
-            if kind not in {OperationKind.LOGIN, OperationKind.DOWNLOAD}:
+                if kind in (OperationKind.SOCIAL, OperationKind.DM):
+                    action_kinds = [OperationKind.SOCIAL.value, OperationKind.DM.value]
+                    combined_hourly_cap, combined_daily_cap = self._combined_action_caps()
+                    hour_count = self._count_successes(
+                        session, account_id, action_kinds, now - timedelta(hours=1))
+                    if combined_hourly_cap > 0 and hour_count >= combined_hourly_cap:
+                        return RiskDecision(False, "已达到账号每小时账号动作总上限",
+                                            now + timedelta(hours=1), "combined_hourly_cap")
+                    day_count = self._count_successes(
+                        session, account_id, action_kinds,
+                        self._local_day_start_utc(account, now))
+                    if combined_daily_cap > 0 and day_count >= combined_daily_cap:
+                        local = now.replace(tzinfo=timezone.utc).astimezone(
+                            self._timezone(account))
+                        next_local = (local + timedelta(days=1)).replace(
+                            hour=0, minute=0, second=0, microsecond=0)
+                        next_at = next_local.astimezone(timezone.utc).replace(tzinfo=None)
+                        return RiskDecision(False, "已达到账号每日账号动作总上限",
+                                            next_at, "combined_daily_cap")
+            if self._pacing_active() and kind not in {OperationKind.LOGIN, OperationKind.DOWNLOAD}:
                 for deadline, message, signal in (
                     (state.session_rest_until, "账号连续操作后休息中", "session_rest"),
                     (state.operation_not_before, "账号操作节奏等待中", "operation_pacing"),
@@ -667,7 +780,8 @@ class RiskController:
             if account is None:
                 return
             state = self._state(session, account_id)
-            self._record_pacing(state, kind, now)
+            if self._pacing_active():
+                self._record_pacing(state, kind, now)
             state.last_operation_at = now
             state.updated_at = now
             state.consecutive_network_failures = 0
@@ -678,7 +792,8 @@ class RiskController:
                 state.last_heavy_read_at = now
             if state.retry_not_before and state.retry_not_before <= now:
                 state.retry_not_before = None
-            if state.risk_level > 0 and kind == OperationKind.READ_LIGHT \
+            if self._cooldown_active() and state.risk_level > 0 \
+                    and kind == OperationKind.READ_LIGHT \
                     and not state.manual_review_required:
                 gap = max(1, self.policy.recovery_probe_gap_seconds)
                 if state.last_recovery_at is None \
@@ -696,7 +811,7 @@ class RiskController:
                             account.write_pause_reason = ""
             session.add(RiskEvent(
                 account_id=account_id,
-                network_key=network_key(account.proxy),
+                network_key=network_key(account.proxy, getattr(account, "exit_ip", "")),
                 operation_kind=kind.value,
                 outcome=RiskCategory.SUCCESS.value,
                 occurred_at=now,
@@ -729,34 +844,40 @@ class RiskController:
             if account is None:
                 return FailureDecision(category, signal)
             state = self._state(session, account_id)
-            self._record_pacing(state, kind, now)
+            if self._pacing_active():
+                self._record_pacing(state, kind, now)
             state.last_operation_at = now
             state.updated_at = now
             if category == RiskCategory.RISK:
                 state.consecutive_network_failures = 0
                 state.network_failure_key = ""
-                state.risk_level = min(4, max(1, state.risk_level + 1))
-                state.consecutive_risk += 1
-                state.recovery_successes = 0
-                state.last_recovery_at = None
-                steps = self.policy.cooldown_steps_seconds or [1800, 7200, 21600, 86400]
-                index = min(state.risk_level - 1, len(steps) - 1)
-                next_at = now + timedelta(seconds=max(1, int(steps[index])))
-                state.cooldown_until = next_at
-                state.probe_only_until = next_at
-                state.last_risk_at = now
-                state.last_risk_reason = str(error or signal).strip()[:240]
-                if self._needs_manual_review(error, signal):
-                    state.manual_review_required = True
-                    state.manual_review_reason = "平台安全验证待处理；请在账号浏览器完成后人工解除暂停"
-                account.write_paused_until = next_at
-                account.write_pause_reason = state.last_risk_reason
+                if self._cooldown_active():
+                    state.risk_level = min(4, max(1, state.risk_level + 1))
+                    state.consecutive_risk += 1
+                    state.recovery_successes = 0
+                    state.last_recovery_at = None
+                    steps = self.policy.cooldown_steps_seconds or [1800, 7200, 21600, 86400]
+                    index = min(state.risk_level - 1, len(steps) - 1)
+                    next_at = now + timedelta(seconds=max(1, int(steps[index])))
+                    state.cooldown_until = next_at
+                    state.probe_only_until = next_at
+                    state.last_risk_at = now
+                    state.last_risk_reason = str(error or signal).strip()[:240]
+                    if self._needs_manual_review(error, signal):
+                        state.manual_review_required = True
+                        state.manual_review_reason = "平台安全验证待处理；请在账号浏览器完成后人工解除暂停"
+                    account.write_paused_until = next_at
+                    account.write_pause_reason = state.last_risk_reason
             elif category == RiskCategory.NETWORK:
-                extra = self._rng.uniform(0, max(0, min(
-                    300, int(self.policy.network_retry_jitter_seconds))))
-                next_at = now + timedelta(seconds=300 + extra)
-                state.retry_not_before = max(state.retry_not_before or next_at, next_at)
-                next_at = state.retry_not_before
+                if self._cooldown_active():
+                    extra = (
+                        self._rng.uniform(0, max(0, min(
+                            300, int(self.policy.network_retry_jitter_seconds))))
+                        if self._jitter_active() else 0.0
+                    )
+                    next_at = now + timedelta(seconds=300 + extra)
+                    state.retry_not_before = max(state.retry_not_before or next_at, next_at)
+                    next_at = state.retry_not_before
                 proxy_failure = bool(account.proxy) and signal in {
                     "network_failure", "proxy_auth"}
                 current_key = network_key(account.proxy) if proxy_failure else ""
@@ -788,7 +909,7 @@ class RiskController:
                 state.network_failure_key = ""
             event = RiskEvent(
                 account_id=account_id,
-                network_key=network_key(account.proxy),
+                network_key=network_key(account.proxy, getattr(account, "exit_ip", "")),
                 operation_kind=kind.value,
                 outcome=category.value,
                 signal=signal,
@@ -797,7 +918,7 @@ class RiskController:
             )
             session.add(event)
             session.flush()
-            if category == RiskCategory.RISK:
+            if category == RiskCategory.RISK and self._network_guard_active():
                 group_until = self._apply_network_group_circuit_breaker(
                     session, account, now=now)
                 if group_until is not None \
@@ -845,17 +966,26 @@ class RiskController:
 
     def next_write_at(self, account_id: int) -> datetime | None:
         """Return the earliest known time any write may pass shared gates."""
+        if not self.policy.enabled:
+            return None
         with self._decision_lock, get_session() as session:
             state = session.get(AccountRiskState, account_id)
             if state is None:
                 return None
-            candidates = [value for value in (
-                state.cooldown_until, state.retry_not_before,
-                state.operation_not_before, state.session_rest_until)
-                          if value is not None]
-            if state.last_write_at is not None:
-                candidates.append(
-                    state.last_write_at + timedelta(seconds=self._shared_write_gap()))
+            candidates: list[datetime] = []
+            if self._cooldown_active():
+                for value in (state.cooldown_until, state.retry_not_before):
+                    if value is not None:
+                        candidates.append(value)
+            if self._pacing_active():
+                for value in (state.operation_not_before, state.session_rest_until):
+                    if value is not None:
+                        candidates.append(value)
+            if self._write_limits_active() and state.last_write_at is not None:
+                shared_gap = self._shared_write_gap()
+                if shared_gap > 0:
+                    candidates.append(
+                        state.last_write_at + timedelta(seconds=shared_gap))
             return max(candidates) if candidates else None
 
     def prune_events(self, *, now: datetime | None = None) -> int:
@@ -873,20 +1003,23 @@ class RiskController:
 
     @asynccontextmanager
     async def network_guard(self, account_or_id: DouyinAccount | int | None):
-        if not self.policy.enabled:
+        if not self.policy.enabled or not self._network_guard_active():
             yield "disabled"
             return
         proxy = ""
+        exit_ip = ""
         if not isinstance(account_or_id, (int, type(None))) \
                 and hasattr(account_or_id, "proxy"):
             proxy = getattr(account_or_id, "proxy", "") or ""
+            exit_ip = getattr(account_or_id, "exit_ip", "") or ""
         else:
             account_id = self._account_id(account_or_id)
             if account_id:
                 with get_session() as session:
                     account = session.get(DouyinAccount, account_id)
                     proxy = account.proxy if account else ""
-        key = network_key(proxy)
+                    exit_ip = getattr(account, "exit_ip", "") if account else ""
+        key = network_key(proxy, exit_ip)
         with self._network_lock_guard:
             sem = self._network_locks.get(key)
             if sem is None:

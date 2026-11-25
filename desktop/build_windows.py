@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from preview.build_preview import build_guide
 from desktop.bundle_config import dependency_options, node_module_data
+from desktop.installer_assets import write_installer_assets
 
 
 def main():
@@ -29,8 +30,7 @@ def main():
     output = (dist_root / "CreatorHub").resolve()
     if not output.is_relative_to(ROOT.resolve()):
         raise SystemExit("Build output must remain inside the repository")
-    from desktop.ui import brand_image
-    brand_image(256).save(staging / "CreatorHub.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
+    write_installer_assets(staging)
     build_guide(staging / "desktop-guide")
     (staging / "desktop-version.txt").write_text(args.version, encoding="utf-8")
     (staging / "build-runtime.json").write_text(json.dumps({
@@ -44,8 +44,6 @@ def main():
                     "--workpath", str(staging / "updater-work"), "--specpath", str(staging),
                     str(ROOT / "desktop" / "update_helper.py")], cwd=ROOT, check=True)
     helper = helper_dir / "CreatorHubUpdater.exe"
-    subprocess.run([str(helper), "--self-test"], check=True, timeout=30,
-                   creationflags=subprocess.CREATE_NO_WINDOW)
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir", "--windowed",
                "--name", "CreatorHub", "--icon", str(staging / "CreatorHub.ico"),
                "--distpath", str(dist_root),

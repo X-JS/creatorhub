@@ -1,4 +1,4 @@
-"""配置加载。对应逆向 internal/config。"""
+"""全局配置模型与 YAML 加载校验。"""
 from __future__ import annotations
 
 import os
@@ -27,8 +27,12 @@ class EngineConfig:
     danmaku_max_probe_points: int = 120       # 单条视频最多探测的时间点数
     danmaku_max_records_per_scan: int = 1000  # 单轮最多入库弹幕数,0=不限
     danmaku_max_records_total: int = 0        # 每个监控最多保留记录数,0=不限
-    account_check_interval_seconds: int = 1800  # 登录态独立体检间隔(0=关闭)，不受普通活跃时间影响
+    account_check_interval_seconds: int = 1800  # 登录态独立体检/保活间隔(0=关闭)，不受普通活跃时间影响
     idle_keepalive_hours: float = 6.0  # 兼容历史闲置保活配置；不再用于延迟登录态体检
+    keepalive_cookie_sync_enabled: bool = True       # 体检/保活成功后自动将最新响应/浏览器 Cookie 同步落库
+    bilibili_auto_cookie_refresh: bool = True        # B站检测到需续期时自动执行官方 RSA-OAEP Cookie 续期
+    shipinhao_keepalive_interval_seconds: int = 900  # 视频号独立保活间隔(秒,0=跟随 account_check_interval_seconds)
+    keepalive_notify_on_invalid: bool = True         # 账号登录态由有效转为失效时通过通知渠道告警
     # 自有账号评论模式:创作中心评论管理页(实验性,抖音改版时改这里)
     creator_comment_url: str = "https://creator.douyin.com/creator-micro/interaction/comment-management"
     # 自有账号弹幕模式:创作中心弹幕管理页(实验性,抖音改版时改这里)
@@ -60,12 +64,23 @@ class EngineConfig:
     xhs_cdp_idle_seconds: int | None = None
     # 小红书读取默认使用常驻签名客户端直连；browser 保留为页面兼容模式。
     xhs_read_mode: str = "api"               # api | browser
+    # 海外小红书(Rednote)读取通道: hybrid=XYS/XYW+b1 直连优先、普通兼容失败回退页面(默认推荐); api=仅直连; browser=仅页面
+    rednote_read_mode: str = "hybrid"        # hybrid | api | browser
     douyin_read_mode: str = "hybrid"         # 默认 API 优先/浏览器回退；api=仅 API；browser=仅浏览器
     # native=纯 Python 离线签名直连；browser=已授权页面；auto=直连优先/页面回退。
     tiktok_read_mode: str = "native"          # native | auto | browser
     # B站读写通道: hybrid=WBI/Cookie直连优先、明确风控兼容失败时回退页面; api=仅直连; browser=仅页面
     bilibili_read_mode: str = "hybrid"        # hybrid | api | browser
     bilibili_write_mode: str = "hybrid"       # hybrid | api | browser
+    # Instagram 读写通道: hybrid=双栈协议直连优先、兼容失败回退页面; api=仅直连; browser=仅页面
+    instagram_read_mode: str = "hybrid"       # hybrid | api | browser
+    instagram_write_mode: str = "hybrid"      # hybrid | api | browser
+    # X (Twitter) 读取与写入通道: hybrid=Syndication/REST直连优先、GraphQL时间线回退隔离浏览器; browser=全程隔离浏览器
+    twitter_read_mode: str = "hybrid"         # hybrid | api | browser
+    twitter_write_mode: str = "browser"       # browser
+    # Facebook 读取与写入通道: hybrid=Cookie SSR轻读优先、动态时间线/搜索/评论走隔离浏览器; browser=全程隔离浏览器
+    facebook_read_mode: str = "hybrid"        # hybrid | api | browser
+    facebook_write_mode: str = "browser"      # browser
     # 视频号读取模式: auto=优先桌面微信原生 Finder CDP 协议、回退创作者助手页面;
     # protocol=仅原生 Finder 协议; browser=仅创作者助手页面。
     channels_read_mode: str = "auto"          # auto | protocol | browser
@@ -73,6 +88,7 @@ class EngineConfig:
     channels_cdp_endpoint_file: str = ""      # wmpf_cdp 生成的本地控制口令端点描述文件
     channels_proxy_enabled: bool = False      # 是否使用内置本机视频号选择性 HTTPS 代理桥接
     channels_proxy_port: int = 2023           # 内置视频号本机代理监听端口(127.0.0.1)
+    channels_proxy_manage_sysproxy: bool = True  # 内置代理是否自动托管 Windows 系统代理
     # 本账号管理中的独立读取通道。资料与粉丝已支持直连；其余三项保留
     # 独立开关，待协议完整可验证后无需再迁移配置。
     douyin_profile_mode: str = "hybrid"      # hybrid | api | browser
@@ -80,13 +96,14 @@ class EngineConfig:
     douyin_dm_sync_mode: str = "hybrid"      # hybrid | api | browser
     douyin_creator_danmaku_mode: str = "hybrid"  # hybrid | api | browser
     douyin_publish_mode: str = "browser"     # browser (api reserved)
-    # browser=页面写入；api=仅网页 HTTP/imapi；hybrid=API 优先、明确拒绝时页面回退。
+    # browser=页面写入(默认推荐，真机拟人交互)；api=仅网页 HTTP/imapi；hybrid=API 优先、明确拒绝时页面回退。
     # 不确定的网络结果一律不回退，避免重复提交非幂等写请求。
-    douyin_write_mode: str = "hybrid"        # 默认 API 优先；明确失败后才回退浏览器
+    douyin_write_mode: str = "browser"       # 默认真机浏览器写入，避免无 DTrait 直连高频触发风控
     xhs_keyword_gap_seconds: float = 10.0    # 同一任务相邻关键词的最小停顿
     xhs_item_gap_seconds: float = 2.5         # 相邻详情/评论读取的最小停顿
     xhs_request_jitter: float = 0.35          # 上述停顿的正向随机抖动比例
     xhs_publish_mode: str = "browser"       # browser | api(API 仅为显式兼容模式)
+    rednote_publish_mode: str = "browser"   # browser | api(API 为实验性 XYS+b1 纯协议直发通道)
     # 小红书 Web 私信。监控只读；命中规则后仍进入统一 DM 限速队列。
     xhs_dm_monitor_enabled: bool = False
     xhs_dm_poll_interval_seconds: int = 120
@@ -94,18 +111,18 @@ class EngineConfig:
     xhs_dm_realtime_debounce_seconds: float = 1.5
     xhs_dm_fallback_interval_seconds: int = 600
     xhs_dm_max_conversations_per_poll: int = 2
-    xhs_dm_poll_jitter: float = 0.35
+    xhs_dm_poll_jitter: float = 0.0
     xhs_dm_auto_reply_enabled: bool = False
     active_accounts: int = 3                # 同一时刻最多并发活跃的账号数(错峰)
-    scan_jitter: float = 0.15              # 周期扫描额外等待 0–15%，同一轮稳定，不缩短基础周期
-    initial_scan_spread_seconds: int = 60  # 新监控/规则首次自动执行额外等待 0–60 秒；0 关闭
+    scan_jitter: float = 0.0                # 周期扫描额外等待上限比例(0=关闭,由风控中心随机错峰开关统一管理)
+    initial_scan_spread_seconds: int = 0    # 新监控/规则首次自动执行额外等待上限(秒,0=关闭)
     route_download_via_proxy: bool = True   # 媒体下载是否走账号代理(避免 CDN 拉流暴露真实 IP)
-    # ── 自动评论风控闸(写操作最敏感,宁慢勿快)──
-    comment_daily_cap_per_account: int = 30  # 每账号每日自动评论总上限(跨所有规则),0=不限
-    comment_min_gap_seconds: int = 60        # 同账号两条评论的全局最小间隔(秒)
-    comment_jitter: float = 0.4              # 评论排队间隔额外增加 0–40%，不缩短最小间隔
-    comment_hourly_cap_per_account: int = 10  # 每账号每小时自动评论上限(比日上限更贴人类节律),0=不限
-    comment_risk_cooldown_seconds: int = 21600  # 平台拒绝/验证后暂停该账号写操作(默认6小时)
+    # ── 自动评论基础限制(默认全部关闭/0=不限,需要限制时建议在「风控中心 → 风控规则」统一开启)──
+    comment_daily_cap_per_account: int = 0   # 每账号每日自动评论总上限(跨所有规则),0=不限
+    comment_min_gap_seconds: int = 0         # 同账号两条评论的全局最小间隔(秒),0=不限
+    comment_jitter: float = 0.0              # 评论排队间隔额外等待上限比例(0=关闭)
+    comment_hourly_cap_per_account: int = 0  # 每账号每小时自动评论上限,0=不限
+    comment_risk_cooldown_seconds: int = 21600  # 平台拒绝/验证后暂停该账号写操作参考时长(默认6小时)
     # 小红书评论发布通道:browser=页面操作;api=显式兼容;manual=只保留草稿。
     xhs_comment_write_mode: str = "browser"  # browser | api | manual
     # true=先存草稿,人工点击“通过”后由队列自动发布; false=生成后直接排队发布。
@@ -113,25 +130,27 @@ class EngineConfig:
     # 抖音发评论用有头浏览器(弹真实窗口):抖音对无头写操作常降级/拦截,有头更稳,
     # 且能让你手动过验证码;量大嫌弹窗可设 false 试无头。
     comment_browser_headed: bool = True
-    # ── 本账号写操作风控闸(取关/回关/私信,与自动评论同级)──
-    #   关注/取关是抖音封号重灾区,默认比评论更保守。
-    action_daily_cap_per_account: int = 20   # 每账号每日写操作总上限(跨所有动作),0=不限
-    action_hourly_cap_per_account: int = 6   # 每账号每小时写操作上限,0=不限
-    action_min_gap_seconds: int = 90         # 同账号两次写操作全局最小间隔(与任务级 min_gap 取大)
-    # ── 活跃时段(夜间静默)──
-    #   仅约束「写操作」(评论/关注/取关/私信)自动排队执行;读取抓取不受影响。
-    #   按东八区(账号时区)小时判定,避免整个账号矩阵在深夜齐发的机器特征。
-    quiet_hours_enabled: bool = True         # 夜间静默总开关
+    # ── 本账号写操作基础限制(取关/回关/私信,默认0=不限,需要限制时在「风控中心 → 风控规则」统一开启)──
+    action_daily_cap_per_account: int = 0    # 每账号每日写操作总上限(跨所有动作),0=不限
+    action_hourly_cap_per_account: int = 0   # 每账号每小时写操作上限,0=不限
+    action_min_gap_seconds: int = 0          # 同账号两次写操作全局最小间隔(秒),0=不限
+    # ── 活跃时段(夜间静默与人类作息节律,默认关闭,按需在「风控中心 → 风控规则」开启)──
+    quiet_hours_enabled: bool = False        # 夜间静默总开关(默认关闭)
+    quiet_hours_include_reads: bool = False  # 夜间静默期间是否同步休眠后台监控/评论采集/登录态体检(默认关闭)
+    quiet_hours_wake_jitter_minutes: int = 0  # 每账号每日独立苏醒/入睡随机偏移上限(0-120 分钟,0=关闭)
     active_hours_start: int = 8              # 活跃起点小时(含),0-23
     active_hours_end: int = 24               # 活跃止点小时(不含);可 >24 表示跨零点(如 25=次日 1 点)
     verify_proxy_region: bool = True         # 体检时探测代理出口国家,与账号时区不一致则告警
-    # 新建 native 账号的写操作环境门禁。存量 legacy 账号不受这组开关影响。
-    native_write_gate_enabled: bool = True
+    # ── 代理防关联提醒策略（默认仅提醒不强拦，允许本机直连与多号共用代理）──
+    strict_proxy_required: bool = False      # 兼容保留字段；已改为非阻断式风险提醒，不再强制拦截本机直连
+    forbid_same_platform_shared_proxy: bool = False  # 兼容保留字段；已改为非阻断式风险提醒，不再强制拦截一号多绑
+    # 新建 native 账号的写操作环境门禁(默认关闭，按需在「风控中心 → 风控规则 → 高级与维护」开启)。
+    native_write_gate_enabled: bool = False
     native_write_require_system_chrome: bool = True
     native_write_require_verified_proxy: bool = True
     native_write_proxy_max_age_seconds: int = 86400
     browser_exit_probe_url: str = "https://ipinfo.io/json"
-    # ── 本账号作品健康监控(B5:盯自己作品的流量/0播/违规,发现异常推送通知)──
+    # ── 本账号作品健康监控(盯自己作品的流量/0播/违规,发现异常推送通知)──
     # 默认关闭；启用后需定期同步本账号作品，资源开销较高。
     work_health_enabled: bool = False         # 作品健康监控总开关
     work_health_interval_seconds: int = 3600  # 每个账号多久体检一次自己作品
@@ -147,50 +166,72 @@ class ServerConfig:
 
 
 @dataclass
+class LoggingConfig:
+    level: str = "info"                     # info | debug | warning
+    dir: str = "./logs"                     # 日志目录(可用 CREATORHUB_LOG_DIR 覆盖)
+    max_bytes: int = 5 * 1024 * 1024        # app.log 单文件体积上限(默认 5 MB)
+    backup_count: int = 4                   # app.log 滚动备份数量
+    error_max_bytes: int = 2 * 1024 * 1024  # error.log 单文件体积上限(默认 2 MB)
+    error_backup_count: int = 3             # error.log 滚动备份数量
+    slow_request_ms: int = 3000             # 慢请求告警阈值(毫秒,0=关闭)
+    log_mutations: bool = True              # 记录写请求(POST/PUT/PATCH/DELETE)轨迹,高频轮询默认静默
+
+
+@dataclass
 class RiskControlConfig:
-    """Conservative cross-feature limits for platform-facing account activity."""
-    enabled: bool = True
-    mode: str = "conservative"
+    """Unified, opt-in cross-feature risk control rules (all disabled by default)."""
+    # 总开关默认关闭；开启后仅生效下方已勾选的子规则模块
+    enabled: bool = False
+    # custom=所见即所得（输入值直接生效）；conservative 保留用于兼容旧配置文件
+    mode: str = "custom"
+    # 分模块独立开关（全部默认关闭，用户可按需勾选或在 UI 一键套用场景方案）
+    cooldown_enabled: bool = False        # 异常自动冷却与渐进恢复
+    write_limits_enabled: bool = False    # 写操作间隔与每小时/每日额度保护
+    pacing_enabled: bool = False          # 读写防抖与连续操作自动休息
+    network_guard_enabled: bool = False   # 同网络出口串行与多号熔断保护
+    jitter_enabled: bool = False          # 自动任务随机错峰（扫描/评论/私信/首跑/重试）
+    # 以下参数仅在对应模块开启时生效，默认预填稳妥均衡参考值便于一键开启
     network_group_concurrency: int = 1
-    read_light_gap_seconds: int = 20
-    read_heavy_gap_seconds: int = 60
-    shared_write_gap_seconds: int = 300
-    comment_min_gap_seconds: int = 600
-    comment_hourly_cap: int = 3
-    comment_daily_cap: int = 10
-    social_min_gap_seconds: int = 900
-    social_hourly_cap: int = 2
-    social_daily_cap: int = 8
-    dm_min_gap_seconds: int = 900
-    dm_hourly_cap: int = 2
-    dm_daily_cap: int = 8
-    publish_min_gap_seconds: int = 7200
-    publish_hourly_cap: int = 1
-    publish_daily_cap: int = 3
-    combined_action_hourly_cap: int = 3
-    combined_action_daily_cap: int = 10
+    read_light_gap_seconds: int = 15
+    read_heavy_gap_seconds: int = 45
+    shared_write_gap_seconds: int = 180
+    comment_min_gap_seconds: int = 300
+    comment_hourly_cap: int = 6
+    comment_daily_cap: int = 20
+    social_min_gap_seconds: int = 480
+    social_hourly_cap: int = 4
+    social_daily_cap: int = 15
+    dm_min_gap_seconds: int = 480
+    dm_hourly_cap: int = 4
+    dm_daily_cap: int = 15
+    publish_min_gap_seconds: int = 3600
+    publish_hourly_cap: int = 2
+    publish_daily_cap: int = 5
+    combined_action_hourly_cap: int = 6
+    combined_action_daily_cap: int = 20
     cooldown_steps_seconds: List[int] = field(
         default_factory=lambda: [1800, 7200, 21600, 86400])
     recovery_successes: int = 3
     recovery_probe_gap_seconds: int = 600
     event_retention_days: int = 30
     # 同一网络出口下多个 native 账号在短时间内同时命中平台风险时，
-    # 暂停该出口下所有 native 账号的写操作。
+    # 暂停该出口下所有 native 账号的写操作（仅在 network_guard_enabled=True 时生效）。
     network_group_risk_accounts: int = 2
     network_group_risk_window_seconds: int = 900
     network_group_cooldown_seconds: int = 7200
-    # Account-wide pacing supplements, never replaces, per-operation limits.
-    operation_gap_min_seconds: int = 8
-    operation_gap_max_seconds: int = 25
-    session_operation_limit: int = 12
-    session_rest_min_seconds: int = 180
-    session_rest_max_seconds: int = 480
-    network_retry_jitter_seconds: int = 30  # 网络失败在至少 5 分钟退避上额外等待 0–30 秒
+    # 账号级操作节奏与连续操作休息（仅在 pacing_enabled=True 时生效）。
+    operation_gap_min_seconds: int = 6
+    operation_gap_max_seconds: int = 18
+    session_operation_limit: int = 15
+    session_rest_min_seconds: int = 120
+    session_rest_max_seconds: int = 300
+    network_retry_jitter_seconds: int = 30  # 网络失败退避额外随机等待上限（仅 jitter_enabled=True 时生效）
 
 
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     risk_control: RiskControlConfig = field(default_factory=RiskControlConfig)
     db_path: str = "./data/creatorhub.db"
@@ -216,6 +257,9 @@ def load_config(path: str | None = None) -> Config:
         cfg.engine.xhs_read_mode = (
             xhs_read_mode if xhs_read_mode in {"browser", "api"}
             else "api")
+        for pub_name in ("xhs_publish_mode", "rednote_publish_mode"):
+            pub_val = str(getattr(cfg.engine, pub_name, "browser") or "browser").strip().lower()
+            setattr(cfg.engine, pub_name, pub_val if pub_val in {"browser", "api"} else "browser")
         tiktok_read_mode = str(
             cfg.engine.tiktok_read_mode or "native").strip().lower()
         cfg.engine.tiktok_read_mode = (
@@ -231,13 +275,22 @@ def load_config(path: str | None = None) -> Config:
         proxy_port = int(cfg.engine.channels_proxy_port or 2023)
         cfg.engine.channels_proxy_port = proxy_port if 1024 <= proxy_port <= 65535 else 2023
         for name, default in (
+                ("rednote_read_mode", "hybrid"),
+                ("bilibili_read_mode", "hybrid"),
+                ("bilibili_write_mode", "hybrid"),
                 ("douyin_read_mode", "hybrid"),
                 ("douyin_profile_mode", "hybrid"),
                 ("douyin_followers_mode", "hybrid"),
                 ("douyin_dm_sync_mode", "hybrid"),
                 ("douyin_creator_danmaku_mode", "hybrid"),
                 ("douyin_publish_mode", "browser"),
-                ("douyin_write_mode", "hybrid")):
+                ("douyin_write_mode", "browser"),
+                ("bilibili_read_mode", "hybrid"),
+                ("bilibili_write_mode", "hybrid"),
+                ("instagram_read_mode", "hybrid"),
+                ("instagram_write_mode", "hybrid"),
+                ("twitter_read_mode", "hybrid"),
+                ("facebook_read_mode", "hybrid")):
             mode = str(getattr(cfg.engine, name, default) or default).strip().lower()
             setattr(cfg.engine, name, mode if mode in {"hybrid", "api", "browser"}
                     else default)
@@ -262,6 +315,10 @@ def load_config(path: str | None = None) -> Config:
             setattr(cfg.engine, name, min(1.0, max(0.0, value)) if math.isfinite(value) else 0.0)
         cfg.engine.initial_scan_spread_seconds = max(
             0, min(600, int(cfg.engine.initial_scan_spread_seconds)))
+        cfg.engine.quiet_hours_wake_jitter_minutes = max(
+            0, min(120, int(cfg.engine.quiet_hours_wake_jitter_minutes)))
+        cfg.engine.shipinhao_keepalive_interval_seconds = max(
+            0, min(86400, int(cfg.engine.shipinhao_keepalive_interval_seconds or 0)))
         cfg.engine.browser_session_idle_seconds = max(
             0, int(cfg.engine.browser_session_idle_seconds))
         if cfg.engine.xhs_cdp_idle_seconds is not None:
@@ -285,13 +342,47 @@ def load_config(path: str | None = None) -> Config:
             k: v for k, v in risk.items()
             if k in RiskControlConfig.__dataclass_fields__
         }
-        mode = str(risk_values.get("mode", "conservative") or "").strip().lower()
+        mode = str(risk_values.get("mode", "custom") or "").strip().lower()
         risk_values["mode"] = (
-            mode if mode in {"conservative", "custom"} else "conservative")
+            mode if mode in {"conservative", "custom"} else "custom")
+        module_keys = (
+            "cooldown_enabled", "write_limits_enabled", "pacing_enabled",
+            "network_guard_enabled", "jitter_enabled",
+        )
+        if risk_values.get("enabled") is True and not any(k in risk_values for k in module_keys):
+            risk_values["cooldown_enabled"] = True
+            risk_values["write_limits_enabled"] = True
+            risk_values["pacing_enabled"] = True
+            risk_values["network_guard_enabled"] = True
+            risk_values["jitter_enabled"] = any((
+                cfg.engine.scan_jitter > 0,
+                cfg.engine.comment_jitter > 0,
+                cfg.engine.xhs_dm_poll_jitter > 0,
+                cfg.engine.initial_scan_spread_seconds > 0,
+            ))
         cfg.risk_control = RiskControlConfig(**risk_values)
+        log_raw = raw.get("logging", {}) or {}
+        if isinstance(log_raw, dict):
+            log_values = {
+                k: v for k, v in log_raw.items()
+                if k in LoggingConfig.__dataclass_fields__
+            }
+            cfg.logging = LoggingConfig(**log_values)
         cfg.db_path = (raw.get("storage", {}) or {}).get("db_path", cfg.db_path)
         px = raw.get("proxies") or []
         cfg.proxies = [str(p).strip() for p in px if str(p).strip()]
+    env_log_dir = os.environ.get("CREATORHUB_LOG_DIR", "").strip()
+    if env_log_dir:
+        cfg.logging.dir = env_log_dir
+    env_log_level = os.environ.get("CREATORHUB_LOG_LEVEL", "").strip().lower()
+    raw_level = env_log_level or str(cfg.logging.level or "info").strip().lower()
+    cfg.logging.level = raw_level if raw_level in {"debug", "info", "warning", "error"} else "info"
+    cfg.logging.max_bytes = max(512 * 1024, min(50 * 1024 * 1024, int(cfg.logging.max_bytes or 5 * 1024 * 1024)))
+    cfg.logging.backup_count = max(1, min(10, int(cfg.logging.backup_count or 4)))
+    cfg.logging.error_max_bytes = max(256 * 1024, min(20 * 1024 * 1024, int(cfg.logging.error_max_bytes or 2 * 1024 * 1024)))
+    cfg.logging.error_backup_count = max(1, min(10, int(cfg.logging.error_backup_count or 3)))
+    cfg.logging.slow_request_ms = max(0, min(60000, int(cfg.logging.slow_request_ms or 0)))
+    cfg.logging.log_mutations = bool(cfg.logging.log_mutations)
     if not cfg.engine.channels_cdp_endpoint:
         cfg.engine.channels_cdp_endpoint = os.environ.get(
             "CREATORHUB_CHANNELS_CDP_ENDPOINT", ""

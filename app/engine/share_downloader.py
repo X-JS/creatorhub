@@ -59,15 +59,16 @@ class ShareURL:
 _PLATFORM_DOMAINS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("douyin", ("douyin.com", "iesdouyin.com")),
     ("xhs", ("xiaohongshu.com", "xhslink.com")),
+    ("rednote", ("rednote.com",)),
     ("kuaishou", ("kuaishou.com", "kwai.com", "gifshow.com")),
     ("bilibili", ("bilibili.com", "b23.tv")),
     ("weibo", ("weibo.com", "weibo.cn")),
     ("wechat", ("weixin.qq.com", "qq.com", "yuanbao.tencent.com")),
     ("youtube", ("youtube.com", "youtu.be")),
     ("tiktok", ("tiktok.com",)),
-    ("instagram", ("instagram.com",)),
-    ("facebook", ("facebook.com", "fb.watch")),
-    ("twitter", ("twitter.com", "x.com")),
+    ("instagram", ("instagram.com", "instagr.am")),
+    ("facebook", ("facebook.com", "fb.watch", "fb.me", "fb.com")),
+    ("twitter", ("twitter.com", "x.com", "t.co", "vxtwitter.com", "fxtwitter.com")),
     ("vimeo", ("vimeo.com",)),
     ("acfun", ("acfun.cn",)),
     ("ixigua", ("ixigua.com",)),
@@ -581,8 +582,9 @@ class ShareDownloader:
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
             },
         }
-        if proxy:
-            options["proxy"] = proxy
+        from app.netfp import curl_proxy_url
+        # 显式传入空字符串可禁止 yt-dlp 隐式读取系统注册表/环境变量代理；socks5 自动转 socks5h 走远端 DNS
+        options["proxy"] = curl_proxy_url(proxy) if proxy else ""
         if cookie_file:
             options["cookiefile"] = cookie_file
         return options

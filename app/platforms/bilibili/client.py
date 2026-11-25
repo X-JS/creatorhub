@@ -1,6 +1,7 @@
 """哔哩哔哩直连 HTTP 客户端（Web / 创作中心 / WBI 签名 / VC 私信 / Cookie 刷新）。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -12,7 +13,7 @@ from urllib.parse import urlencode
 from curl_cffi.requests import AsyncSession
 
 from ...browser.manager import normalize_proxy
-from ...netfp import impersonate_for_ua
+from ...netfp import curl_proxy_url, impersonate_for_ua
 from .._submit import notify_submit
 from .extract import (
     Aweme,
@@ -27,7 +28,7 @@ from .extract import (
     parse_bili_self_user,
 )
 from .formatter import FALLBACK_PARTITIONS, play_source_percent
-from .im_codec import create_uuid_v1
+from .im_codec import create_uuid_v1_factory
 from .resolve import av_to_bv, bv_to_av, resolve_bili_work_ref
 from .wbi import (
     VC_COMMON_PARAMS,
@@ -125,6 +126,58 @@ def has_bili_login_cookies(storage_state: str | Mapping[str, Any] | None) -> boo
     return bool(cks.get("SESSDATA") and cks.get("bili_jct"))
 
 
+def _derive_bili_account_seed(
+    account_seed: str,
+    cookies: Mapping[str, str],
+    user_agent: str,
+    proxy: Optional[str],
+) -> str:
+    explicit = str(account_seed or "").strip()
+    if explicit:
+        return explicit
+    material = (
+        cookies.get("DedeUserID")
+        or cookies.get("SESSDATA")
+        or cookies.get("bili_jct")
+        or f"{user_agent}|{proxy or 'direct'}"
+    )
+    return hashlib.sha256(f"bili-acct-seed|{material}".encode("utf-8")).hexdigest()[:32]
+
+
+def _derive_bili_infoc_id(seed: str, purpose: str) -> str:
+    """按账号种子确定性派生符合 B 站 Web 端格式的 `buvid3` / `_uuid`（`<UUIDv4-upper><5digits>infoc`）。"""
+    digest = hashlib.sha256(f"bili-{purpose}|{seed}".encode("utf-8")).digest()
+    b = bytearray(digest[:16])
+    b[6] = (b[6] & 0x0F) | 0x40
+    b[8] = (b[8] & 0x3F) | 0x80
+    hx = bytes(b).hex().upper()
+    uuid_str = f"{hx[0:8]}-{hx[8:12]}-{hx[12:16]}-{hx[16:20]}-{hx[20:32]}"
+    tail = int.from_bytes(digest[16:20], "big") % 100000
+    return f"{uuid_str}{tail:05d}infoc"
+
+
+def _bili_client_hints(user_agent: str) -> Dict[str, str]:
+    ua = str(user_agent or DEFAULT_UA)
+    m = re.search(r"Chrome/(\d+)", ua)
+    major = int(m.group(1)) if m else 131
+    if "Edg/" in ua:
+        brands = f'"Chromium";v="{major}", "Microsoft Edge";v="{major}", "Not?A_Brand";v="99"'
+    else:
+        brands = f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not?A_Brand";v="99"'
+    platform = (
+        '"macOS"'
+        if ("Mac OS" in ua or "Macintosh" in ua)
+        else '"Linux"'
+        if ("Linux" in ua and "Android" not in ua)
+        else '"Windows"'
+    )
+    return {
+        "sec-ch-ua": brands,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": platform,
+    }
+
+
 class BilibiliClient:
     """B 站多域统一异步客户端（按账号隔离 Cookie、UA、TLS 指纹与代理）。"""
 
@@ -136,12 +189,21 @@ class BilibiliClient:
         proxy: str = "",
         timeout: float = 20.0,
         locale: str = "zh-CN",
+        account_seed: str = "",
     ):
         self.cookies: Dict[str, str] = cookie_map_from_state(storage_state)
         self.user_agent = str(user_agent or DEFAULT_UA)
-        self.proxy = normalize_proxy(proxy) or None
+        self.proxy = curl_proxy_url(proxy) or None
         self.timeout = float(timeout)
         self.locale = locale or "zh-CN"
+        self.account_seed = _derive_bili_account_seed(
+            account_seed, self.cookies, self.user_agent, self.proxy
+        )
+        self._uuid_v1 = create_uuid_v1_factory(account_seed=self.account_seed)
+        if not self.cookies.get("buvid3"):
+            self.cookies["buvid3"] = _derive_bili_infoc_id(self.account_seed, "buvid3")
+        if not self.cookies.get("_uuid"):
+            self.cookies["_uuid"] = _derive_bili_infoc_id(self.account_seed, "_uuid")
         self.impersonate = impersonate_for_ua(self.user_agent)
         self.last_error: str = ""
         self._session: Optional[AsyncSession] = None
@@ -149,6 +211,8 @@ class BilibiliClient:
         self._wbi_fetched_at: float = 0.0
         self._buvid_checked: bool = False
         self._mid: str = str(self.cookies.get("DedeUserID") or "")
+        self._initial_cookies: Dict[str, str] = dict(self.cookies)
+        self._captured_set_cookies: List[Tuple[str, str]] = []
 
     @property
     def csrf(self) -> str:
@@ -163,7 +227,7 @@ class BilibiliClient:
         if self._session is not None:
             yield self
             return
-        async with AsyncSession(impersonate=self.impersonate) as sess:
+        async with AsyncSession(impersonate=self.impersonate, trust_env=False) as sess:
             self._session = sess
             try:
                 yield self
@@ -182,6 +246,7 @@ class BilibiliClient:
             "Accept-Language": f"{self.locale},zh;q=0.9,en;q=0.8",
             "Referer": referer,
             "User-Agent": self.user_agent,
+            **_bili_client_hints(self.user_agent),
         }
         if origin:
             hdrs["Origin"] = origin
@@ -221,7 +286,7 @@ class BilibiliClient:
                 quote=curl_quote,
             )
         else:
-            async with AsyncSession(impersonate=self.impersonate) as sess:
+            async with AsyncSession(impersonate=self.impersonate, trust_env=False) as sess:
                 resp = await sess.request(
                     method,
                     url,
@@ -233,6 +298,12 @@ class BilibiliClient:
                     timeout=self.timeout,
                     quote=curl_quote,
                 )
+        try:
+            from ...services.session_keepalive import extract_set_cookie_lines
+            for line in extract_set_cookie_lines(resp):
+                self._captured_set_cookies.append((url, line))
+        except Exception:
+            pass
         try:
             for k, v in resp.cookies.items():
                 if k and v is not None:
@@ -324,18 +395,12 @@ class BilibiliClient:
         return payload, ""
 
     async def ensure_buvid(self) -> None:
-        """补齐 `buvid3` / `buvid4` 指纹 Cookie，降低公开搜索与空间接口风控率。"""
-        if self._buvid_checked or (self.cookies.get("buvid3") and self.cookies.get("buvid4")):
-            self._buvid_checked = True
-            return
+        """确保账号稳定的 `buvid3` / `_uuid` 指纹 Cookie 已就绪，避免每次实例化请求 `/x/frontend/finger/spi` 产生漂移标识。"""
+        if not self.cookies.get("buvid3"):
+            self.cookies["buvid3"] = _derive_bili_infoc_id(self.account_seed, "buvid3")
+        if not self.cookies.get("_uuid"):
+            self.cookies["_uuid"] = _derive_bili_infoc_id(self.account_seed, "_uuid")
         self._buvid_checked = True
-        payload, _ = await self._get_json(f"{API_BASE}/x/frontend/finger/spi")
-        data = (payload or {}).get("data") if isinstance(payload, dict) else None
-        if isinstance(data, Mapping):
-            if data.get("b_3") and not self.cookies.get("buvid3"):
-                self.cookies["buvid3"] = str(data["b_3"])
-            if data.get("b_4") and not self.cookies.get("buvid4"):
-                self.cookies["buvid4"] = str(data["b_4"])
 
     async def ensure_wbi_key(self, *, force: bool = False) -> str:
         """获取并缓存 WBI `mixin_key`（即使未登录 `code == -101` 时 `nav` 也会返回 `wbi_img`）。"""
@@ -404,16 +469,24 @@ class BilibiliClient:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         return data, ""
 
-    async def refresh_cookies(self, refresh_token: str) -> Tuple[dict, str]:
+    async def refresh_cookies(
+        self,
+        refresh_token: str,
+        *,
+        timestamp_ms: int | None = None,
+    ) -> Tuple[dict, str]:
         """通过 B 站官方 RSA-OAEP `correspond/1` 握手流程刷新即将过期的会话。"""
         old_token = str(refresh_token or "").strip()
         old_csrf = self.csrf
         if not old_token or not old_csrf:
             return {}, "缺 refresh_token 或 bili_jct"
-        info, err = await self.check_cookie_refresh()
-        if err:
-            return {}, err
-        ts = int(info.get("timestamp") or int(time.time() * 1000))
+        if timestamp_ms and int(timestamp_ms) > 0:
+            ts = int(timestamp_ms)
+        else:
+            info, err = await self.check_cookie_refresh()
+            if err:
+                return {}, err
+            ts = int(info.get("timestamp") or int(time.time() * 1000))
         correspond_path = get_correspond_path(ts)
         try:
             corr_resp = await self._request(
@@ -443,15 +516,119 @@ class BilibiliClient:
         if ref_err or not ref_payload:
             return {}, ref_err or "refresh_failed"
         data = ref_payload.get("data") if isinstance(ref_payload.get("data"), dict) else {}
-        new_token = str(data.get("refresh_token") or "")
+        new_token = str(data.get("refresh_token") or "").strip()
         new_csrf = self.csrf or old_csrf
-        await self._post_write_form(
-            f"{PASSPORT_BASE}/x/passport-login/web/confirm/refresh",
-            {"csrf": new_csrf, "refresh_token": old_token},
-            referer="https://www.bilibili.com/",
-            origin="https://www.bilibili.com",
-        )
+        if new_token:
+            _, confirm_err = await self._post_write_form(
+                f"{PASSPORT_BASE}/x/passport-login/web/confirm/refresh",
+                {"csrf": new_csrf, "refresh_token": old_token},
+                referer="https://www.bilibili.com/",
+                origin="https://www.bilibili.com",
+            )
+            if confirm_err:
+                return {
+                    "refresh_token": new_token,
+                    "cookies": dict(self.cookies),
+                    "confirm_warning": confirm_err,
+                }, ""
         return {"refresh_token": new_token, "cookies": dict(self.cookies)}, ""
+
+    def export_refreshed_state(
+        self,
+        base_state: str | Mapping[str, Any] | None,
+        *,
+        new_refresh_token: str = "",
+    ) -> Tuple[Optional[dict], bool]:
+        """将本次会话收到的 Set-Cookie、轮换 Cookie 及新 refresh_token 合并回 storage_state。"""
+        from ...services.session_keepalive import (
+            merge_set_cookies_into_state,
+            upsert_local_storage_value,
+        )
+
+        changed_kv = {
+            k: v for k, v in self.cookies.items()
+            if k and v and self._initial_cookies.get(k) != v
+        }
+        if not self._captured_set_cookies and not changed_kv and not new_refresh_token:
+            return None, False
+
+        merged, changed = merge_set_cookies_into_state(
+            base_state,
+            self._captured_set_cookies,
+            platform="bilibili",
+            url=WWW_BASE + "/",
+            cookie_updates=changed_kv,
+            default_ttl_seconds=180 * 86400 if new_refresh_token else 0,
+        )
+        if merged is None:
+            return None, False
+        token_changed = False
+        if new_refresh_token:
+            token_changed = upsert_local_storage_value(
+                merged,
+                WWW_BASE,
+                "ac_time_value",
+                new_refresh_token,
+                update_existing_hosts=("bilibili.com",),
+            )
+        return merged, bool(changed or token_changed)
+
+    async def maybe_refresh_cookies(
+        self,
+        base_state: str | Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        """按 B 站官方机制检查是否需要 Cookie 续期；若需要且具备 ac_time_value 则自动完成续期。"""
+        from ...services.session_keepalive import extract_bili_refresh_token
+
+        info, err = await self.check_cookie_refresh()
+        if err:
+            return {"checked": False, "refresh_needed": False, "refreshed": False, "error": err}
+        refresh_needed = bool(info.get("refresh"))
+        if not refresh_needed:
+            merged, changed = self.export_refreshed_state(base_state)
+            return {
+                "checked": True,
+                "refresh_needed": False,
+                "refreshed": False,
+                "state": merged,
+                "changed": changed,
+                "error": "",
+            }
+
+        old_token = extract_bili_refresh_token(base_state)
+        if not old_token:
+            return {
+                "checked": True,
+                "refresh_needed": True,
+                "refreshed": False,
+                "missing_refresh_token": True,
+                "state": None,
+                "changed": False,
+                "error": "missing_ac_time_value",
+            }
+
+        ts_ms = int(info.get("timestamp") or 0) or None
+        res, ref_err = await self.refresh_cookies(old_token, timestamp_ms=ts_ms)
+        if ref_err or not res:
+            return {
+                "checked": True,
+                "refresh_needed": True,
+                "refreshed": False,
+                "state": None,
+                "changed": False,
+                "error": ref_err or "refresh_failed",
+            }
+        new_token = str(res.get("refresh_token") or "").strip()
+        merged, changed = self.export_refreshed_state(base_state, new_refresh_token=new_token)
+        return {
+            "checked": True,
+            "refresh_needed": True,
+            "refreshed": bool(merged is not None),
+            "new_refresh_token": bool(new_token),
+            "state": merged,
+            "changed": bool(changed or merged is not None),
+            "error": "" if merged is not None else "invalid_refreshed_state",
+        }
 
     async def fetch_self_profile(self) -> Tuple[dict, str]:
         """校验登录态并拉取账号昵称、头像、UID、粉丝/关注数及投稿总数。"""
@@ -1523,7 +1700,7 @@ class BilibiliClient:
         except Exception as exc:
             return False, str(exc), {}
 
-        dev = (str(dev_id or "").strip() or create_uuid_v1()).upper()
+        dev = (str(dev_id or "").strip() or self._uuid_v1()).upper()
         signed = sign_with_key(
             mixin_key,
             {

@@ -1,0 +1,1180 @@
+  <section data-panel="settings">
+  <div class="card appearance-card" data-section="appearance">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-sun"/></svg></span>
+      <h2>外观与体验 <span class="sub">所有平台共用 · 即选即生效</span></h2>
+    </div>
+    <fieldset class="appearance-fieldset">
+      <legend>画面主题</legend>
+      <div class="appearance-options">
+        <label class="appearance-choice">
+          <span class="theme-preview light" aria-hidden="true"><span class="theme-preview-side"></span><span class="theme-preview-main"></span></span>
+          <span><span class="appearance-choice-line"><input type="radio" name="appearance-theme" value="light"><b>日间</b></span><small>清晰明亮，专注工作</small></span>
+        </label>
+        <label class="appearance-choice">
+          <span class="theme-preview dark" aria-hidden="true"><span class="theme-preview-side"></span><span class="theme-preview-main"></span></span>
+          <span><span class="appearance-choice-line"><input type="radio" name="appearance-theme" value="dark"><b>夜间</b></span><small>柔和暗色，减少眩光</small></span>
+        </label>
+        <label class="appearance-choice">
+          <span class="theme-preview system" aria-hidden="true"><span class="theme-preview-side"></span><span class="theme-preview-main"></span></span>
+          <span><span class="appearance-choice-line"><input type="radio" name="appearance-theme" value="system" checked><b>跟随系统</b></span><small>随设备外观自动切换</small></span>
+        </label>
+      </div>
+    </fieldset>
+    <div class="appearance-bottom">
+      <fieldset class="appearance-fieldset">
+        <legend>界面密度</legend>
+        <div class="density-options">
+          <label><input type="radio" name="appearance-density" value="comfortable" checked>舒适</label>
+          <label><input type="radio" name="appearance-density" value="compact">紧凑</label>
+        </div>
+        <p class="field-help">调整卡片间距与表格行高，手机端保留舒适的点击空间。</p>
+      </fieldset>
+      <div>
+        <label class="check appearance-motion"><input type="checkbox" id="appearance-motion">减少界面动效</label>
+        <p class="field-help">简化切换与加载动画；系统的减少动态效果设置始终生效。</p>
+        <label class="check appearance-motion"><input type="checkbox" id="appearance-transparency">减少玻璃透明与模糊</label>
+        <p class="field-help">将顶部栏、导航与浮层切换为高不透明实体表面，兼顾低功耗与更高对比度。</p>
+      </div>
+    </div>
+    <div class="appearance-status"><svg aria-hidden="true"><use href="#i-check"/></svg><span id="appearance-status" role="status" aria-live="polite">偏好自动保存在此浏览器</span></div>
+  </div>
+  <!-- 下载设置 -->
+  <div class="card" data-section="downloads">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-download"/></svg></span>
+      <h2>下载设置 <span class="sub">全局默认</span></h2>
+    </div>
+    <div class="form-grid download-grid">
+      <div class="form-field">
+        <label for="dl-dir">默认下载目录</label>
+        <input id="dl-dir" placeholder="例如 D:\douyin\downloads；留空使用 ./data/media">
+        <div class="field-help">系统会在该目录下按作者昵称自动创建子文件夹</div>
+      </div>
+      <div class="form-field">
+        <label for="dl-quality">默认视频画质</label>
+        <select id="dl-quality">
+          <option value="highest">原画 / 最高</option>
+          <option value="1080">1080P</option>
+          <option value="720">720P</option>
+          <option value="540">540P</option>
+          <option value="lowest">最低省流</option>
+        </select>
+        <div class="field-help">单个监控目标可单独覆盖</div>
+      </div>
+    </div>
+    <div class="form-actions">
+      <span class="status-text" id="dl-msg" role="status" aria-live="polite"></span>
+      <button onclick="saveSettings()"><svg><use href="#i-check"/></svg>保存下载设置</button>
+    </div>
+  </div>
+
+  <!-- 大模型 API(统一 AI 文案配置中心)-->
+  <div class="card" data-section="ai">
+    <div class="card-head">
+      <span class="card-ic"><svg><use href="#i-bolt"/></svg></span>
+      <h2>AI 文案大模型 <span class="sub">复用共享模型渠道 · 支持多协议、人设预设与自动评论场景路由</span></h2>
+    </div>
+    <div class="stack">
+      <div class="ai-status-strip" id="ai-status-strip" data-state="off">
+        <div class="ai-status-copy">
+          <b id="ai-status-title">AI 文案生成未启用</b>
+          <p id="ai-status-desc">启用后，自动评论规则可直接使用大模型结合作品与评论上下文生成自然回复。</p>
+        </div>
+        <div class="ai-status-actions">
+          <button type="button" class="ghost sm" onclick="openAiChannelsManager()"><svg><use href="#i-settings"/></svg>管理共享模型渠道 →</button>
+        </div>
+      </div>
+
+      <label class="switch-row">
+        <input type="checkbox" id="ai-enabled" onchange="syncAiStatusBanner()">
+        <span class="switch-copy"><b>启用 AI 文案生成（全局总开关）</b><span>关闭后，所有自动评论规则仅使用本地模板库；开启后按各规则的文案策略生效。</span></span>
+      </label>
+
+      <div class="form-field">
+        <label>模型来源</label>
+        <div class="ai-source-seg" role="radiogroup" aria-label="AI 文案模型来源">
+          <label class="ai-source-opt">
+            <input type="radio" name="ai-source" id="ai-source-channel" value="channel" checked onchange="onAiSourceChange()">
+            <span><b>复用 AI 助手共享渠道（推荐）</b><small>无需重复填地址和 API Key，支持 OpenAI / Responses / Anthropic 全协议与模型目录。</small></span>
+          </label>
+          <label class="ai-source-opt">
+            <input type="radio" name="ai-source" id="ai-source-custom" value="custom" onchange="onAiSourceChange()">
+            <span><b>使用独立自定义接口</b><small>单独配置文案专用模型（如便宜高速小模型或本地 Ollama / vLLM），支持多协议。</small></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- 来源 1：复用 AI 助手共享模型渠道 -->
+      <div class="ac-section-box" id="ai-panel-channel">
+        <div class="ac-section-title">
+          <span>共享模型渠道路由</span>
+          <div style="display:flex;gap:6px">
+            <button type="button" class="ghost sm" onclick="refreshAiSharedChannels()">刷新渠道</button>
+            <button type="button" class="ghost sm" onclick="openAiChannelsManager()">添加/编辑渠道 →</button>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="ai-channel-id">选择模型渠道</label>
+            <select id="ai-channel-id" onchange="onAiChannelChange()"></select>
+            <div class="field-help" id="ai-channel-help">默认跟随 AI 助手当前激活渠道；也可为自动评论固定指定更低成本的渠道。</div>
+          </div>
+          <div class="form-field">
+            <label for="ai-channel-model-override">指定模型 ID（可选覆盖）</label>
+            <input id="ai-channel-model-override" list="ai-channel-models-datalist" autocomplete="off" placeholder="留空使用该渠道默认模型" oninput="syncAiStatusBanner()">
+            <datalist id="ai-channel-models-datalist"></datalist>
+            <div class="field-help">例如渠道默认用强模型分析数据，文案这里可覆盖为 <code>deepseek-chat</code> / <code>gpt-4o-mini</code>。</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 来源 2：独立自定义多协议接口 -->
+      <div class="ac-section-box" id="ai-panel-custom" hidden>
+        <div class="ac-section-title">
+          <span>独立模型接口配置</span>
+          <button type="button" class="ghost sm" id="ai-migrate-btn" onclick="migrateAiToChannel()" hidden>一键转存为共享渠道</button>
+        </div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="ai-provider">接口协议</label>
+            <select id="ai-provider" onchange="syncAiStatusBanner()">
+              <option value="openai_compatible">OpenAI Chat Completions（兼容主流模型）</option>
+              <option value="openai_responses">OpenAI Responses</option>
+              <option value="anthropic">Anthropic Messages (Claude)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="ai-path-mode">推理路径拼接</label>
+            <select id="ai-path-mode">
+              <option value="auto">自动：纯域名自动补 /v1，已有前缀保留</option>
+              <option value="exact">原样拼接：直接追加协议端点</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="ai-base">接口基础地址</label>
+            <input id="ai-base" type="url" inputmode="url" autocomplete="url" placeholder="https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1" onblur="validateAiField(this,isAiCustomRequired())" oninput="syncAiStatusBanner()">
+          </div>
+          <div class="form-field">
+            <label for="ai-model">模型名称 / ID</label>
+            <input id="ai-model" autocomplete="off" placeholder="deepseek-chat / qwen-plus / gpt-4o-mini" onblur="validateAiField(this,isAiCustomRequired())" oninput="syncAiStatusBanner()">
+          </div>
+          <div class="form-field">
+            <label for="ai-key">API Key（本地无鉴权模型可留空）</label>
+            <div class="input-affix">
+              <input id="ai-key" type="password" autocomplete="new-password" placeholder="留空不修改已保存密钥；本地模型可不填">
+              <button class="input-action" type="button" onclick="toggleSecretInput('ai-key',this)" aria-label="显示 API Key" aria-pressed="false" title="显示或隐藏 API Key"><svg><use href="#i-eye"/></svg></button>
+            </div>
+            <label class="mut" id="ai-clear-key-wrap" style="display:none;align-items:center;gap:6px;margin-top:6px;font-size:12px">
+              <input type="checkbox" id="ai-clear-key" style="width:auto" onchange="onAiClearKeyToggle()"> 清除已保存的 API Key（更换地址/协议时需重填或勾选清除）
+            </label>
+          </div>
+          <div class="form-field">
+            <label for="ai-token-param">输出长度参数名</label>
+            <select id="ai-token-param">
+              <option value="max_tokens">max_tokens（默认）</option>
+              <option value="max_completion_tokens">max_completion_tokens（OpenAI 新模型/推理模型）</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- 人设预设与生成控制 -->
+      <div class="ac-section-box">
+        <div class="ac-section-title">
+          <span>默认文案人设与生成规范</span>
+          <button type="button" class="ghost sm" onclick="manageAiPresets()">管理自定义人设</button>
+        </div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="ai-default-preset">默认人设预设</label>
+            <select id="ai-default-preset" onchange="onAiPresetChange()"></select>
+            <div class="field-help" id="ai-preset-desc">单条自动评论规则可单独覆盖人设与补充指令。</div>
+          </div>
+          <div class="form-field">
+            <label for="ai-language-mode">目标语种策略</label>
+            <select id="ai-language-mode">
+              <option value="auto">自动匹配平台与对方原文语种（推荐）</option>
+              <option value="zh">始终使用自然中文</option>
+              <option value="en">始终使用自然英文</option>
+            </select>
+            <div class="field-help">海外平台（IG / X / Facebook）选自动即可跟评外语内容。</div>
+          </div>
+          <div class="form-field">
+            <label for="ai-max-chars">单条评论字数上限</label>
+            <input id="ai-max-chars" type="number" min="15" max="300" step="5" value="60">
+            <div class="field-help">控制生成长度（15–300 字），推荐 45–80 字。</div>
+          </div>
+          <div class="form-field">
+            <label for="ai-temp">生成温度（留空跟随模型默认）</label>
+            <input id="ai-temp" type="number" inputmode="decimal" min="0" max="2" step="0.1" placeholder="0.85" onblur="validateAiField(this)">
+            <div class="field-help">建议 0.7–1.0；使用 o1/o3 等推理模型建议留空。</div>
+          </div>
+        </div>
+        <div class="form-field">
+          <label for="ai-prompt">全局补充提示词（可选）</label>
+          <textarea id="ai-prompt" rows="3" placeholder="例如：禁止提及具体价格；遇到夸奖可顺带邀请关注主页。支持下方变量占位符（花括号安全替换，不会报错）。"></textarea>
+          <div class="ai-var-chips" aria-label="点击插入可用变量">
+            <span class="mut" style="font-size:11.5px">点击插入变量：</span>
+            <button type="button" class="ai-var-chip" onclick="insertTextVar('ai-prompt','{source_text}')">{source_text} 对方原文</button>
+            <button type="button" class="ai-var-chip" onclick="insertTextVar('ai-prompt','{work_desc}')">{work_desc} 作品简介</button>
+            <button type="button" class="ai-var-chip" onclick="insertTextVar('ai-prompt','{nick}')">{nick} 对方昵称</button>
+            <button type="button" class="ai-var-chip" onclick="insertTextVar('ai-prompt','{kw}')">{kw} 关键词</button>
+            <button type="button" class="ai-var-chip" onclick="insertTextVar('ai-prompt','{platform_name}')">{platform_name} 平台</button>
+            <button type="button" class="ai-var-chip" onclick="insertTextVar('ai-prompt','{max_chars}')">{max_chars} 字数上限</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 高级参数与网络代理 -->
+      <details class="collection-advanced">
+        <summary>高级生成参数与网络代理（Token 上限 / 超时 / 代理通道）</summary>
+        <div class="collection-advanced-body stack">
+          <div class="form-grid">
+            <div class="form-field">
+              <label for="ai-max-output-tokens">最大输出 Token</label>
+              <input id="ai-max-output-tokens" type="number" min="64" max="2048" step="32" value="256">
+              <div class="field-help">推理/思考模型若返回空正文，可调大至 512–1024。</div>
+            </div>
+            <div class="form-field">
+              <label for="ai-timeout">单次请求超时（秒）</label>
+              <input id="ai-timeout" type="number" min="5" max="90" step="1" value="25">
+            </div>
+            <div class="form-field">
+              <label for="ai-proxy-mode">模型请求网络代理</label>
+              <select id="ai-proxy-mode" onchange="onAiProxyModeChange()">
+                <option value="direct">直连（不走系统代理）</option>
+                <option value="system">跟随本机系统代理</option>
+                <option value="custom">自定义代理地址</option>
+              </select>
+            </div>
+            <div class="form-field" id="ai-proxy-url-wrap" hidden>
+              <label for="ai-proxy-url">自定义代理地址</label>
+              <input id="ai-proxy-url" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" onblur="validateAiField(this)">
+            </div>
+          </div>
+          <label class="switch-row">
+            <input type="checkbox" id="ai-disable-thinking" checked>
+            <span class="switch-copy"><b>跳过长思考链（推荐开启）</b><span>短评场景不主动附加推理参数，并自动清理部分本地模型输出的 <code>&lt;think&gt;</code> 标签。</span></span>
+          </label>
+        </div>
+      </details>
+
+      <!-- 实景生成测试 -->
+      <details class="collection-advanced" id="ai-test-drawer">
+        <summary>实景生成测试（保存前即可验证连通性、语种与人设效果）</summary>
+        <div class="collection-advanced-body stack">
+          <div class="form-grid">
+            <div class="form-field">
+              <label for="ai-test-platform">模拟平台</label>
+              <select id="ai-test-platform">
+                <option value="douyin">抖音</option>
+                <option value="xhs">小红书</option>
+                <option value="bilibili">哔哩哔哩</option>
+                <option value="kuaishou">快手</option>
+                <option value="instagram">Instagram</option>
+                <option value="twitter">X (Twitter)</option>
+                <option value="facebook">Facebook</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label for="ai-test-mode">模拟场景</label>
+              <select id="ai-test-mode">
+                <option value="auto_reply">回复自己作品下的评论</option>
+                <option value="auto_comment">在他人作品下发评论</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-field">
+            <label for="ai-test-work">模拟作品标题/简介</label>
+            <input id="ai-test-work" value="周末露营实测：轻量化天幕搭建全过程，新手 5 分钟搞定">
+          </div>
+          <div class="form-field">
+            <label for="ai-test-source">模拟对方评论 / 原帖内容</label>
+            <input id="ai-test-source" value="这条视频拍得太治愈了，请问天幕是什么牌子的呀？期待更新！">
+          </div>
+          <div id="ai-test-output" class="ai-test-result" hidden></div>
+        </div>
+      </details>
+
+      <div class="form-actions">
+        <span class="status-text" id="ai-msg" role="status" aria-live="polite"></span>
+        <button type="button" class="ghost" onclick="testAi()"><svg><use href="#i-bolt"/></svg>实景测试生成</button>
+        <button type="button" onclick="saveAiSettings()"><svg><use href="#i-check"/></svg>保存 AI 文案设置</button>
+      </div>
+    </div>
+  </div>
+  <div class="card eng-card" id="engine-settings-card" data-section="engine">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-settings"/></svg></span>
+      <h2>采集与运行 <span class="sub">可视化管理 · 自动保存且重启保留，无需手动修改配置文件</span></h2>
+    </div>
+    <form id="engine-settings-form" class="eng-layout" novalidate onsubmit="event.preventDefault();CreatorHubEngineSettings.save()">
+      <div id="engine-settings-errors" class="form-note engine-settings-errors" role="alert" tabindex="-1" hidden></div>
+
+      <!-- 1. 顶部实时运行态势概览 -->
+      <div class="eng-hero" id="eng-hero" data-state="default">
+        <div class="eng-hero-top">
+          <div class="eng-hero-copy">
+            <span class="eng-hero-badge" aria-hidden="true"><svg><use href="#i-sparkles"/></svg></span>
+            <div class="eng-hero-text">
+              <div class="eng-hero-title-row">
+                <h3 id="eng-hero-title">当前使用推荐运行配置</h3>
+                <span class="eng-hero-pill" id="eng-hero-pill">开箱即用</span>
+              </div>
+              <p id="eng-hero-desc">不确定怎么选时直接保持默认即可。保存后自动生效于后续任务，正在执行的任务不会被中断。</p>
+            </div>
+          </div>
+        </div>
+        <div class="eng-hero-chips" id="eng-hero-chips"></div>
+        <div class="eng-legacy-banner" id="eng-legacy-limits-banner" hidden>
+          <svg aria-hidden="true"><use href="#i-alert"/></svg>
+          <div class="eng-legacy-copy">
+            <b>检测到旧版「写操作基础限制」仍在生效</b>
+            <span id="eng-legacy-limits-detail">旧版频率限制会与「风控规则」叠加生效，建议清零后统一在风控规则中管理。</span>
+          </div>
+          <div class="eng-legacy-actions">
+            <button type="button" class="ghost sm" id="eng-clear-legacy-btn" onclick="CreatorHubEngineSettings.clearLegacyLimits()">一键清零旧限制</button>
+            <button type="button" class="ghost sm" onclick="openRiskRulesSection()">前往风控规则 →</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. 一键运行方案 -->
+      <div class="eng-section-block">
+        <div class="eng-section-head">
+          <div>
+            <h3>一键运行方案</h3>
+            <p>按电脑配置和使用习惯一键切换，套用后仍可在下方卡片自由微调（不会改动你的监控范围和私信/健康提醒开关）。</p>
+          </div>
+        </div>
+        <div class="eng-presets" role="group" aria-label="快捷运行方案">
+          <button type="button" class="eng-preset" data-eng-preset="recommended" onclick="CreatorHubEngineSettings.applyPreset('recommended')">
+            <div class="eng-preset-top"><b>省心推荐</b><span class="eng-preset-tag">默认</span></div>
+            <p>API 优先、普通失败回退浏览器；5 分钟巡检与标准并发，兼顾速度与稳定。</p>
+          </button>
+          <button type="button" class="eng-preset" data-eng-preset="lite" onclick="CreatorHubEngineSettings.applyPreset('lite')">
+            <div class="eng-preset-top"><b>轻量省内存</b><span class="eng-preset-tag">低配电脑</span></div>
+            <p>降低同时下载与采集并发、关闭浏览器常驻并缩短空闲回收，显著减少内存占用。</p>
+          </button>
+          <button type="button" class="eng-preset" data-eng-preset="compat" onclick="CreatorHubEngineSettings.applyPreset('compat')">
+            <div class="eng-preset-top"><b>稳妥兼容</b><span class="eng-preset-tag">网络波动 / 防验证</span></div>
+            <p>拉长关键词采集间隔与请求等待时间，遇阻自动回退浏览器并保持审核与可见窗口。</p>
+          </button>
+        </div>
+      </div>
+
+      <!-- 3. 日常常用设置：4 张大白话功能卡片 -->
+      <div class="eng-section-block">
+        <div class="eng-section-head">
+          <div>
+            <h3>常用运行设置</h3>
+            <p>日常 90% 的调整都在这里，改完点击底部「保存采集设置」即可生效。</p>
+          </div>
+        </div>
+
+        <div class="eng-modules">
+          <!-- 卡片 1：监控与采集默认范围 -->
+          <article class="eng-module" data-eng-card="monitor">
+            <div class="eng-module-head">
+              <div class="eng-module-title-wrap">
+                <span class="eng-module-ic" aria-hidden="true"><svg><use href="#i-target"/></svg></span>
+                <div class="eng-module-copy">
+                  <div class="eng-module-title-line">
+                    <b>监控与采集范围</b>
+                    <span class="eng-module-badge" id="eng-badge-monitor">推荐值</span>
+                  </div>
+                  <p>控制定时巡检频率，以及新建监控、评论与弹幕默认抓取多少内容。</p>
+                </div>
+              </div>
+            </div>
+            <div class="eng-module-main stack">
+              <div class="form-field">
+                <label for="eng-scan-preset">后台自动巡检频率</label>
+                <div class="eng-compound-row">
+                  <select id="eng-scan-preset" disabled aria-describedby="eng-scan-help">
+                    <option value="60">每 1 分钟（高频）</option>
+                    <option value="300">每 5 分钟（推荐）</option>
+                    <option value="900">每 15 分钟</option>
+                    <option value="1800">每 30 分钟</option>
+                    <option value="3600">每 1 小时</option>
+                    <option value="custom">自定义间隔…</option>
+                  </select>
+                  <div class="eng-inline-custom" id="eng-scan-custom-wrap" hidden>
+                    <input id="eng-scan-custom-val" type="number" min="1" max="86400" step="1" disabled aria-label="自定义巡检间隔数值">
+                    <select id="eng-scan-custom-unit" disabled aria-label="自定义巡检间隔单位">
+                      <option value="min">分钟</option>
+                      <option value="sec">秒</option>
+                    </select>
+                  </div>
+                </div>
+                <input id="engine-scan_interval_seconds" name="scan_interval_seconds" type="number" min="1" max="86400" step="1" required hidden disabled>
+                <p class="field-help" id="eng-scan-help">仅影响选择“跟随全局间隔”的任务；单个监控单独填了间隔时以监控自身为准。</p>
+              </div>
+
+              <div class="form-field">
+                <label for="eng-backfill-mode">抖音新建监控时，是否补拉历史作品</label>
+                <div class="eng-compound-row">
+                  <select id="eng-backfill-mode" disabled aria-describedby="engine-backfill-help">
+                    <option value="0">仅追踪后续新发布（推荐）</option>
+                    <option value="recent">首次补拉最近 N 条作品</option>
+                    <option value="-1">尽可能拉取全部历史作品</option>
+                  </select>
+                  <div class="eng-inline-custom" id="eng-backfill-count-wrap" hidden>
+                    <input id="eng-backfill-count" type="number" min="1" max="1000" step="1" value="20" disabled aria-label="首次补拉最近作品条数">
+                    <span class="eng-unit">条</span>
+                  </div>
+                </div>
+                <input id="engine-monitor_initial_backfill_count" name="monitor_initial_backfill_count" type="number" min="-1" max="1000" step="1" required hidden disabled>
+                <p class="field-help" id="engine-backfill-help">仅影响新建时选“跟随全局设置”的抖音监控，已建监控不受影响。</p>
+              </div>
+
+              <div class="form-grid cols-2">
+                <div class="form-field">
+                  <label for="engine-comment_recent_works">评论监控：看最近几条作品</label>
+                  <input id="engine-comment_recent_works" name="comment_recent_works" type="number" min="1" max="100" step="1" required disabled aria-describedby="engine-comments-help">
+                </div>
+                <div class="form-field">
+                  <label for="engine-comment_recent_days">评论监控：只看几天内作品</label>
+                  <input id="engine-comment_recent_days" name="comment_recent_days" type="number" min="1" max="365" step="1" required disabled aria-describedby="engine-comments-help">
+                </div>
+              </div>
+              <p class="field-help" id="engine-comments-help" style="margin-top:-2px">以上为全局默认范围；单个监控单独设置时仍按该监控执行。</p>
+            </div>
+            <details class="risk-module-details">
+              <summary>展开：弹幕默认范围与评论翻页深度</summary>
+              <div class="risk-module-body stack">
+                <div class="form-grid cols-2">
+                  <div class="form-field"><label for="engine-danmaku_recent_works">弹幕：每账号最近作品数</label><input id="engine-danmaku_recent_works" name="danmaku_recent_works" type="number" min="1" max="100" step="1" required disabled><p class="field-help">推荐 5 个</p></div>
+                  <div class="form-field"><label for="engine-danmaku_recent_days">弹幕：作品时间范围（天）</label><input id="engine-danmaku_recent_days" name="danmaku_recent_days" type="number" min="1" max="365" step="1" required disabled><p class="field-help">推荐 7 天</p></div>
+                  <div class="form-field"><label for="engine-danmaku_max_scrolls">弹幕：每作品最多加载轮次</label><input id="engine-danmaku_max_scrolls" name="danmaku_max_scrolls" type="number" min="1" max="30" step="1" required disabled><p class="field-help">推荐 6 次</p></div>
+                  <div class="form-field"><label for="engine-comment_max_scrolls">评论区默认翻页次数</label><input id="engine-comment_max_scrolls" name="comment_max_scrolls" type="number" min="1" max="30" step="1" required disabled><p class="field-help">推荐 6 次，越大越耗时</p></div>
+                  <div class="form-field"><label for="engine-danmaku_max_records_per_scan">单轮最多保存弹幕数</label><input id="engine-danmaku_max_records_per_scan" name="danmaku_max_records_per_scan" type="number" min="0" max="100000" step="1" required disabled><p class="field-help">填 0 表示不限制</p></div>
+                  <div class="form-field"><label for="engine-danmaku_max_records_total">单监控最多保留弹幕数</label><input id="engine-danmaku_max_records_total" name="danmaku_max_records_total" type="number" min="0" max="1000000" step="1" required disabled><p class="field-help">填 0 表示不限制</p></div>
+                </div>
+              </div>
+            </details>
+          </article>
+
+          <!-- 卡片 2：互动、私信与安全体验 -->
+          <article class="eng-module" data-eng-card="interact">
+            <div class="eng-module-head">
+              <div class="eng-module-title-wrap">
+                <span class="eng-module-ic" aria-hidden="true"><svg><use href="#i-msg"/></svg></span>
+                <div class="eng-module-copy">
+                  <div class="eng-module-title-line">
+                    <b>互动、私信与下载体验</b>
+                    <span class="eng-module-badge" id="eng-badge-interact">推荐值</span>
+                  </div>
+                  <p>决定自动评论要不要人工先审核、是否显示浏览器窗口，以及小红书私信监听。</p>
+                </div>
+              </div>
+            </div>
+            <div class="eng-module-main stack">
+              <label class="switch-row" for="engine-xhs_comment_review_before_publish">
+                <input id="engine-xhs_comment_review_before_publish" name="xhs_comment_review_before_publish" type="checkbox" disabled>
+                <span class="switch-copy"><b>小红书自动评论先审核再发</b><span>推荐开启。关闭后，命中的评论将直接进入发送队列。</span></span>
+              </label>
+              <label class="switch-row" for="engine-comment_browser_headed">
+                <input id="engine-comment_browser_headed" name="comment_browser_headed" type="checkbox" disabled>
+                <span class="switch-copy"><b>发评论时显示浏览器窗口</b><span>推荐开启。弹出窗口更稳定，遇到验证可直接手动通过。</span></span>
+              </label>
+              <label class="switch-row" for="engine-route_download_via_proxy">
+                <input id="engine-route_download_via_proxy" name="route_download_via_proxy" type="checkbox" disabled>
+                <span class="switch-copy"><b>下载视频/图片沿用账号代理</b><span>推荐开启。媒体下载与该账号浏览保持相同网络出口。</span></span>
+              </label>
+              <label class="switch-row" for="engine-xhs_dm_monitor_enabled">
+                <input id="engine-xhs_dm_monitor_enabled" name="xhs_dm_monitor_enabled" type="checkbox" disabled>
+                <span class="switch-copy"><b>启用小红书私信监控</b><span>默认关闭。开启后按设定间隔读取新私信，仍受风控频控约束。</span></span>
+              </label>
+            </div>
+            <details class="risk-module-details" id="eng-xhs-dm-details">
+              <summary>展开：小红书私信自动回复与轮询参数 <span class="eng-summary-meta" id="eng-dm-meta">未启用</span></summary>
+              <div class="risk-module-body stack" id="eng-xhs-dm-body">
+                <label class="switch-row" for="engine-xhs_dm_auto_reply_enabled">
+                  <input id="engine-xhs_dm_auto_reply_enabled" name="xhs_dm_auto_reply_enabled" type="checkbox" disabled>
+                  <span class="switch-copy"><b>允许私信自动回复</b><span>仅在规则命中并通过审核/风控队列后才会发送。</span></span>
+                </label>
+                <label class="switch-row" for="engine-xhs_dm_realtime_enabled">
+                  <input id="engine-xhs_dm_realtime_enabled" name="xhs_dm_realtime_enabled" type="checkbox" disabled>
+                  <span class="switch-copy"><b>新消息实时唤醒</b><span>有新私信推送时立即触发一次读取，减少盲目轮询。</span></span>
+                </label>
+                <div class="form-grid cols-2">
+                  <div class="form-field"><label for="engine-xhs_dm_poll_interval_seconds">轮询间隔（秒）</label><input id="engine-xhs_dm_poll_interval_seconds" name="xhs_dm_poll_interval_seconds" type="number" min="30" max="86400" step="1" required disabled><p class="field-help">推荐 120 秒（2 分钟）</p></div>
+                  <div class="form-field"><label for="engine-xhs_dm_max_conversations_per_poll">每轮最多检查会话数</label><input id="engine-xhs_dm_max_conversations_per_poll" name="xhs_dm_max_conversations_per_poll" type="number" min="1" max="10" step="1" required disabled><p class="field-help">推荐 2 个</p></div>
+                  <div class="form-field"><label for="engine-xhs_dm_realtime_debounce_seconds">实时推送合并等待（秒）</label><input id="engine-xhs_dm_realtime_debounce_seconds" name="xhs_dm_realtime_debounce_seconds" type="number" min="0.3" max="10" step="0.1" required disabled></div>
+                  <div class="form-field"><label for="engine-xhs_dm_fallback_interval_seconds">实时连接兜底间隔（分钟）</label><input id="engine-xhs_dm_fallback_interval_seconds" name="xhs_dm_fallback_interval_seconds" data-scale="60" type="number" min="2" max="1440" step="1" required disabled><p class="field-help">推荐 10 分钟</p></div>
+                </div>
+              </div>
+            </details>
+          </article>
+
+          <!-- 卡片 3：账号保活与作品健康 -->
+          <article class="eng-module" data-eng-card="health">
+            <div class="eng-module-head">
+              <div class="eng-module-title-wrap">
+                <span class="eng-module-ic" aria-hidden="true"><svg><use href="#i-heart"/></svg></span>
+                <div class="eng-module-copy">
+                  <div class="eng-module-title-line">
+                    <b>账号保活与作品健康</b>
+                    <span class="eng-module-badge" id="eng-badge-health">推荐值</span>
+                  </div>
+                  <p>自动延长账号登录有效期、掉线及时告警，并可选定时监测本账号作品 0 播。</p>
+                </div>
+              </div>
+            </div>
+            <div class="eng-module-main stack">
+              <label class="switch-row" for="engine-keepalive_cookie_sync_enabled">
+                <input id="engine-keepalive_cookie_sync_enabled" name="keepalive_cookie_sync_enabled" type="checkbox" disabled>
+                <span class="switch-copy"><b>自动同步刷新后的登录态</b><span>推荐开启。体检或读取时自动保存最新凭证，减少频繁重新扫码。</span></span>
+              </label>
+              <label class="switch-row" for="engine-keepalive_notify_on_invalid">
+                <input id="engine-keepalive_notify_on_invalid" name="keepalive_notify_on_invalid" type="checkbox" disabled>
+                <span class="switch-copy"><b>账号掉线时推送提醒</b><span>推荐开启。登录态失效后自动通过已配置的通知渠道发出告警。</span></span>
+              </label>
+              <label class="switch-row" for="engine-bilibili_auto_cookie_refresh">
+                <input id="engine-bilibili_auto_cookie_refresh" name="bilibili_auto_cookie_refresh" type="checkbox" disabled>
+                <span class="switch-copy"><b>B站登录态自动续期</b><span>推荐开启。检测到 B站登录临期时自动执行官方续期流程。</span></span>
+              </label>
+              <label class="switch-row" for="engine-verify_proxy_region">
+                <input id="engine-verify_proxy_region" name="verify_proxy_region" type="checkbox" disabled>
+                <span class="switch-copy"><b>提醒代理地区与账号时区不一致</b><span>发现代理出口地区异常时在日志中提示（仅提醒，不拦截任务）。</span></span>
+              </label>
+              <label class="switch-row" for="engine-work_health_enabled">
+                <input id="engine-work_health_enabled" name="work_health_enabled" type="checkbox" disabled>
+                <span class="switch-copy"><b>定时检查本账号作品健康（0 播预警）</b><span>默认关闭。开启后定期打开账号主页核查流量与异常，配合通知渠道推送。</span></span>
+              </label>
+            </div>
+            <details class="risk-module-details" id="eng-health-details">
+              <summary>展开：作品健康检查周期与视频号保活 <span class="eng-summary-meta" id="eng-health-meta">0 播检查未开启</span></summary>
+              <div class="risk-module-body stack">
+                <div class="form-grid cols-2">
+                  <div class="form-field"><label for="engine-work_health_interval_seconds">作品检查间隔（分钟）</label><input id="engine-work_health_interval_seconds" name="work_health_interval_seconds" data-scale="60" type="number" min="10" max="1440" step="1" required disabled><p class="field-help">最低 10 分钟，推荐 60 分钟（1 小时）</p></div>
+                  <div class="form-field"><label for="engine-work_health_recent_days">检查最近几天的作品</label><input id="engine-work_health_recent_days" name="work_health_recent_days" type="number" min="1" max="90" step="1" required disabled><p class="field-help">推荐 7 天</p></div>
+                  <div class="form-field"><label for="engine-work_health_zero_play_hours">零播放预警时长（小时）</label><input id="engine-work_health_zero_play_hours" name="work_health_zero_play_hours" type="number" min="1" max="168" step="0.5" required disabled><p class="field-help">发布满此时长仍 0 播则提醒</p></div>
+                  <div class="form-field"><label for="engine-shipinhao_keepalive_interval_seconds">视频号保活间隔（分钟）</label><input id="engine-shipinhao_keepalive_interval_seconds" name="shipinhao_keepalive_interval_seconds" data-scale="60" type="number" min="0" max="1440" step="1" required disabled><p class="field-help">推荐 15 分钟；填 0 跟随全局体检</p></div>
+                </div>
+                <label class="switch-row" for="engine-work_health_stat_snapshots">
+                  <input id="engine-work_health_stat_snapshots" name="work_health_stat_snapshots" type="checkbox" disabled>
+                  <span class="switch-copy"><b>同步记录账号数据快照</b><span>在已有账号检查中顺带保存粉丝与作品数，用于查看增长趋势。</span></span>
+                </label>
+              </div>
+            </details>
+          </article>
+
+          <!-- 卡片 4：电脑性能与并发控制（彻底替代 config.yaml 性能配置） -->
+          <article class="eng-module" data-eng-card="perf">
+            <div class="eng-module-head">
+              <div class="eng-module-title-wrap">
+                <span class="eng-module-ic" aria-hidden="true"><svg><use href="#i-bolt"/></svg></span>
+                <div class="eng-module-copy">
+                  <div class="eng-module-title-line">
+                    <b>电脑性能与多开负载</b>
+                    <span class="eng-module-badge" id="eng-badge-perf">标准均衡</span>
+                  </div>
+                  <p>按电脑内存与账号规模调节并发和浏览器常驻，再也不用手改配置文件。</p>
+                </div>
+              </div>
+            </div>
+            <div class="eng-module-main stack">
+              <div class="form-field">
+                <label>快速选择电脑负载档位</label>
+                <div class="eng-seg" role="group" aria-label="电脑性能与并发档位">
+                  <button type="button" data-perf-tier="lite" onclick="CreatorHubEngineSettings.applyPerfTier('lite')">省资源 · 低配机</button>
+                  <button type="button" data-perf-tier="standard" onclick="CreatorHubEngineSettings.applyPerfTier('standard')">标准均衡 · 推荐</button>
+                  <button type="button" data-perf-tier="high" onclick="CreatorHubEngineSettings.applyPerfTier('high')">高性能 · 多号多开</button>
+                </div>
+                <p class="field-help" id="eng-perf-summary">同时下载 2 个 · 同时采集 2 个 · 常驻浏览器上限 6 个</p>
+              </div>
+              <label class="switch-row" for="engine-resident_browser_sessions">
+                <input id="engine-resident_browser_sessions" name="resident_browser_sessions" type="checkbox" disabled>
+                <span class="switch-copy"><b>账号浏览器常驻复用</b><span>推荐开启，任务切换更快；电脑内存吃紧时关闭可明显降内存。</span></span>
+              </label>
+              <div class="form-field">
+                <label for="engine-browser_session_idle_seconds">空闲浏览器自动关闭释放内存（分钟）</label>
+                <input id="engine-browser_session_idle_seconds" name="browser_session_idle_seconds" data-scale="60" type="number" min="0" max="1440" step="1" required disabled>
+                <p class="field-help">推荐 30 分钟；填 0 表示不按空闲时长自动回收。</p>
+              </div>
+              <label class="switch-row" for="engine-block_media_resources">
+                <input id="engine-block_media_resources" name="block_media_resources" type="checkbox" disabled>
+                <span class="switch-copy"><b>浏览器采集时屏蔽图片/视频（省流量）</b><span>建议保持关闭。开启虽省流量，但可能导致部分页面数据加载不全。</span></span>
+              </label>
+            </div>
+            <details class="risk-module-details">
+              <summary>展开：精细调整并发与内存上限 <span class="eng-summary-meta">并发项需重启生效</span></summary>
+              <div class="risk-module-body stack">
+                <div class="form-grid cols-2">
+                  <div class="form-field"><label for="engine-worker_pool_size">同时下载任务数 <span class="eng-restart-tag">重启生效</span></label><input id="engine-worker_pool_size" name="worker_pool_size" type="number" min="1" max="16" step="1" required disabled><p class="field-help">推荐 2，越高带宽占用越大</p></div>
+                  <div class="form-field"><label for="engine-scan_concurrency">同时抓取目标数 <span class="eng-restart-tag">重启生效</span></label><input id="engine-scan_concurrency" name="scan_concurrency" type="number" min="1" max="16" step="1" required disabled><p class="field-help">推荐 2，低配机建议设 1</p></div>
+                  <div class="form-field"><label for="engine-active_accounts">同时活跃账号上限 <span class="eng-restart-tag">重启生效</span></label><input id="engine-active_accounts" name="active_accounts" type="number" min="1" max="32" step="1" required disabled><p class="field-help">推荐 3，用于多账号自动错峰</p></div>
+                  <div class="form-field"><label for="engine-max_live_contexts">常驻浏览器上限 <span class="eng-live-tag">立即生效</span></label><input id="engine-max_live_contexts" name="max_live_contexts" type="number" min="1" max="32" step="1" required disabled><p class="field-help">推荐 6，超出后自动关闭最早闲置的</p></div>
+                </div>
+              </div>
+            </details>
+          </article>
+        </div>
+      </div>
+
+      <!-- 4. 风控统一管理快捷引导（替代重复的旧限流/门禁抽屉） -->
+      <div class="eng-link-strip">
+        <div class="eng-link-strip-main">
+          <span class="eng-link-ic" aria-hidden="true"><svg><use href="#i-shield"/></svg></span>
+          <div>
+            <b>需要限制评论/私信频率、夜间休眠、冷却保护或写入门禁？</b>
+            <p>所有风控限额与防护开关已统一归口到「风控中心 → 风控规则」，提供一键场景方案，无需在两处重复配置。</p>
+          </div>
+        </div>
+        <button type="button" class="ghost sm" onclick="openRiskRulesSection()">前往风控规则 →</button>
+      </div>
+
+      <!-- 5. 进阶与排障（全部默认折叠，普通用户无需展开） -->
+      <div class="eng-section-block">
+        <div class="eng-section-head">
+          <div>
+            <h3>进阶与排障选项</h3>
+            <p>默认已为每个平台配置好最优执行方式，仅在遇到特定平台采集异常或有特殊需求时再展开调整。</p>
+          </div>
+        </div>
+
+        <!-- 5A. 各平台读写通道与执行模式（按平台归拢 + 优先展示当前已有账号的平台） -->
+        <details class="collection-advanced eng-drawer" id="engine-settings-platforms">
+          <summary>各平台读写通道与执行模式 <span id="eng-pf-summary">默认已选用推荐通道 · 通常无需修改</span></summary>
+          <div class="collection-advanced-body stack">
+            <div class="eng-mode-legend">
+              <span><b>API 优先（Hybrid · 推荐）</b>：优先走协议/API 直连，不拉起浏览器；普通兼容失败时自动回退浏览器，命中风控直接冷却。</span>
+              <span><b>仅 API 直连</b>：全程仅走 HTTP/协议接口，不启动浏览器；内存占用最低，接口异常时不自动回退页面。</span>
+              <span><b>仅浏览器</b>：全程在账号隔离浏览器上下文内执行，兼容性最高，内存与耗时相对较高。</span>
+            </div>
+
+            <div class="eng-pf-grid" id="eng-pf-active">
+              <!-- 抖音 -->
+              <div class="eng-pf-card" data-platform="douyin">
+                <div class="eng-pf-head"><b>抖音</b><span class="eng-pf-tag" data-pf-badge="douyin"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-douyin_read_mode">作品、关键词与评论读取</label>
+                    <select id="engine-douyin_read_mode" name="douyin_read_mode" disabled title="优先走 search/single API；普通兼容失败才回退浏览器，触发验证/风控直接冷却且不打开浏览器">
+                      <option value="hybrid">API 优先，失败回退浏览器（推荐）</option>
+                      <option value="api">仅 API 直连（不打开浏览器）</option>
+                      <option value="browser">仅浏览器</option>
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="engine-douyin_write_mode">评论、关注与私信写入</label>
+                    <select id="engine-douyin_write_mode" name="douyin_write_mode" disabled title="推荐走真实浏览器模拟操作以对齐原生签名栈、降低风控概率；作品发布固定走创作中心浏览器">
+                      <option value="browser">仅浏览器模拟操作（推荐 · 防风控）</option>
+                      <option value="hybrid">API 优先，明确失败回退浏览器</option>
+                      <option value="api">仅 API 直连（不打开浏览器）</option>
+                    </select>
+                  </div>
+                  <details class="eng-sub-details">
+                    <summary>细分：本账号资料、粉丝、私信与弹幕读取通道</summary>
+                    <div class="eng-sub-body form-grid cols-2">
+                      <div class="form-field"><label for="engine-douyin_profile_mode">手动刷新资料</label><select id="engine-douyin_profile_mode" name="douyin_profile_mode" disabled><option value="hybrid">API 优先，回退浏览器（推荐）</option><option value="api">仅 API 直连</option><option value="browser">仅浏览器</option></select></div>
+                      <div class="form-field"><label for="engine-douyin_followers_mode">粉丝列表同步</label><select id="engine-douyin_followers_mode" name="douyin_followers_mode" disabled><option value="hybrid">API 优先，回退浏览器（推荐）</option><option value="api">仅 API 直连</option><option value="browser">仅浏览器</option></select></div>
+                      <div class="form-field"><label for="engine-douyin_dm_sync_mode">私信会话同步</label><select id="engine-douyin_dm_sync_mode" name="douyin_dm_sync_mode" disabled title="API 模式通过 imapi protobuf 初始化并同步会话历史"><option value="hybrid">API 优先，回退浏览器（推荐）</option><option value="api">仅 API 直连</option><option value="browser">仅浏览器</option></select></div>
+                      <div class="form-field"><label for="engine-douyin_creator_danmaku_mode">创作中心弹幕</label><select id="engine-douyin_creator_danmaku_mode" name="douyin_creator_danmaku_mode" disabled><option value="hybrid">API 优先，回退浏览器（推荐）</option><option value="api">仅 API 直连</option><option value="browser">仅浏览器</option></select></div>
+                    </div>
+                  </details>
+                </div>
+              </div>
+
+              <!-- 小红书 -->
+              <div class="eng-pf-card" data-platform="xhs">
+                <div class="eng-pf-head"><b>小红书</b><span class="eng-pf-tag" data-pf-badge="xhs"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-xhs_read_mode">作品与公开评论读取</label>
+                    <select id="engine-xhs_read_mode" name="xhs_read_mode" disabled title="默认使用常驻签名客户端 API 直连，不打开页面；需要页面兼容时切浏览器">
+                      <option value="api">API 直连（推荐 · 不打开浏览器）</option>
+                      <option value="browser">浏览器页面</option>
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="engine-xhs_publish_mode">笔记发布方式</label>
+                    <select id="engine-xhs_publish_mode" name="xhs_publish_mode" disabled title="仅影响发布；原生环境账号始终使用浏览器发布">
+                      <option value="browser">浏览器发布（推荐）</option>
+                      <option value="api">API 直连（兼容模式）</option>
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="engine-xhs_comment_write_mode">评论发送方式</label>
+                    <select id="engine-xhs_comment_write_mode" name="xhs_comment_write_mode" disabled>
+                      <option value="browser">浏览器发送（推荐）</option>
+                      <option value="manual">仅保存草稿（不自动发送）</option>
+                      <option value="api">API 直连（兼容模式）</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 哔哩哔哩 -->
+              <div class="eng-pf-card" data-platform="bilibili">
+                <div class="eng-pf-head"><b>哔哩哔哩</b><span class="eng-pf-tag" data-pf-badge="bilibili"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-bilibili_read_mode">视频、动态、评论与弹幕读取</label>
+                    <select id="engine-bilibili_read_mode" name="bilibili_read_mode" disabled title="优先走离线 WBI 签名接口与 XML 弹幕直连，普通兼容失败回退浏览器">
+                      <option value="hybrid">WBI API 优先，失败回退浏览器（推荐）</option>
+                      <option value="api">仅 WBI API 直连</option>
+                      <option value="browser">仅浏览器</option>
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="engine-bilibili_write_mode">评论、关注与私信写入</label>
+                    <select id="engine-bilibili_write_mode" name="bilibili_write_mode" disabled title="网络结果不确定时不重复提交；视频投稿与图文动态发布固定走创作中心浏览器">
+                      <option value="hybrid">API 优先，明确失败回退浏览器（推荐）</option>
+                      <option value="api">仅 API 直连</option>
+                      <option value="browser">仅浏览器</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 视频号 -->
+              <div class="eng-pf-card" data-platform="shipinhao">
+                <div class="eng-pf-head"><b>微信视频号</b><span class="eng-pf-tag" data-pf-badge="shipinhao"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-channels_read_mode">内容与评论读取方式</label>
+                    <select id="engine-channels_read_mode" name="channels_read_mode" disabled title="连接本机微信 Finder 协议通道后支持搜索、主页、评论分页与 WxIsaac64 视频解密下载">
+                      <option value="auto">原生 Finder 协议优先，回退创作者助手（推荐）</option>
+                      <option value="protocol">仅微信本地 Finder 协议</option>
+                      <option value="browser">仅创作者助手浏览器</option>
+                    </select>
+                    <p class="field-help">需要搜索或下载加密视频时，请先连接本机微信。<a class="channels-inline-jump" href="#channels-protocol-card" onclick="event.preventDefault();openChannelsProtocolSettings()">前往视频号微信通道 →</a></p>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 海外小红书 -->
+              <div class="eng-pf-card" data-platform="rednote">
+                <div class="eng-pf-head"><b>海外小红书 (Rednote)</b><span class="eng-pf-tag" data-pf-badge="rednote"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-rednote_read_mode">作品与评论读取</label>
+                    <select id="engine-rednote_read_mode" name="rednote_read_mode" disabled title="独立使用 rednote.com XYS/XYW + b1 签名协议直连，绝不混用国内小红书 Cookie">
+                      <option value="hybrid">API 优先，失败回退浏览器（推荐）</option>
+                      <option value="api">仅 API 直连</option>
+                      <option value="browser">仅浏览器</option>
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="engine-rednote_publish_mode">笔记发布方式</label>
+                    <select id="engine-rednote_publish_mode" name="rednote_publish_mode" disabled title="协议直发走 COS + webapi.rednote.com 单次提交，失败不自动重发">
+                      <option value="browser">创作者中心浏览器（推荐）</option>
+                      <option value="api">API 协议直发（实验）</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- TikTok -->
+              <div class="eng-pf-card" data-platform="tiktok">
+                <div class="eng-pf-head"><b>TikTok</b><span class="eng-pf-tag" data-pf-badge="tiktok"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-tiktok_read_mode">关键词与评论读取</label>
+                    <select id="engine-tiktok_read_mode" name="tiktok_read_mode" disabled title="native 模式使用账号 Cookie/UA/代理与离线签名直连，全程不启动浏览器">
+                      <option value="native">离线签名 API 直连，不打开浏览器（推荐）</option>
+                      <option value="auto">离线 API 优先，失败回退浏览器</option>
+                      <option value="browser">仅已授权浏览器</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Instagram -->
+              <div class="eng-pf-card" data-platform="instagram">
+                <div class="eng-pf-head"><b>Instagram</b><span class="eng-pf-tag" data-pf-badge="instagram"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-instagram_read_mode">主页、Reels 与私信读取</label>
+                    <select id="engine-instagram_read_mode" name="instagram_read_mode" disabled title="直连 Mobile v1 / Web API 读取主页、Reels、标签、评论、关注粉丝与 Direct v2 私信">
+                      <option value="hybrid">API 直连优先，失败回退浏览器（推荐）</option>
+                      <option value="api">仅 API 直连</option>
+                      <option value="browser">仅浏览器</option>
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="engine-instagram_write_mode">发布、评论与私信写入</label>
+                    <select id="engine-instagram_write_mode" name="instagram_write_mode" disabled title="支持 rupload + configure 直连发布与评论/私信互动；网络结果不确定时不重复提交">
+                      <option value="hybrid">API 优先，明确失败回退浏览器（推荐）</option>
+                      <option value="api">仅 API 直连</option>
+                      <option value="browser">仅浏览器</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Twitter (X) -->
+              <div class="eng-pf-card" data-platform="twitter">
+                <div class="eng-pf-head"><b>Twitter (X)</b><span class="eng-pf-tag" data-pf-badge="twitter"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-twitter_read_mode">推文、时间线与私信读取</label>
+                    <select id="engine-twitter_read_mode" name="twitter_read_mode" disabled title="公开单帖与本账号资料/私信优先走 Syndication/REST，时间线与搜索在隔离浏览器拦截 GraphQL">
+                      <option value="hybrid">轻量协议优先，时间线走隔离浏览器（推荐）</option>
+                      <option value="browser">全程隔离浏览器</option>
+                      <option value="api">仅轻量协议（单帖 / 资料 / 私信）</option>
+                    </select>
+                    <p class="field-help">发推、点赞、转推与私信发送固定走隔离浏览器（原生签名）。</p>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Facebook -->
+              <div class="eng-pf-card" data-platform="facebook">
+                <div class="eng-pf-head"><b>Facebook</b><span class="eng-pf-tag" data-pf-badge="facebook"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-facebook_read_mode">主页、群组与评论读取</label>
+                    <select id="engine-facebook_read_mode" name="facebook_read_mode" disabled title="优先走 HTTP SSR 与动态学习 GraphQL 协议直采，冷启动或变更时自动回退隔离浏览器更新模板">
+                      <option value="hybrid">协议 API 优先，冷启动/失败回退浏览器（推荐）</option>
+                      <option value="api">仅协议 API 直连</option>
+                      <option value="browser">仅隔离浏览器</option>
+                    </select>
+                    <p class="field-help">动态/主页/群组/快拍发布与互动固定走隔离浏览器通道。</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <details class="eng-pf-more" id="eng-pf-others" hidden>
+              <summary id="eng-pf-others-summary">展开其他暂未添加账号的平台</summary>
+              <div class="eng-pf-grid" id="eng-pf-inactive"></div>
+            </details>
+          </div>
+        </details>
+
+        <!-- 5B. 网络超时、抓取间隔与弹幕探测（专家参数） -->
+        <details class="collection-advanced eng-drawer" id="engine-settings-expert">
+          <summary>网络超时、抓取间隔与弹幕探测 <span id="eng-expert-summary">专家参数 · 默认即可</span></summary>
+          <div class="collection-advanced-body stack">
+            <p class="field-help" style="margin:0">间隔越大采集越慢但连续请求更少；网络波动或经常超时时可适当调大等待上限。</p>
+            <div class="form-grid cols-2">
+              <div class="form-field"><label for="engine-request_timeout_seconds">接口等待超时（秒）</label><input id="engine-request_timeout_seconds" name="request_timeout_seconds" type="number" min="5" max="300" step="1" required disabled><p class="field-help">推荐 20 秒，不改变浏览器等待时长</p></div>
+              <div class="form-field"><label for="engine-download_timeout_seconds">下载等待超时（秒）</label><input id="engine-download_timeout_seconds" name="download_timeout_seconds" type="number" min="30" max="1800" step="1" required disabled><p class="field-help">推荐 120 秒，用于单次网络读写等待</p></div>
+              <div class="form-field"><label for="engine-douyin_keyword_gap_seconds">抖音关键词切换间隔（秒）</label><input id="engine-douyin_keyword_gap_seconds" name="douyin_keyword_gap_seconds" type="number" min="0" max="300" step="0.1" required disabled><p class="field-help">同任务切到下个关键词的最短停顿，推荐 8 秒</p></div>
+              <div class="form-field"><label for="engine-xhs_keyword_gap_seconds">小红书关键词切换间隔（秒）</label><input id="engine-xhs_keyword_gap_seconds" name="xhs_keyword_gap_seconds" type="number" min="0" max="300" step="0.1" required disabled><p class="field-help">同任务切到下个关键词的最短停顿，推荐 10 秒</p></div>
+              <div class="form-field"><label for="engine-xhs_item_gap_seconds">小红书详情读取间隔（秒）</label><input id="engine-xhs_item_gap_seconds" name="xhs_item_gap_seconds" type="number" min="0" max="120" step="0.1" required disabled><p class="field-help">推荐 2.5 秒</p></div>
+              <div class="form-field"><label for="engine-xhs_request_jitter">小红书间隔随机延长比例（%）</label><input id="engine-xhs_request_jitter" name="xhs_request_jitter" data-scale="0.01" type="number" min="0" max="100" step="1" required disabled><p class="field-help">例如 35 表示最多额外随机延长 35%</p></div>
+              <div class="form-field"><label for="engine-danmaku_probe_step_seconds">弹幕时间轴探测步长（秒）</label><input id="engine-danmaku_probe_step_seconds" name="danmaku_probe_step_seconds" type="number" min="0.1" max="60" step="0.1" required disabled><p class="field-help">推荐 1 秒</p></div>
+              <div class="form-field"><label for="engine-danmaku_max_probe_points">单条视频弹幕最多探测点数</label><input id="engine-danmaku_max_probe_points" name="danmaku_max_probe_points" type="number" min="1" max="1000" step="1" required disabled><p class="field-help">推荐 120，调高更完整但更耗时</p></div>
+            </div>
+          </div>
+        </details>
+
+        <!-- 5C. 技术诊断：API 兼容矩阵与多账号环境隔离（默认折叠） -->
+        <details class="collection-advanced eng-drawer transport-matrix" id="transport-matrix-panel">
+          <summary>技术诊断：平台通道兼容矩阵与账号环境隔离 <span>排查问题时查看</span></summary>
+          <div class="collection-advanced-body stack">
+            <div class="row-between gap-wrap">
+              <p class="field-help" style="margin:0">按当前保存配置显示各平台真实执行通道与账号独立环境状态；选择“仅 API 直连”时不会暗中打开浏览器。</p>
+              <button type="button" class="ghost sm" onclick="CreatorHubTransportMatrix.load()">刷新诊断</button>
+            </div>
+            <div class="table-wrap"><table aria-label="平台 API 与浏览器兼容矩阵">
+              <thead><tr><th>平台</th><th>功能</th><th>API</th><th>浏览器</th><th>当前通道</th><th>说明</th></tr></thead>
+              <tbody id="transport-matrix-body"><tr><td colspan="6"><div class="empty">正在读取兼容矩阵…</div></td></tr></tbody>
+            </table></div>
+            <h3 style="margin:4px 0 0">账号环境隔离</h3>
+            <div class="table-wrap"><table aria-label="多账号 API 与浏览器环境隔离状态">
+              <thead><tr><th>账号</th><th>浏览器 Profile</th><th>API 登录态/会话</th><th>网络出口</th><th>环境编号</th></tr></thead>
+              <tbody id="transport-isolation-body"><tr><td colspan="5"><div class="empty">正在检查账号环境…</div></td></tr></tbody>
+            </table></div>
+            <p class="field-help" id="transport-matrix-status" role="status" aria-live="polite"></p>
+          </div>
+        </details>
+      </div>
+
+      <!-- 6. 吸底操作与备份栏 -->
+      <div class="eng-sticky-bar" id="eng-sticky-bar">
+        <div class="eng-sticky-status">
+          <span class="status-text" id="engine-settings-status" role="status" aria-live="polite">正在读取配置…</span>
+          <button type="button" class="ghost sm" id="engine-settings-retry" onclick="CreatorHubEngineSettings.load()" hidden>重新读取</button>
+        </div>
+        <div class="eng-sticky-actions">
+          <input type="file" id="eng-import-file" accept=".json,application/json" hidden>
+          <button type="button" class="ghost sm" id="eng-export-btn" onclick="CreatorHubEngineSettings.exportBackup()" disabled title="导出当前运行配置为 JSON 文件（不含账号密码或 API Key）"><svg aria-hidden="true"><use href="#i-download"/></svg>导出备份</button>
+          <button type="button" class="ghost sm" id="eng-import-btn" onclick="CreatorHubEngineSettings.triggerImport()" disabled title="从之前导出的 JSON 备份恢复配置"><svg aria-hidden="true"><use href="#i-folder"/></svg>导入恢复</button>
+          <button type="button" class="ghost" id="engine-settings-defaults" onclick="CreatorHubEngineSettings.defaults()" disabled>恢复全部推荐</button>
+          <button type="submit" id="engine-settings-save" disabled><svg aria-hidden="true"><use href="#i-check"/></svg>保存采集设置</button>
+        </div>
+      </div>
+    </form>
+  </div>
+  <!-- 视频号本机微信通道可视化配置 -->
+  <div class="card" id="channels-protocol-card" data-section="channels">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-network"/></svg></span>
+      <h2>视频号微信通道 <span class="sub">一键连接本机微信 · 重启自动恢复</span></h2>
+    </div>
+    <div class="stack">
+      <div class="channels-oneclick-panel stack" id="channels-proxy-panel">
+        <div class="row-between gap-wrap">
+          <div class="row gap-wrap">
+            <span class="pill pending" id="ch-proto-badge">正在读取…</span>
+            <span class="field-help" id="ch-proto-summary-text" style="margin:0">正在检查本机微信通道配置与能力状态…</span>
+          </div>
+          <button type="button" class="ghost sm" id="ch-proto-refresh-btn" onclick="CreatorHubChannelsProtocol.load()"><svg aria-hidden="true"><use href="#i-refresh"/></svg>刷新状态</button>
+        </div>
+        <div class="channels-proto-caps" id="ch-proto-caps" aria-label="视频号双通道当前能力"></div>
+
+        <div id="ch-proxy-pages" class="channels-proxy-pages" aria-label="微信连接引导与已连接页面" hidden></div>
+
+        <div class="form-actions channels-proxy-actions">
+          <span class="status-text" id="ch-proto-msg" role="status" aria-live="polite"></span>
+          <button type="button" id="ch-proxy-start-btn" onclick="CreatorHubChannelsProtocol.startProxy()"><svg aria-hidden="true"><use href="#i-play"/></svg>一键连接本机微信</button>
+          <button type="button" class="ghost danger" id="ch-proxy-stop-btn" onclick="CreatorHubChannelsProtocol.stopProxy()" hidden disabled><svg aria-hidden="true"><use href="#i-x"/></svg>断开并关闭</button>
+        </div>
+      </div>
+
+      <details class="collection-advanced" id="channels-advanced-details">
+        <summary>高级设置、证书管理与调试选项（一般用户无需展开）</summary>
+        <div class="collection-advanced-body stack">
+          <div class="channels-proxy-ca-box stack">
+            <div class="row-between gap-wrap">
+              <div class="row gap-wrap">
+                <b>本机代理与根证书状态</b>
+                <span class="pill skipped" id="ch-proxy-badge">未启动</span>
+                <span class="pill skipped" id="ch-proxy-ca-badge">根证书未安装</span>
+              </div>
+              <div class="channels-proto-inline-tools" style="margin-top:0">
+                <button type="button" class="ghost sm" id="ch-proxy-probe-btn" onclick="CreatorHubChannelsProtocol.probe('proxy')"><svg aria-hidden="true"><use href="#i-bolt"/></svg>手动检测连通</button>
+                <button type="button" class="ghost sm" id="ch-proxy-ca-install-btn" onclick="CreatorHubChannelsProtocol.installProxyCert()"><svg aria-hidden="true"><use href="#i-shield"/></svg>安装根证书</button>
+                <button type="button" class="ghost sm" id="ch-proxy-ca-download-btn" onclick="CreatorHubChannelsProtocol.downloadProxyCert()"><svg aria-hidden="true"><use href="#i-download"/></svg>下载证书</button>
+                <button type="button" class="ghost sm danger" id="ch-proxy-ca-uninstall-btn" onclick="CreatorHubChannelsProtocol.uninstallProxyCert()" disabled>卸载证书</button>
+              </div>
+            </div>
+            <p class="field-help" id="ch-proxy-status-text" style="margin:0">仅拦截 channels.weixin.qq.com，其余网站流量原样加密直通，停止或退出软件时自动恢复系统代理。</p>
+            <p class="field-help" id="ch-proxy-ca-text" style="margin:0">点击上方「一键连接本机微信」时会自动检查并安装本机根证书；仅排障时需在此手动管理。</p>
+            <div class="channels-proto-probe" id="ch-proto-probe-box" hidden></div>
+            <label class="switch-row" for="ch-proxy-manage-sysproxy">
+              <input id="ch-proxy-manage-sysproxy" type="checkbox" checked>
+              <span class="switch-copy"><b>自动托管 Windows 系统代理（推荐）</b><span>启动时备份原设置并指向本地代理，退出软件时自动恢复；若使用外部代理规则手动将 <code>channels.weixin.qq.com</code> 分流至 <code>127.0.0.1:2023</code>，可取消勾选。</span></span>
+            </label>
+          </div>
+      <form id="channels-protocol-form" class="stack" novalidate onsubmit="event.preventDefault();CreatorHubChannelsProtocol.save()">
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="ch-proto-read-mode">视频号读取策略</label>
+            <select id="ch-proto-read-mode" aria-describedby="ch-proto-read-mode-help">
+              <option value="auto">原生协议优先，本账号回退创作者助手（推荐）</option>
+              <option value="protocol">仅微信本地 Finder 协议</option>
+              <option value="browser">仅创作者助手浏览器页面</option>
+            </select>
+            <p class="field-help" id="ch-proto-read-mode-help">与「采集与运行 → 视频号读取方式」同步联动；保存后立即用于后续任务。</p>
+          </div>
+          <div class="form-field">
+            <label for="ch-proto-mode">本机微信连接方式</label>
+            <select id="ch-proto-mode" onchange="CreatorHubChannelsProtocol.onModeChange()" aria-describedby="ch-proto-mode-help">
+              <option value="proxy">内置本机微信代理桥接（推荐，免改微信）</option>
+              <option value="none">暂不连接（仅用创作者助手 / 公开预览）</option>
+              <option value="endpoint">直连本机回环 CDP 端点（http / ws）</option>
+              <option value="endpoint_file">WMPF 控制口令文件（wmpf_cdp）</option>
+            </select>
+            <p class="field-help" id="ch-proto-mode-help">内置代理仅拦截 <code>channels.weixin.qq.com</code>，其余 HTTPS 流量原样加密直通，绝不导出账号凭据。</p>
+          </div>
+        </div>
+
+        <div class="form-field" id="ch-proto-proxy-wrap" hidden>
+          <label for="ch-proto-proxy-port">内置本机代理端口（127.0.0.1）</label>
+          <input id="ch-proto-proxy-port" type="number" min="1024" max="65535" step="1" value="2023" aria-describedby="ch-proto-proxy-help">
+          <p class="field-help" id="ch-proto-proxy-help">仅监听本机回环 <code>127.0.0.1</code>（默认 <code>2023</code>）；启动下方内置代理后，在桌面微信中打开一次视频号页面即可自动建立协议桥接。</p>
+        </div>
+
+        <div class="form-field" id="ch-proto-endpoint-wrap">
+          <label for="ch-proto-endpoint">本机回环 CDP 端点地址</label>
+          <input id="ch-proto-endpoint" type="url" inputmode="url" autocomplete="off" placeholder="http://127.0.0.1:9222 或 ws://127.0.0.1:9422/cdp/..." aria-describedby="ch-proto-endpoint-help">
+          <div class="channels-proto-inline-tools">
+            <button type="button" class="ghost sm" id="ch-proto-scan-btn" onclick="CreatorHubChannelsProtocol.discover()"><svg aria-hidden="true"><use href="#i-search"/></svg>扫描本机 CDP 端口</button>
+            <button type="button" class="ghost sm" onclick="CreatorHubChannelsProtocol.fillEndpoint('http://127.0.0.1:9222')">填入 127.0.0.1:9222</button>
+          </div>
+          <p class="field-help" id="ch-proto-endpoint-help">填写桌面微信或 WMPF 调试环境暴露的本机回环地址，也可点击上方按钮自动探测常见端口。</p>
+          <div class="channels-proto-discovered" id="ch-proto-discovered" hidden></div>
+        </div>
+
+        <div class="form-field" id="ch-proto-file-wrap">
+          <label for="ch-proto-endpoint-file">WMPF 控制口令文件路径</label>
+          <input id="ch-proto-endpoint-file" autocomplete="off" placeholder="./data/channels_wmpf_endpoint.json" aria-describedby="ch-proto-file-help">
+          <p class="field-help" id="ch-proto-file-help">指向 <code>wmpf_cdp.LoopbackBridge</code> 生成的 JSON 描述文件；若使用下方托管桥接会自动填入。</p>
+        </div>
+
+        <div class="form-actions channels-proto-actions">
+          <button type="button" class="ghost" id="ch-proto-probe-btn" onclick="CreatorHubChannelsProtocol.probe()"><svg aria-hidden="true"><use href="#i-bolt"/></svg>测试通道连接</button>
+          <button type="button" class="ghost" id="ch-proto-reset-btn" onclick="CreatorHubChannelsProtocol.reset()">恢复默认</button>
+          <button type="submit" id="ch-proto-save-btn"><svg aria-hidden="true"><use href="#i-check"/></svg>保存通道配置</button>
+        </div>
+      </form>
+
+      <details class="collection-advanced" id="channels-bridge-panel">
+        <summary>WMPF 本地回环桥接托管（wmpf_cdp）</summary>
+        <div class="collection-advanced-body stack">
+          <div class="row-between gap-wrap">
+            <div class="row gap-wrap">
+              <span class="pill pending" id="ch-bridge-badge">未启动</span>
+              <span class="field-help" id="ch-bridge-status-text" style="margin:0">仅在需要由 CreatorHub 托管本机 127.0.0.1 WMPF 转发桥时启动。</span>
+            </div>
+            <button type="button" class="ghost sm" id="ch-bridge-refresh-btn" onclick="CreatorHubChannelsProtocol.discover()"><svg aria-hidden="true"><use href="#i-refresh"/></svg>刷新微信进程</button>
+          </div>
+          <div id="ch-bridge-procs" class="channels-proc-chips" aria-label="检测到的微信与 WMPF 进程"></div>
+          <div class="form-grid">
+            <div class="form-field">
+              <label for="ch-bridge-debug-port">WMPF 调试监听端口</label>
+              <input id="ch-bridge-debug-port" type="number" min="1024" max="65535" step="1" value="9421">
+              <p class="field-help">供本机桌面微信 WMPF 客户端接入（默认 9421，校验 PID 白名单）。</p>
+            </div>
+            <div class="form-field">
+              <label for="ch-bridge-cdp-port">CDP 转发端口</label>
+              <input id="ch-bridge-cdp-port" type="number" min="1024" max="65535" step="1" value="9422">
+              <p class="field-help">仅供 CreatorHub 通过带控制口令的本地 WebSocket 接入（默认 9422）。</p>
+            </div>
+          </div>
+          <div class="form-field">
+            <label for="ch-bridge-pids">允许接入的微信 PID（留空自动识别）</label>
+            <input id="ch-bridge-pids" autocomplete="off" placeholder="留空自动绑定上方检测到的 Weixin.exe / WeChat.exe / WeChatAppEx.exe PID；多个用逗号分隔">
+          </div>
+          <div class="form-actions channels-bridge-actions">
+            <button type="button" id="ch-bridge-start-btn" onclick="CreatorHubChannelsProtocol.startBridge()"><svg aria-hidden="true"><use href="#i-play"/></svg>启动桥接并应用</button>
+            <button type="button" class="ghost danger" id="ch-bridge-stop-btn" onclick="CreatorHubChannelsProtocol.stopBridge()" disabled><svg aria-hidden="true"><use href="#i-x"/></svg>停止桥接</button>
+          </div>
+        </div>
+      </details>
+        </div>
+      </details>
+
+      <div class="form-note">
+        <svg aria-hidden="true"><use href="#i-info"/></svg>
+        <span>首次点击「一键连接本机微信」后，只需在电脑微信「文件传输助手」粘贴并点开一次桥接链接（保持窗口最小化即可）；此后重启 CreatorHub 会自动恢复连接，无需重复配置。</span>
+      </div>
+    </div>
+  </div>
+  <!-- 系统日志与问题排查诊断 -->
+  <div class="card diag-card" id="diagnostics-card" data-section="diagnostics">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-shield"/></svg></span>
+      <h2>日志与诊断 <span class="sub">精简运行记录 · 自动脱敏 · 一键导出反馈</span></h2>
+    </div>
+    <div class="diag-layout">
+      <!-- 1. 顶部问题反馈与一键导出工作区 -->
+      <div class="diag-hero">
+        <div class="diag-hero-top">
+          <div class="diag-hero-title-group">
+            <span class="diag-hero-badge" aria-hidden="true"><svg><use href="#i-sparkles"/></svg></span>
+            <div>
+              <h3>遇到问题需要向开发者反馈？</h3>
+              <p>补充现象说明后一键导出诊断压缩包，或复制精简摘要直接粘贴到微信 / Issue，无需手动翻找日志文件。</p>
+            </div>
+          </div>
+          <div class="diag-hero-actions">
+            <button type="button" class="ghost" id="diag-copy-report-btn" onclick="CreatorHubDiagnostics.copyReport()"><svg aria-hidden="true"><use href="#i-copy"/></svg>复制排查摘要</button>
+            <button type="button" id="diag-export-zip-btn" onclick="CreatorHubDiagnostics.exportZip()"><svg aria-hidden="true"><use href="#i-download"/></svg>导出脱敏诊断包 (.zip)</button>
+          </div>
+        </div>
+        <div class="diag-note-input-wrap">
+          <svg class="diag-note-ic" aria-hidden="true"><use href="#i-edit"/></svg>
+          <input id="diag-issue-note" maxlength="500" autocomplete="off" aria-label="问题现象简述（选填）" placeholder="选填：简述问题现象（会自动写入诊断报告开头），例如：小红书图文点击发布后提示未找到上传框…">
+        </div>
+        <div class="diag-privacy-strip" aria-label="自动隐私脱敏说明">
+          <span class="diag-privacy-badge"><svg aria-hidden="true"><use href="#i-shield"/></svg>自动脱敏已启用</span>
+          <span class="diag-privacy-text">导出时自动剥离：</span>
+          <span class="diag-privacy-tag">Cookie / 登录态</span>
+          <span class="diag-privacy-tag">API Key / 代理密码</span>
+          <span class="diag-privacy-tag">账号昵称 / UID</span>
+          <span class="diag-privacy-tag">私信与评论正文</span>
+          <span class="diag-privacy-tag">本机系统用户名</span>
+        </div>
+      </div>
+
+      <!-- 2. 四宫格运行指标与快捷控制条 -->
+      <div class="diag-kpi-grid">
+        <div class="diag-stat-card">
+          <div class="diag-stat-head">
+            <span class="diag-stat-label">记录模式</span>
+            <span class="diag-mode-pill is-info" id="diag-level-pill"><i class="diag-dot"></i>INFO 精简</span>
+          </div>
+          <div class="diag-mode-seg" role="group" aria-label="切换运行日志级别">
+            <button type="button" class="active" data-diag-mode="info" onclick="CreatorHubDiagnostics.changeLevel('info')">精简</button>
+            <button type="button" data-diag-mode="debug" onclick="CreatorHubDiagnostics.changeLevel('debug')">调试</button>
+            <button type="button" data-diag-mode="warning" onclick="CreatorHubDiagnostics.changeLevel('warning')">仅告警</button>
+          </div>
+          <div class="diag-stat-sub" id="diag-mode-hint">默认静默高频页面轮询请求</div>
+        </div>
+
+        <button type="button" class="diag-stat-card is-interactive" id="diag-card-warn" onclick="CreatorHubDiagnostics.setFilter('warn')">
+          <div class="diag-stat-head">
+            <span class="diag-stat-label">本次运行告警</span>
+            <span class="diag-mini-tag warn">WARN</span>
+          </div>
+          <div class="diag-stat-val"><b id="diag-warn-num">0</b><small>条</small></div>
+          <div class="diag-stat-sub">通道回退 · 风控冷却 · 慢请求</div>
+        </button>
+
+        <button type="button" class="diag-stat-card is-interactive" id="diag-card-err" onclick="CreatorHubDiagnostics.setFilter('error')">
+          <div class="diag-stat-head">
+            <span class="diag-stat-label">本次异常错误</span>
+            <span class="diag-mini-tag danger">ERROR</span>
+          </div>
+          <div class="diag-stat-val"><b id="diag-err-num">0</b><small>条</small></div>
+          <div class="diag-stat-sub">任务执行失败 · 未捕获异常栈</div>
+        </button>
+
+        <div class="diag-stat-card">
+          <div class="diag-stat-head">
+            <span class="diag-stat-label">本地日志占用</span>
+            <span class="diag-mini-tag muted" id="diag-file-cnt">0 个文件</span>
+          </div>
+          <div class="diag-stat-val"><b id="diag-size-val">0 KB</b></div>
+          <div class="diag-stat-actions">
+            <button type="button" class="ghost sm" onclick="CreatorHubDiagnostics.openDir()"><svg aria-hidden="true"><use href="#i-folder"/></svg>打开目录</button>
+            <button type="button" class="ghost sm danger" onclick="CreatorHubDiagnostics.clearLogs()"><svg aria-hidden="true"><use href="#i-trash"/></svg>清理日志</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. 一体化日志检视控制台 -->
+      <div class="diag-console">
+        <div class="diag-console-bar">
+          <div class="diag-console-left">
+            <div class="diag-seg" role="group" aria-label="日志级别筛选">
+              <button type="button" class="active" data-diag-lvl="warn" onclick="CreatorHubDiagnostics.setFilter('warn')">告警与错误 <span class="diag-seg-cnt" id="diag-cnt-warn">0</span></button>
+              <button type="button" data-diag-lvl="error" onclick="CreatorHubDiagnostics.setFilter('error')">仅错误 <span class="diag-seg-cnt" id="diag-cnt-err">0</span></button>
+              <button type="button" data-diag-lvl="all" onclick="CreatorHubDiagnostics.setFilter('all')">全部记录 <span class="diag-seg-cnt" id="diag-cnt-all">0</span></button>
+            </div>
+            <span class="diag-bar-sep" aria-hidden="true"></span>
+            <select id="diag-source-select" class="diag-source-select" onchange="CreatorHubDiagnostics.setSource(this.value)" aria-label="日志读取来源">
+              <option value="memory">实时内存缓冲</option>
+              <option value="error.log">error.log · 历史错误</option>
+              <option value="app.log">app.log · 历史运行</option>
+            </select>
+          </div>
+          <div class="diag-console-right">
+            <div class="diag-search-box">
+              <svg class="diag-search-ic" aria-hidden="true"><use href="#i-search"/></svg>
+              <input id="diag-search-input" type="search" placeholder="搜索模块、状态码或错误关键字…" oninput="CreatorHubDiagnostics.onSearchInput()" aria-label="搜索日志">
+              <button type="button" class="diag-search-clear" id="diag-search-clear" hidden onclick="CreatorHubDiagnostics.clearSearch()" aria-label="清除搜索"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <button type="button" class="ghost sm diag-refresh-btn" id="diag-refresh-btn" onclick="CreatorHubDiagnostics.load()"><svg aria-hidden="true"><use href="#i-refresh"/></svg>刷新</button>
+          </div>
+        </div>
+
+        <div class="diag-log-viewport" id="diag-log-list" role="log" aria-live="off" aria-label="系统运行日志列表">
+          <div class="diag-empty-state">
+            <div class="diag-empty-title">正在读取运行日志…</div>
+          </div>
+        </div>
+
+        <div class="diag-console-foot">
+          <div class="diag-foot-path">
+            <svg aria-hidden="true"><use href="#i-folder"/></svg>
+            <code id="diag-dir-code">./logs</code>
+            <button type="button" class="diag-path-copy" id="diag-copy-path-btn" onclick="CreatorHubDiagnostics.copyDirPath()" title="复制日志目录路径" aria-label="复制日志目录路径"><svg aria-hidden="true"><use href="#i-copy"/></svg></button>
+            <span class="diag-foot-rule">app.log (≤5MB×4) · error.log (≤2MB×3) 自动滚动限容</span>
+          </div>
+          <span class="status-text" id="diag-status-msg" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+  </section>
+

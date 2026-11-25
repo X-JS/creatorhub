@@ -1,3 +1,5 @@
+/* AUTO-GENERATED FROM frontend/app/*.js BY npm run build:ui — EDIT SOURCE MODULES IN frontend/app/ */
+// 01-core-modals.js — 核心网络请求封装、全局忙碌指示器、表单辅助与通用对话框模态。
 const $ = (id) => document.getElementById(id);
 // 有用户发起的慢操作(开浏览器抓评论/发评论/解析链接等)在进行时,暂停 8 秒轮询刷新,
 // 否则定时重渲染会把按钮的「…中」加载态冲掉。
@@ -60,13 +62,46 @@ function localDateTimeValue(value) {
   const pad = n => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
-function safeMediaUrl(value) {
+function safeHttpUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
   try {
     const url = new URL(raw, typeof location === "undefined" ? "http://localhost" : location.href);
-    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    return url.href;
   } catch (_) { return ""; }
+}
+function safeMediaUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("/api/") || raw.startsWith("blob:") || raw.startsWith("data:image/")) return raw;
+  try {
+    const baseHref = typeof location === "undefined" ? "http://localhost" : location.href;
+    const pageOrigin = typeof location === "undefined" ? "http://localhost" : location.origin;
+    const url = new URL(raw, baseHref);
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    const host = (url.hostname || "").toLowerCase();
+    const isPreview = typeof document !== "undefined" && document.documentElement?.dataset?.preview === "true";
+    if (!isPreview && url.protocol === "https:" && (host === "twimg.com" || host.endsWith(".twimg.com"))) {
+      return `/api/tw-media-thumb?url=${encodeURIComponent(url.href)}`;
+    }
+    if (!isPreview && url.protocol === "https:" && (host.endsWith(".cdninstagram.com") || host.endsWith(".fbcdn.net"))) {
+      return `/api/ig-media-thumb?url=${encodeURIComponent(url.href)}`;
+    }
+    if (!isPreview && url.origin !== pageOrigin) {
+      return `/api/thumb?url=${encodeURIComponent(url.href)}`;
+    }
+    return url.href;
+  } catch (_) { return ""; }
+}
+function setHtmlIfChanged(el, nextHtml) {
+  if (!el) return false;
+  const html = String(nextHtml ?? "");
+  if (el._lastHtml === html && el._lastDomHtml === el.innerHTML && el.childNodes.length > 0) return false;
+  el._lastHtml = html;
+  el.innerHTML = html;
+  el._lastDomHtml = el.innerHTML;
+  return true;
 }
 // JSON encoding handles the JS string, then HTML encoding handles the attribute.
 function jsArg(value) { return esc(JSON.stringify(String(value ?? ""))); }
@@ -236,6 +271,23 @@ function toggleSecretInput(id, btn) {
   }
   input.focus({ preventScroll: true });
 }
+function insertTextVar(inputId, token) {
+  const el = $(inputId);
+  if (!el) return;
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  el.value = el.value.slice(0, start) + token + el.value.slice(end);
+  const next = start + token.length;
+  el.focus();
+  try { el.setSelectionRange(next, next); } catch (e) {}
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+function isAiCustomSource() {
+  return Boolean($("ai-source-custom")?.checked);
+}
+function isAiCustomRequired() {
+  return isAiCustomSource() && Boolean($("ai-enabled")?.checked);
+}
 function validateAiField(el, required = false) {
   if (!el) return true;
   const value = el.value.trim();
@@ -246,20 +298,35 @@ function validateAiField(el, required = false) {
       if (!/^https?:$/.test(url.protocol)) throw new Error("protocol");
     } catch (e) { return setFieldError(el, "请输入以 http:// 或 https:// 开头的有效地址"); }
   }
+  if (el.id === "ai-proxy-url" && $("ai-proxy-mode")?.value === "custom") {
+    if (!value) return setFieldError(el, "选择自定义代理时请填写代理地址");
+    try {
+      const url = new URL(value);
+      if (!/^(https?|socks5h?):$/.test(url.protocol)) throw new Error("protocol");
+    } catch (e) { return setFieldError(el, "请输入合法代理地址（http:// 或 socks5://）"); }
+  }
   if (el.id === "ai-temp" && value) {
     const n = Number(value);
-    if (!Number.isFinite(n) || n < 0 || n > 2) return setFieldError(el, "温度需填写 0–2 之间的数字");
+    if (!Number.isFinite(n) || n < 0 || n > 2) return setFieldError(el, "温度需填写 0–2 之间的数字，或留空");
   }
   return setFieldError(el, "");
 }
 function validateAiSettings(requireConfigured = false) {
-  const required = requireConfigured || $("ai-enabled").checked;
-  const fields = [$("ai-base"), $("ai-model"), $("ai-temp")];
-  const valid = fields.map(el => validateAiField(el, required && (el.id === "ai-base" || el.id === "ai-model"))).every(Boolean);
+  const custom = isAiCustomSource();
+  const required = requireConfigured || Boolean($("ai-enabled")?.checked);
+  const fields = [$("ai-temp"), $("ai-proxy-url")];
+  if (custom) fields.unshift($("ai-base"), $("ai-model"));
+  else {
+    setFieldError($("ai-base"), "");
+    setFieldError($("ai-model"), "");
+  }
+  const valid = fields.filter(Boolean).map(el =>
+    validateAiField(el, custom && required && (el.id === "ai-base" || el.id === "ai-model"))
+  ).every(Boolean);
   if (!valid) {
-    const first = fields.find(el => el.getAttribute("aria-invalid") === "true");
+    const first = fields.find(el => el && el.getAttribute("aria-invalid") === "true");
     if (first) first.focus({ preventScroll: false });
-    $("ai-msg").textContent = "请先修正标红的配置项";
+    if ($("ai-msg")) $("ai-msg").textContent = "请先修正标红的配置项";
   }
   return valid;
 }
@@ -304,7 +371,7 @@ function _modalFocusables(el) {
 }
 
 // ─── 通用模态(替代原生 prompt / confirm:下拉 / 文本输入 / 确认)───
-let _uiResolve = null, _uiGetVal = null, _uiCancelVal = null, _uiSubmit = null, _uiBusy = false;
+let _uiResolve = null, _uiGetVal = null, _uiCancelVal = null, _uiSubmit = null, _uiBusy = false, _uiBusyText = "保存中";
 function _uiClose(val) {
   if (_uiBusy) return;
   if (typeof _openSelectClose === "function") _openSelectClose();
@@ -345,11 +412,11 @@ async function uiModalOk() {
     value = _uiGetVal ? _uiGetVal() : "";
     _uiBusy = true; body.inert = true; modal.setAttribute("aria-busy", "true");
     modal.querySelectorAll(".pv-close,#ui-actions .ghost").forEach(button => { button.disabled = true; });
-    uiEditorNotice("正在保存，请稍候…");
+    uiEditorNotice(_uiBusyText === "保存中" ? "正在保存，请稍候…" : `${_uiBusyText}，请稍候…`);
     $("ui-feedback").focus({ preventScroll: true });
-    success = await withBusy($("ui-ok"), "保存中", () => _uiSubmit(value)) !== false;
+    success = await withBusy($("ui-ok"), _uiBusyText, () => _uiSubmit(value)) !== false;
   } catch (error) {
-    uiEditorNotice(error.fieldId ? error.message : "保存未完成：" + error.message, true);
+    uiEditorNotice(error.fieldId ? error.message : (_uiBusyText === "保存中" ? "保存未完成：" : "") + error.message, true);
     body.inert = false;
     const field = error.fieldId && $(error.fieldId);
     if (field) {
@@ -368,15 +435,15 @@ async function uiModalOk() {
   }
   if (success) _uiClose(value);
 }
-function _uiOpen(title, hint, { okText = "确定", danger = false, wide = false, submit = null, icon = "i-edit" } = {}) {
+function _uiOpen(title, hint, { okText = "确定", danger = false, wide = false, submit = null, icon = "i-edit", busyText = "保存中", noticeText = undefined } = {}) {
   const previousExtraAction = $("ui-extra-action");
   if (previousExtraAction) previousExtraAction.remove();
   $("ui-title").textContent = title || "";
   $("ui-hint").textContent = hint || "";
   $("ui-hint").hidden = !hint;
   $("ui-icon").setAttribute("href", "#" + (danger ? "i-trash" : icon));
-  _uiSubmit = submit; _uiBusy = false;
-  uiEditorNotice(submit ? "更改仅在保存后生效" : "");
+  _uiSubmit = submit; _uiBusy = false; _uiBusyText = busyText || "保存中";
+  uiEditorNotice(noticeText !== undefined ? noticeText : (submit ? "更改仅在保存后生效" : ""));
   const ok = $("ui-ok");
   ok.innerHTML = `<svg aria-hidden="true"><use href="#${danger ? "i-trash" : "i-check"}"/></svg>` + esc(okText);
   ok.classList.toggle("danger", !!danger);
@@ -442,6 +509,7 @@ function uiPrompt({ title, hint, value, placeholder, multiline, rows, secret = f
   });
 }
 
+// 02-ui-controls.js — 渐进增强下拉框、自定义悬浮提示、日期时间选择器与总览趋势图。
 // ─── 自定义下拉:渐进增强原生 <select>(美化展开列表)───
 // 弹层挂到 body 以避开卡片 overflow；Tab 时显式回到文档顺序，避免焦点落到 body 末尾。
 let _openSelectClose = null;
@@ -463,8 +531,8 @@ function focusAdjacentControl(origin, backwards = false) {
   if (next) requestAnimationFrame(() => next.focus({ preventScroll: true }));
 }
 function enhanceSelect(sel) {
-  // React owns the assistant's native controls; reparenting them breaks updates.
-  if (sel.dataset.cs || sel.closest(".agent-workspace")) return;
+  // React owns the assistant and matrix islands' native controls; reparenting them breaks updates.
+  if (sel.dataset.cs || sel.closest(".agent-workspace,.wb-react-island")) return;
   sel.dataset.cs = "1";
   const wrap = document.createElement("div");
   wrap.className = "cs" + (sel.className ? " " + sel.className : "");
@@ -684,7 +752,7 @@ function _dtFmt(d) { return `${d.getFullYear()}-${_pad2(d.getMonth() + 1)}-${_pa
 function _dtDisp(d) { return `${d.getFullYear()}-${_pad2(d.getMonth() + 1)}-${_pad2(d.getDate())} ${_pad2(d.getHours())}:${_pad2(d.getMinutes())}`; }
 function _dtParse(v) { const m = (v || "").match(/(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/); return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : null; }
 function enhanceDateTime(inp) {
-  if (inp.dataset.dt) return; inp.dataset.dt = "1";
+  if (inp.dataset.dt || inp.closest(".agent-workspace,.wb-react-island")) return; inp.dataset.dt = "1";
   const wrap = document.createElement("div");
   wrap.className = "dt" + (inp.className ? " " + inp.className : "");
   const st = inp.getAttribute("style"); if (st) wrap.setAttribute("style", st);
@@ -861,6 +929,7 @@ async function refreshOverviewChart() {
   box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="近 7 天每日新增作品与评论柱状图">${gl}${axt}${bars}${labels}</svg><details class="wb-chart-data"><summary>查看每日数据</summary><table><caption class="sr-only">每日新增作品与评论</caption><thead><tr><th>日期</th><th>作品</th><th>评论</th></tr></thead><tbody>${days.map((day, i) => `<tr><th>${esc(day)}</th><td>${Number(A[i]) || 0}</td><td>${Number(B[i]) || 0}</td></tr>`).join("")}</tbody></table></details>`;
 }
 
+// 03-navigation-platform.js — 十平台上下文切换、平台差异化表单显隐与工作台标签页导航。
 // ─── 平台切换(抖音 / 小红书) ───
 
 async function exportMonitorReport(explicitBtn = null) {
@@ -1043,14 +1112,18 @@ async function exportModuleReport(module, full = false, explicitBtn = null) {
 }
 
 let PLATFORM = "douyin";
-const PF_NAME = { douyin: "抖音", xhs: "小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩" };
+let GLOBAL_MODE = true;
+const PF_NAME = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook" };
 let CURRENT_TAB = "overview";
 const PAGE_META = {
   overview: {
-    title: "工作概览", desc: "查看待处理任务，接着推进今天的内容工作。"
+    title: "指挥概览", desc: "跨平台查看账号健康态势、高赞内容快览与今日发布排期。"
+  },
+  "media-hub": {
+    title: "汇总预览库", desc: "跨平台统一画廊预览监控作品、批量采集、自有作品与本地下载素材，支持右侧分栏快览。"
   },
   accounts: {
-    title: "平台账号", desc: "查看登录状态；网络与环境配置按需展开。"
+    title: "账号矩阵", desc: "按跨平台人设组管理多账号，支持异常快筛、批量配代理与连续扫码补登。"
   },
   "risk-control": {
     title: "风控中心", desc: "统一管理风控规则，查看账号状态、触发原因、恢复进度与事件记录。"
@@ -1068,13 +1141,13 @@ const PAGE_META = {
     title: "弹幕监控", desc: "监控短视频播放器内的弹幕，保留每条弹幕在视频中的时间点。"
   },
   hub: {
-    title: "本账号管理", desc: "查看当前登录账号自己的作品、数据与账号维护入口。"
+    title: "矩阵数据与私信", desc: "横向对比全部账号涨粉、播放、0播异常与全平台聚合私信，或下钻单账号明细。"
   },
   "tiktok-tools": {
     title: "用户互动", desc: "搜索其他 TikTok 用户并创建关注、取关、私信、评论或回复任务。"
   },
   publish: {
-    title: "内容发布", desc: "准备素材与文案，创建立即或定时发布任务。"
+    title: "内容发布", desc: "支持单账号精细发布或跨平台多账号错峰矩阵群发。"
   },
   queue: {
     title: "任务队列", desc: "统一查看采集、发布、评论、账号动作与下载任务的排队、执行和阻塞状态。"
@@ -1092,26 +1165,36 @@ const PAGE_META = {
     title: "设置", desc: "管理外观、下载、AI 文案与采集运行配置。"
   },
 };
+const SINGLE_PF_ONLY_TABS = ["monitors", "collections", "comments", "danmaku", "tiktok-tools", "autocomment"];
 function updatePageContext(name = CURRENT_TAB) {
   const meta = PAGE_META[name] || PAGE_META.overview;
-  if ($("page-title")) $("page-title").textContent = meta.title;
-  if ($("page-desc")) $("page-desc").textContent = meta.desc;
-  if ($("page-platform")) $("page-platform").textContent = PF_NAME[PLATFORM] || "当前平台";
-  if ($("page-kicker")) $("page-kicker").textContent = pfIsChannels(PLATFORM) ? "本账号工作台" : "多平台工作台";
-  document.title = `${meta.title} · ${PF_NAME[PLATFORM] || ""} | CreatorHub`;
+  const showGlobalLabel = GLOBAL_MODE && !SINGLE_PF_ONLY_TABS.includes(name);
+  const effectiveTitle = (GLOBAL_MODE && name === "publish") ? "矩阵群发与排期" : meta.title;
+  const effectiveDesc = (GLOBAL_MODE && name === "publish")
+    ? "一次上传素材与主文案，按跨平台矩阵组一键错峰群发，并统一追踪全平台发布进度。"
+    : meta.desc;
+  if ($("page-title")) $("page-title").textContent = effectiveTitle;
+  if ($("page-desc")) $("page-desc").textContent = effectiveDesc;
+  if ($("page-platform")) $("page-platform").textContent = showGlobalLabel ? "全平台矩阵" : (PF_NAME[PLATFORM] || "当前平台");
+  if ($("page-kicker")) $("page-kicker").textContent = showGlobalLabel ? "跨 10 大平台全局视角" : (pfIsChannels(PLATFORM) ? "本账号工作台" : "单平台精细工作台");
+  document.title = `${effectiveTitle} · ${showGlobalLabel ? "全平台" : (PF_NAME[PLATFORM] || "")} | CreatorHub`;
   globalThis.CreatorHubWorkbench?.navigate?.();
 }
 // 是否支持「发布」面板
-function pfHasPublish(pf) { return ["xhs", "kuaishou", "douyin", "shipinhao", "tiktok", "bilibili"].includes(pf); }
+function pfHasPublish(pf) { return ["xhs", "rednote", "kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(pf); }
 // 视频号只有「本账号」数据(助手接口本账号),不支持监控他人作品/评论
 function pfIsChannels(pf) { return pf === "shipinhao"; }
 function switchPlatform(pf) {
-  if (!["douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"].includes(pf)) pf = "douyin";
-  globalThis.CreatorHubWorkbench?.platformChanging?.(pf);
-  PLATFORM = pf;
+  const wantGlobal = pf === "all";
+  if (!wantGlobal && !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(pf)) pf = "douyin";
+  if (!wantGlobal) globalThis.CreatorHubWorkbench?.platformChanging?.(pf);
+  GLOBAL_MODE = wantGlobal;
+  if (!wantGlobal) PLATFORM = pf;
   VIEW_REQUESTS.clear();
   CONTENT_PAGE = COMMENT_PAGE = 1;
+  COLLECTION_JOBS = []; selCollection.clear(); closeCollectionResults(); renderCollectionJobs(); if ($("tb-col")) $("tb-col").textContent = "0";
   selContent.clear(); selComment.clear();
+  monSelClear(); watchSelClear(); danmakuWatchSelClear();
   CONTENT_SRC = CONTENT_GROUP = CONTENT_TAG = "";
   CONTENT_SOURCE_CACHE.clear();
   ["content-captured-from", "content-captured-to"].forEach(id => { if ($(id)) $(id).value = ""; });
@@ -1131,10 +1214,17 @@ function switchPlatform(pf) {
     const select = $(id);
     if (select) { select.value = ""; if (select._csSync) select._csSync(); }
   });
-  try { localStorage.setItem("dym-pf", pf); } catch (e) {}
+  try {
+    localStorage.setItem("dym-global", wantGlobal ? "1" : "0");
+    if (!wantGlobal) localStorage.setItem("dym-pf", pf);
+  } catch (e) {}
+  if ($("queue-platform")) {
+    $("queue-platform").value = wantGlobal ? "all" : "current";
+    $("queue-platform")._csSync?.();
+  }
   applyPlatformUI();
   ["t-interval", "w-interval", "d-w-interval"].forEach(id => $(id)?._monitorIntervalSync?.());
-  // 切换后立刻刷新该平台数据
+  // 切换后立刻刷新对应数据
   refreshAccounts(); refreshMonitors(); refreshContents(); refreshWatches(); refreshComments(); refreshDanmakuWatches(); refreshDanmaku(); refreshCollections();
   updateTaskQueuePlatformLabel();
   if (CURRENT_TAB === "queue") refreshTaskQueue(true); else refreshTaskQueueBadge();
@@ -1144,17 +1234,22 @@ function switchPlatform(pf) {
   if (CURRENT_TAB === "overview") loop();
 }
 function applyPlatformUI() {
-  document.body.classList.toggle("pf-douyin", PLATFORM === "douyin");
-  document.body.classList.toggle("pf-xhs", PLATFORM === "xhs");
-  document.body.classList.toggle("pf-kuaishou", PLATFORM === "kuaishou");
-  document.body.classList.toggle("pf-shipinhao", PLATFORM === "shipinhao");
-  document.body.classList.toggle("pf-tiktok", PLATFORM === "tiktok");
-  document.body.classList.toggle("pf-bilibili", PLATFORM === "bilibili");
+  document.body.classList.toggle("pf-all", GLOBAL_MODE);
+  document.body.classList.toggle("pf-douyin", !GLOBAL_MODE && PLATFORM === "douyin");
+  document.body.classList.toggle("pf-xhs", !GLOBAL_MODE && PLATFORM === "xhs");
+  document.body.classList.toggle("pf-kuaishou", !GLOBAL_MODE && PLATFORM === "kuaishou");
+  document.body.classList.toggle("pf-shipinhao", !GLOBAL_MODE && PLATFORM === "shipinhao");
+  document.body.classList.toggle("pf-tiktok", !GLOBAL_MODE && PLATFORM === "tiktok");
+  document.body.classList.toggle("pf-bilibili", !GLOBAL_MODE && PLATFORM === "bilibili");
+  document.body.classList.toggle("pf-rednote", !GLOBAL_MODE && PLATFORM === "rednote");
+  document.body.classList.toggle("pf-instagram", !GLOBAL_MODE && PLATFORM === "instagram");
+  document.body.classList.toggle("pf-twitter", !GLOBAL_MODE && PLATFORM === "twitter");
+  document.body.classList.toggle("pf-facebook", !GLOBAL_MODE && PLATFORM === "facebook");
   // 视频号:只有本账号数据,隐藏「监控他人作品/评论」相关入口(.notsh-only)
-  document.body.classList.toggle("pf-channels", pfIsChannels(PLATFORM));
+  document.body.classList.toggle("pf-channels", !GLOBAL_MODE && pfIsChannels(PLATFORM));
   if (!["douyin", "bilibili"].includes(PLATFORM) && CURRENT_TAB === "danmaku") switchTab("overview");
   document.querySelectorAll(".pswitch button").forEach(b => {
-    const active = b.dataset.pf === PLATFORM;
+    const active = GLOBAL_MODE ? b.dataset.pf === "all" : b.dataset.pf === PLATFORM;
     b.classList.toggle("active", active);
     b.setAttribute("aria-selected", active ? "true" : "false");
     b.tabIndex = active ? 0 : -1;
@@ -1167,6 +1262,15 @@ function applyPlatformUI() {
   document.querySelectorAll(".tk-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "tiktok"));
   document.querySelectorAll(".bili-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "bilibili"));
   document.querySelectorAll(".bili-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "bilibili"));
+  document.querySelectorAll(".rn-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "rednote"));
+  document.querySelectorAll(".rn-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "rednote"));
+  document.querySelectorAll(".xhs-rn-only").forEach(e => e.classList.toggle("hidden", !["xhs", "rednote"].includes(PLATFORM)));
+  document.querySelectorAll(".ig-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "instagram"));
+  document.querySelectorAll(".ig-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "instagram"));
+  document.querySelectorAll(".tw-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "twitter"));
+  document.querySelectorAll(".tw-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "twitter"));
+  document.querySelectorAll(".fb-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "facebook"));
+  document.querySelectorAll(".fb-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "facebook"));
   document.querySelectorAll(".danmaku-only").forEach(e => e.classList.toggle("hidden", !["douyin", "bilibili"].includes(PLATFORM)));
   document.querySelectorAll(".notsh-only").forEach(e => {
     const allowOnChannels = pfIsChannels(PLATFORM) && (
@@ -1174,17 +1278,26 @@ function applyPlatformUI() {
       || e.dataset?.tab === "comments"
       || (e.classList.contains("quick-action") && (e.getAttribute("onclick") || "").includes("'monitors'"))
     );
-    e.classList.toggle("hidden", pfIsChannels(PLATFORM) && !allowOnChannels);
+    const hideByPlatform = (e.classList.contains("tk-hide") && PLATFORM === "tiktok") || (e.classList.contains("bili-hide") && PLATFORM === "bilibili") || (e.classList.contains("rn-hide") && PLATFORM === "rednote");
+    e.classList.toggle("hidden", hideByPlatform || (pfIsChannels(PLATFORM) && !allowOnChannels));
   });
   document.querySelectorAll(".collect-only").forEach(e => e.classList.toggle(
-    "hidden", !["douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"].includes(PLATFORM)));
+    "hidden", !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM)));
+  // 全平台模式下隐藏所有单平台专属采集/监控/互动入口与分组标题
+  if (GLOBAL_MODE) {
+    document.querySelectorAll(".single-pf-only").forEach(e => e.classList.add("hidden"));
+  } else {
+    document.querySelectorAll("#nav-sep-collect").forEach(e => e.classList.remove("hidden"));
+  }
+  if ($("nav-publish-label")) $("nav-publish-label").textContent = GLOBAL_MODE ? "矩阵群发" : "内容发布";
+  if ($("nav-hub-label")) $("nav-hub-label").textContent = GLOBAL_MODE ? "矩阵数据与私信" : "数据与私信";
   document.querySelectorAll(".meta-scope").forEach(e => {
     e.textContent = (PF_NAME[PLATFORM] || "当前平台") + "内独立";
   });
   // 发布面板入口
-  document.querySelectorAll(".pub-only").forEach(e => e.classList.toggle("hidden", !pfHasPublish(PLATFORM)));
+  document.querySelectorAll(".pub-only").forEach(e => e.classList.toggle("hidden", !GLOBAL_MODE && !pfHasPublish(PLATFORM)));
   // 发布面板文案随平台切换
-  const ks = PLATFORM === "kuaishou", dy = PLATFORM === "douyin", sph = PLATFORM === "shipinhao", tk = PLATFORM === "tiktok", bili = PLATFORM === "bilibili";
+  const ks = PLATFORM === "kuaishou", dy = PLATFORM === "douyin", sph = PLATFORM === "shipinhao", tk = PLATFORM === "tiktok", bili = PLATFORM === "bilibili", rn = PLATFORM === "rednote", ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook";
   const pubType = $("pub-type");
   if (pubType) {
     const before = pubType.value;
@@ -1202,15 +1315,19 @@ function applyPlatformUI() {
     : sph ? "上传图集 / 视频到视频号助手(实验性)"
     : tk ? "上传视频到 TikTok Studio(实验性)"
     : bili ? "上传图文动态 / 视频稿件到哔哩哔哩创作中心"
+    : ig ? "上传单图 / 轮播 / Reels / Story 到 Instagram"
+    : tw ? "发布纯文本 / 图集（最多 4 图） / 视频推文到 X (Twitter)"
+    : fb ? "发布纯文本 / 图集（最多 20 图） / 视频到 Facebook 个人主页、公共主页、群组或 Story"
+    : rn ? "上传图集 / 视频到海外小红书 creator.rednote.com"
     : "上传图集 / 视频到小红书(实验性)";
-  if ($("pub-head-lead")) $("pub-head-lead").textContent = (ks || dy || sph || tk || bili) ? "发布作品" : "发布笔记";
-  const titleCap = bili ? 80 : dy ? 30 : sph ? 16 : 20;
-  if ($("pub-title-label-text")) $("pub-title-label-text").textContent = `标题(≤${titleCap} 字)`;
+  if ($("pub-head-lead")) $("pub-head-lead").textContent = tw ? "发布推文" : fb ? "发布帖子" : (ks || dy || sph || tk || bili || ig) ? "发布作品" : "发布笔记";
+  const titleCap = fb ? 5000 : tw ? ($("pub-tw-long")?.value === "1" ? 4000 : 280) : ig ? 2200 : bili ? 80 : rn ? 40 : dy ? 30 : sph ? 16 : 20;
+  if ($("pub-title-label-text")) $("pub-title-label-text").textContent = fb ? `首行标题（可选，正文与话题合并 ≤${titleCap} 字）` : tw ? `推文首行标题（可选，合并总重 ≤${titleCap}）` : rn ? "标题(≤20 汉字 / 40 英文字符)" : `标题(≤${titleCap} 字)`;
   if ($("pub-title")) {
     $("pub-title").maxLength = titleCap;
-    $("pub-title").placeholder = bili ? "填写视频稿件标题（图文动态可选）" : tk ? "视频说明的首行标题" : (ks || dy || sph) ? "给作品起个标题" : "给笔记起个标题";
+    $("pub-title").placeholder = fb ? "帖子首行标题（可选，正文与话题会自动合并，可纯文本发布）" : tw ? "推文首行（可选，直接填正文也可；URL 固定计 23 权重）" : ig ? "Caption 首行标题（可选，正文与话题自动合并）" : bili ? "填写视频稿件标题（图文动态可选）" : tk ? "视频说明的首行标题" : (ks || dy || sph) ? "给作品起个标题" : "给笔记起个标题";
   }
-  if ($("pub-dy-opts")) $("pub-dy-opts").classList.toggle("hidden", !["douyin", "xhs", "kuaishou"].includes(PLATFORM));
+  if ($("pub-dy-opts")) $("pub-dy-opts").classList.toggle("hidden", !["douyin", "xhs", "rednote", "kuaishou"].includes(PLATFORM));
   if (bili) { onBiliCopyrightChange(); if ($("pub-acc")?.value) loadBiliPartitions($("pub-acc").value); }
   const pubHintText = dy
     ? "发布通过自动化抖音创作平台完成。首次登录或触发验证时，请在弹出窗口中完成短信验证或扫码；视频上传后还需等待转码。注意：定时发布可能因本人验证而暂停，建议发布时在场。"
@@ -1222,6 +1339,14 @@ function applyPlatformUI() {
     ? "发布通过账号独立的可见 TikTok Studio 页面完成，目前支持单视频、话题、可见范围、评论、Duet 与 Stitch。提交只点击一次；若显示“结果待确认”，请先到 TikTok Studio 核对，系统不会自动重发。"
     : bili
     ? "视频稿件通过哔哩哔哩创作中心完成上传，并按所选分区、自制/转载、创作者声明及弹幕/评论权限提交；图文通过动态页发布。提交只执行一次；若显示“结果待确认”，请先到创作中心核对，系统不会自动重发。"
+    : ig
+    ? "支持单图、混合多图轮播（最多 10 项）、Reels 短视频与 Story 快拍。默认优先走两阶段 rupload + configure 直连协议，并在普通兼容失败时回退独立浏览器 Create 弹窗；若显示“结果待确认”，请先到 Instagram 主页核对。"
+    : tw
+    ? "支持纯文本推文、最多 4 张图片或单个视频/GIF，可配置回复权限与首评自回复串推。通过独立可见浏览器窗口完成上传并拦截 CreateTweet 响应确认，提交只执行一次；若显示“结果待确认”，请先到 x.com 主页核对。"
+    : fb
+    ? "支持纯文本、最多 20 张图片或单个视频，可发布到个人动态、公共主页（自动通过 i_user 切换身份并在完成后恢复）、Facebook 群组或 Story，支持可见范围与发布后自动首评。提交只执行一次；若显示“结果待确认”，请先到 facebook.com 主页核对。"
+    : rn
+    ? "发布通过海外小红书 creator.rednote.com 独立可见浏览器窗口完成（拦截 webapi.rednote.com/web_api/sns/v2/note 确认），不混用国内小红书会话。提交只点击一次；若显示“结果待确认”，请先到平台核对。"
     : "发布通过账号独立的可见 Chrome 页面完成。提交只点击一次；若显示“结果待确认”，请先到小红书核对，系统不会自动重发。";
   const pubHint = $("pub-hint");
   if (pubHint) {
@@ -1233,58 +1358,81 @@ function applyPlatformUI() {
   const wk = $("w-kind");
   if (wk) {
     const cur = wk.value;
-    wk.innerHTML = PLATFORM === "xhs"
+    wk.innerHTML = (PLATFORM === "xhs" || PLATFORM === "rednote")
       ? '<option value="auto">类型:自动识别</option><option value="video">单条笔记</option><option value="user">创作者近期笔记</option>'
       : '<option value="auto">类型:自动识别</option><option value="video">单条视频</option><option value="user">账号近期作品</option>';
     if ([...wk.options].some(o => o.value === cur)) wk.value = cur;
   }
   const wl = $("w-url-label");
-  if (wl) wl.textContent = PLATFORM === "xhs"
+  if (wl) wl.textContent = (PLATFORM === "xhs" || PLATFORM === "rednote")
     ? "笔记 / 创作者主页 / 完整分享文案 / ID"
     : PLATFORM === "kuaishou" ? "作品 / 创作者主页 / 完整分享文案 / ID"
     : PLATFORM === "shipinhao" ? "分享链接 / 作品 objectId / 创作者 v2_...@finder"
     : PLATFORM === "bilibili" ? "视频 BV/av / 图文动态 / 空间主页 / 完整分享文案"
+    : PLATFORM === "instagram" ? "帖子 /p/ / Reels /reel/ / 创作者 @username / 主页链接"
+    : PLATFORM === "twitter" ? "推文 /status/ / 创作者 @username / x.com 主页链接"
+    : PLATFORM === "facebook" ? "帖子 / Reel / Watch 链接或个人/公共主页/群组链接"
     : "视频 / 账号主页 / 完整分享文案 / ID";
   if ($("w-url")) $("w-url").placeholder = PLATFORM === "xhs"
     ? "直接粘贴整段小红书分享文案，将自动提取笔记或主页链接"
     : PLATFORM === "kuaishou" ? "直接粘贴整段快手分享文案，将自动提取作品或主页链接"
     : PLATFORM === "shipinhao" ? "粘贴 weixin.qq.com/sph/... 分享链、视频号作品链接、objectId 或 v2_...@finder"
     : PLATFORM === "tiktok" ? "直接粘贴整段 TikTok 分享文案，将自动提取视频或主页链接"
+    : PLATFORM === "rednote" ? "粘贴 www.rednote.com/zh/discovery/item/... 笔记链接、user/profile/... 主页链接或 24 位 ID"
     : PLATFORM === "bilibili" ? "直接粘贴整段哔哩哔哩分享文案、BV/av 号、opus 动态链接或 space 主页"
+    : PLATFORM === "instagram" ? "粘贴 instagram.com/p/...、/reel/...、创作者主页链接或 @username"
+    : PLATFORM === "twitter" ? "粘贴 x.com/.../status/...、创作者主页链接或 @username"
+    : PLATFORM === "facebook" ? "粘贴 facebook.com 帖子/Reel/Watch 链接、fb.watch 短链、公共主页或群组链接"
     : "直接粘贴整段抖音分享文案，将自动提取视频或主页链接";
   resetWatchTargetState();
   const ckl = $("ck-label");
   if (ckl) ckl.textContent = PLATFORM === "xhs"
     ? "完整 Cookie(含 a1;发布需创作者会话)"
     : PLATFORM === "kuaishou" ? "完整 Cookie(含 userId 与 web_st)"
+    : PLATFORM === "rednote" ? "完整 rednote.com Cookie(含 web_session / a1;禁混用 xiaohongshu.com)"
     : PLATFORM === "bilibili" ? "完整 Cookie(含 SESSDATA 与 bili_jct)"
+    : PLATFORM === "instagram" ? "完整 Cookie(含 sessionid、ds_user_id 与 csrftoken)"
+    : PLATFORM === "twitter" ? "Token (auth_token) / 多字段凭证 / 完整 Cookie"
+    : PLATFORM === "facebook" ? "完整 Facebook Cookie(必须含 c_user 与 xs)"
     : "完整 Cookie(含 sessionid)";
   if ($("ck-val")) $("ck-val").placeholder = PLATFORM === "xhs"
     ? "从 creator.xiaohongshu.com 登录后复制完整 Cookie"
     : PLATFORM === "kuaishou" ? "从 www.kuaishou.com 登录后复制完整 Cookie"
+    : PLATFORM === "rednote" ? "从 www.rednote.com 或 creator.rednote.com 登录后复制完整 Cookie"
     : PLATFORM === "bilibili" ? "从 www.bilibili.com 或 member.bilibili.com 登录后复制完整 Cookie"
+    : PLATFORM === "instagram" ? "从 www.instagram.com 登录后复制完整 Cookie(含 sessionid)"
+    : PLATFORM === "twitter" ? "可直接粘贴 40 位 auth_token、账号----密码----Token 文本、JSON 数组或 x.com 完整 Cookie"
+    : PLATFORM === "facebook" ? "从 www.facebook.com 登录后复制完整 Cookie（含 c_user 与 xs）或粘贴 JSON Cookie 数组"
     : "从浏览器开发者工具复制完整 Cookie";
   applyMonitorForm();
   applyCollectionForm();
   if (["douyin", "bilibili"].includes(PLATFORM)) applyDanmakuForm();
-  if ($("t-kind") && PLATFORM !== "xhs") $("t-kind").value = "creator";
+  if ($("t-kind") && !["xhs", "rednote"].includes(PLATFORM)) $("t-kind").value = "creator";
+  // 全平台视角下不展示单平台专属面板：若当前停留在单平台页，自动回到指挥概览
+  if (GLOBAL_MODE && SINGLE_PF_ONLY_TABS.includes(CURRENT_TAB)) {
+    switchTab("overview");
+    return;
+  }
   // 视频号不支持自动评论规则:若正停在自动评论面板,切回本账号管理
-  if (pfIsChannels(PLATFORM)) {
+  if (!GLOBAL_MODE && pfIsChannels(PLATFORM)) {
     const cur = (document.querySelector('.navitem.active') || {}).dataset;
     if (cur && cur.tab === "autocomment") switchTab("hub");
     // 视频号本账号只有「我的作品 / 数据」;若停在关注/粉丝/私信子页,切回我的作品
     if (["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
   }
-  if (PLATFORM === "tiktok" && CURRENT_TAB === "autocomment") switchTab("hub");
-  if (PLATFORM !== "tiktok" && CURRENT_TAB === "tiktok-tools") switchTab("accounts");
-  if (PLATFORM === "tiktok" && ["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
-  if (!["douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"].includes(PLATFORM) && CURRENT_TAB === "collections") switchTab("overview");
-  // 不支持发布的平台:若正停在该面板则回到总览(当前四平台均支持,兜底保留)
-  if (!pfHasPublish(PLATFORM)) {
+  if (!GLOBAL_MODE && PLATFORM === "tiktok" && CURRENT_TAB === "autocomment") switchTab("hub");
+  if (!GLOBAL_MODE && PLATFORM !== "tiktok" && CURRENT_TAB === "tiktok-tools") switchTab("accounts");
+  if (!GLOBAL_MODE && PLATFORM === "tiktok" && ["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
+  if (!GLOBAL_MODE && PLATFORM === "rednote" && CURRENT_TAB === "autocomment") switchTab("hub");
+  if (!GLOBAL_MODE && PLATFORM === "rednote" && ["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
+  if (!GLOBAL_MODE && !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && CURRENT_TAB === "collections") switchTab("overview");
+  // 不支持发布的平台:若正停在该面板则回到总览(当前十平台均支持,兜底保留)
+  if (!GLOBAL_MODE && !pfHasPublish(PLATFORM)) {
     const pub = document.querySelector('[data-panel="publish"]');
     if (pub && pub.style.display !== "none") switchTab("overview");
   }
   csSyncAll();   // 平台切换可能改了下拉选项/值,同步自定义下拉显示
+  requestAnimationFrame(() => window.dispatchEvent(new Event("creatorhub:layout")));
   updatePageContext();
 }
 const SMART_TARGET_PARSE_SEQ = Object.create(null);
@@ -1454,7 +1602,7 @@ async function normalizePlatformShareTarget({
 }
 
 function resetMonitorTargetState() {
-  const keywordMode = PLATFORM === "xhs" && $("t-kind") && $("t-kind").value === "keyword";
+  const keywordMode = ["xhs", "rednote"].includes(PLATFORM) && $("t-kind") && $("t-kind").value === "keyword";
   resetSmartTargetState("t-url", "t-url-feedback", keywordMode
     ? "输入要持续监控的搜索关键词"
     : PLATFORM === "shipinhao"
@@ -1463,7 +1611,7 @@ function resetMonitorTargetState() {
 }
 
 async function normalizeMonitorTarget(button = null, { quiet = false } = {}) {
-  const keywordMode = PLATFORM === "xhs" && $("t-kind") && $("t-kind").value === "keyword";
+  const keywordMode = ["xhs", "rednote"].includes(PLATFORM) && $("t-kind") && $("t-kind").value === "keyword";
   if (keywordMode) return $("t-url").value.trim();
   return normalizePlatformShareTarget({
     inputId: "t-url", feedbackId: "t-url-feedback", platform: PLATFORM, button, quiet,
@@ -1565,21 +1713,30 @@ function applyMonitorForm() {
   const isSph = PLATFORM === "shipinhao";
   if ($("t-acc-wrap")) $("t-acc-wrap").style.display = isSph ? "none" : "";
   if (isSph && $("t-acc")) $("t-acc").value = "";
-  const supportsBackfill = PLATFORM !== "xhs";
+  const supportsBackfill = !["xhs", "rednote"].includes(PLATFORM);
   if ($("t-backfill-wrap")) $("t-backfill-wrap").style.display = supportsBackfill ? "" : "none";
   if ($("t-backfill") && _LAST_MONITOR_PLATFORM !== PLATFORM) {
-    $("t-backfill").value = ["shipinhao", "kuaishou", "tiktok", "bilibili"].includes(PLATFORM) ? "5" : "";
+    $("t-backfill").value = ["shipinhao", "kuaishou", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) ? "5" : "";
     $("t-backfill")._csSync?.();
   }
   _LAST_MONITOR_PLATFORM = PLATFORM;
-  if (PLATFORM === "douyin" || PLATFORM === "kuaishou" || PLATFORM === "shipinhao" || PLATFORM === "tiktok" || PLATFORM === "bilibili") {
+  if (["douyin", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM)) {
     const isKs = PLATFORM === "kuaishou";
     const isTikTok = PLATFORM === "tiktok";
     const isBili = PLATFORM === "bilibili";
-    if (title) title.innerHTML = (isKs || isSph || isBili ? '添加创作者监控' : '添加作品监控')
+    const isIg = PLATFORM === "instagram";
+    const isTw = PLATFORM === "twitter";
+    const isFb = PLATFORM === "facebook";
+    if (title) title.innerHTML = (isKs || isSph || isBili || isIg || isTw || isFb ? '添加创作者监控' : '添加作品监控')
       + ' <span class="sub">监控并下载新作品</span>';
     if (lbl) lbl.textContent = isTikTok
       ? "创作者主页 / 完整分享文案 / @username"
+      : isIg
+      ? "Instagram 主页链接 / @username / 数字 UID"
+      : isTw
+      ? "Twitter (X) 主页链接 / @username / 数字 UID"
+      : isFb
+      ? "Facebook 个人主页 / 公共主页 / 群组链接或数字 ID"
       : isSph
       ? "创作者主页 / v2_...@finder / 单条视频分享链接"
       : isKs
@@ -1589,6 +1746,12 @@ function applyMonitorForm() {
       : "创作者主页 / 完整分享文案 / sec_uid";
     $("t-url").placeholder = isTikTok
       ? "直接粘贴整段 TikTok 主页或作品分享文案，将自动提取 @username"
+      : isIg
+      ? "粘贴 https://www.instagram.com/<username>/ 或填写 @username"
+      : isTw
+      ? "粘贴 https://x.com/<username> 或填写 @username"
+      : isFb
+      ? "粘贴 https://www.facebook.com/<page>、/groups/<id> 或 profile.php?id=..."
       : isSph
       ? "粘贴视频号主页链接、v2_...@finder、sph 标识或单条视频 weixin.qq.com/sph/... 链接"
       : isKs
@@ -1609,7 +1772,7 @@ function applyMonitorForm() {
   } else {
     if (title) title.innerHTML = '添加创作者监控 <span class="sub">监控并下载新笔记</span>';
     if (lbl) lbl.textContent = "创作者主页 / 完整分享文案 / user_id";
-    $("t-url").placeholder = "直接粘贴整段小红书主页分享文案，将自动提取有效链接";
+    $("t-url").placeholder = PLATFORM === "rednote" ? "粘贴 www.rednote.com/zh/user/profile/... 主页链接或 24 位 user_id" : "直接粘贴整段小红书主页分享文案，将自动提取有效链接";
     if (parseButton) parseButton.classList.remove("hidden");
   }
   resetMonitorTargetState();
@@ -1622,6 +1785,13 @@ function switchTab(name, pushHistory = false) {
     return;
   }
   if (!PAGE_META[name]) name = "overview";
+  // 若从全平台入口主动跳转到某个单平台功能（如去添加作品监控），自动退出全平台模式聚焦当前底层平台
+  if (GLOBAL_MODE && SINGLE_PF_ONLY_TABS.includes(name)) {
+    GLOBAL_MODE = false;
+    try { localStorage.setItem("dym-global", "0"); } catch (e) {}
+    CURRENT_TAB = name;
+    applyPlatformUI();
+  }
   globalThis.CreatorHubWorkbench?.beforeNavigate?.();
   const changed = CURRENT_TAB !== name;
   CURRENT_TAB = name;
@@ -1669,6 +1839,7 @@ function switchTab(name, pushHistory = false) {
   if (changed && !["hub", "share-download", "collections", "queue", "risk-control"].includes(name)) loop();
 }
 
+// 04-auth-login.js — 多平台浏览器扫码登录、预登录指纹选择与 Cookie/Token 凭证导入。
 // ─── 扫码登录(真实浏览器窗口) ───
 let qrTimer = null;
 let preLoginBrowserBackend = "default";
@@ -1707,6 +1878,580 @@ function browserChoiceOptions(catalog, { localOnly = false } = {}) {
   return options;
 }
 // 新账号尚未落库，扫码前先确定浏览器内核；成功后该选择随账号持久化。
+function isDomesticPlatform(pf) {
+  return !["tiktok", "rednote", "instagram", "twitter", "facebook"].includes(pf || "douyin");
+}
+function isMainlandGeoClient(country, region, city) {
+  const c = String(country || "").trim().toUpperCase();
+  const r = `${region || ""} ${city || ""}`.toLowerCase();
+  if (!c) return false;
+  if (["HK", "MO", "TW", "HONG KONG", "MACAU", "MACAO", "TAIWAN"].includes(c)) return false;
+  if (/(hong\s*kong|香港|macau|macao|澳门|taiwan|台湾)/i.test(r)) return false;
+  return c === "CN" || c === "CHINA" || /中国/.test(String(country || ""));
+}
+function proxyEndpointSummary(p) {
+  const sample = String(p.masked || p.url || "").trim();
+  const m = sample.match(/^([a-zA-Z0-9+.-]+):\/\/(?:[^@]*@)?([^/?#]+)/);
+  const scheme = m ? m[1].toUpperCase() : "HTTP";
+  const hostPort = m ? m[2] : sample;
+  const rawLabel = String(p.raw_label ?? "").trim()
+    || ((p.label && p.label !== p.masked) ? String(p.label).trim() : "");
+  return {
+    scheme,
+    hostPort,
+    rawLabel,
+    displayName: rawLabel || hostPort || p.masked || p.label || "未命名代理",
+  };
+}
+function proxyOptionMeta(p, platform = PLATFORM, { currentProxy = "", currentProxyId = null } = {}) {
+  const pf = platform || "douyin";
+  const domestic = isDomesticPlatform(pf);
+  const ep = proxyEndpointSummary(p);
+  const isCurrent = Boolean(
+    (currentProxyId && Number(p.id) === Number(currentProxyId))
+    || (currentProxy && p.masked && p.masked === currentProxy)
+  );
+  const rawSamePf = Number((p.used_by_platform || {})[pf] || 0);
+  const rawTotal = Number(p.used_by || 0);
+  const otherSamePf = Math.max(0, rawSamePf - (isCurrent ? 1 : 0));
+  const otherTotal = Math.max(0, rawTotal - (isCurrent ? 1 : 0));
+  const healthy = p.enabled !== false && !["bad", "auth_error", "blocked"].includes(p.status);
+  const geoChecked = Boolean(p.geo_checked || p.exit_ip || p.country);
+  const geoMatched = !geoChecked ? null : (domestic ? Boolean(p.is_mainland) : !p.is_mainland);
+  const rank = [
+    isCurrent ? 0 : 1,
+    p.enabled === false ? 2 : (healthy ? 0 : 1),
+    geoMatched === true ? 0 : (geoMatched === null ? 1 : 2),
+    otherSamePf === 0 ? 0 : 1,
+    otherSamePf,
+    otherTotal,
+    Number(p.id || 0),
+  ];
+  return { ...ep, pf, domestic, isCurrent, otherSamePf, otherTotal, healthy, geoChecked, geoMatched, rank };
+}
+function compareProxyRank(a, b) {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+function formatProxyOptionLabel(p, platform = PLATFORM) {
+  const meta = proxyOptionMeta(p, platform);
+  const stTxt = { ok: "可连接", bad: "连接失败", auth_error: "认证失败", blocked: "检测受限", unknown: "未测" };
+  const geo = p.geo_loc ? ` · ${p.geo_loc}` : "";
+  const geoWarn = meta.geoMatched === false
+    ? (meta.domestic ? " · ⚠️非大陆" : " · ⚠️大陆节点")
+    : "";
+  const usageTag = meta.otherSamePf > 0
+    ? `⚠️同平台共用(${meta.otherSamePf})`
+    : (meta.otherTotal > 0 ? `跨平台(${meta.otherTotal})` : "空闲独立");
+  return `${meta.displayName}${geo}${geoWarn} · ${usageTag} · ${stTxt[p.status] || p.status}${p.enabled === false ? " · 已停用" : ""}`;
+}
+function renderProxyNodeCard(p, meta, { selected = false, preview = false } = {}) {
+  const stMap = {
+    ok: { cls: "active", txt: "可连接" },
+    bad: { cls: "invalid", txt: "连接失败" },
+    auth_error: { cls: "invalid", txt: "认证失败" },
+    blocked: { cls: "invalid", txt: "检测受限" },
+    unknown: { cls: "bare", txt: "未测" },
+  };
+  const st = p.enabled === false ? { cls: "bare", txt: "已停用" } : (stMap[p.status] || stMap.unknown);
+  const geoBadge = !meta.geoChecked
+    ? `<span class="pill bare">地区未测</span>`
+    : meta.geoMatched
+      ? `<span class="pill active bare">${meta.domestic ? "大陆匹配" : "境外匹配"}</span>`
+      : `<span class="pill pending bare">⚠️ ${meta.domestic ? "非大陆节点" : "大陆节点"}</span>`;
+  const usageBadge = meta.otherSamePf > 0
+    ? `<span class="pill pending bare" title="同平台已有 ${meta.otherSamePf} 个其他账号绑定该代理，共用出口 IP 存在关联风险">⚠️ 同平台共用(${meta.otherSamePf})</span>`
+    : meta.otherTotal > 0
+      ? `<span class="pill bare" title="其他平台有 ${meta.otherTotal} 个账号使用，当前平台内独立">跨平台(${meta.otherTotal})</span>`
+      : `<span class="pill active bare">空闲独立</span>`;
+  const curBadge = meta.isCurrent && !preview ? `<span class="pill downloading bare">当前绑定</span>` : "";
+  const subParts = [p.masked || p.url];
+  if (p.exit_ip) subParts.push(`出口 ${p.exit_ip}`);
+  if (p.note) subParts.push(p.note);
+  const testBtn = p.id && !preview
+    ? `<button type="button" class="ghost sm pxp-test-btn" data-pxp-test="${p.id}" title="检测该节点连通性与出口归属地">测试</button>`
+    : "";
+  const cls = ["pxp-item", selected ? "selected" : "", preview ? "preview" : "", p.enabled === false ? "disabled-node" : ""]
+    .filter(Boolean).join(" ");
+  const attrs = preview
+    ? ""
+    : ` data-pxp-url="${esc(p.url)}" role="option" tabindex="0" aria-selected="${selected ? "true" : "false"}"`;
+  return `<div class="${cls}"${attrs}>
+    <div class="pxp-main">
+      ${preview ? "" : `<span class="pxp-radio" aria-hidden="true"></span>`}
+      <div class="pxp-copy">
+        <div class="pxp-title-line">
+          <span class="pxp-name" title="${esc(meta.displayName)}">${esc(meta.displayName)}</span>
+          <span class="pxp-proto">${esc(meta.scheme)}</span>
+          ${p.geo_loc ? `<span class="pxp-geo">${esc(p.geo_loc)}</span>` : ""}
+        </div>
+        <div class="pxp-sub-line" title="${esc(subParts.join(" · "))}">${esc(subParts.join(" · "))}</div>
+      </div>
+    </div>
+    <div class="pxp-badges">${curBadge}${geoBadge}${usageBadge}<span class="pill ${st.cls}">${esc(st.txt)}</span>${testBtn}</div>
+  </div>`;
+}
+function mountProxyPickerControl(container, {
+  opts = [],
+  platform = PLATFORM,
+  currentProxy = "",
+  currentProxyId = null,
+  isAccountEdit = false,
+  onSummary = null,
+} = {}) {
+  const pf = platform || "douyin";
+  const domestic = isDomesticPlatform(pf);
+  const pfName = (typeof PF_NAME !== "undefined" && PF_NAME[pf]) ? PF_NAME[pf] : pf;
+  const computeItems = () => opts
+    .map(p => ({ p, meta: proxyOptionMeta(p, pf, { currentProxy, currentProxyId }) }))
+    .sort((a, b) => compareProxyRank(a.meta.rank, b.meta.rank));
+
+  let items = computeItems();
+  const initialCurrent = items.find(x => x.meta.isCurrent);
+  const hasEnabledHealthy = items.some(x => x.meta.healthy);
+  const hasCompatibleHealthy = items.some(x => x.meta.healthy && x.meta.geoMatched !== false);
+  let mode = isAccountEdit
+    ? (initialCurrent
+        ? "pool"
+        : (currentProxy ? "custom" : (hasCompatibleHealthy ? "auto" : (items.length ? "pool" : "custom"))))
+    : (hasCompatibleHealthy
+        ? "auto"
+        : (domestic ? "direct" : (items.length ? "pool" : "custom")));
+  let selectedUrl = initialCurrent
+    ? initialCurrent.p.url
+    : ((items.find(x => x.meta.healthy && x.meta.geoMatched !== false) || items.find(x => x.meta.healthy) || items[0])?.p?.url || "");
+  let filter = "all";
+  let query = "";
+  let detected = null;
+
+  const currentBarHtml = isAccountEdit ? (() => {
+    if (initialCurrent) {
+      return `<div class="pxp-cur-bar"><span>当前状态：已绑定代理池节点 <b>${esc(initialCurrent.meta.displayName)}</b></span><code>${esc(initialCurrent.p.masked)}</code></div>`;
+    }
+    if (currentProxy) {
+      return `<div class="pxp-cur-bar"><span>当前状态：使用独立手动代理</span><code>${esc(currentProxy)}</code></div>`;
+    }
+    return `<div class="pxp-cur-bar"><span>当前状态：<b>本机直连</b>（尚未绑定代理）</span><span>建议绑定独立代理防多号关联</span></div>`;
+  })() : "";
+
+  container.innerHTML = `<div class="pxp-wrap">
+    ${currentBarHtml}
+    <div class="pxp-modes" role="tablist" aria-label="代理分配模式">
+      <button type="button" class="pxp-mode-btn" data-pxp-mode="auto"><span class="pxp-mode-dot" id="pxp-auto-dot"></span><span>自动分配</span></button>
+      <button type="button" class="pxp-mode-btn" data-pxp-mode="pool" id="pxp-tab-pool">代理池 (${opts.length})</button>
+      <button type="button" class="pxp-mode-btn" data-pxp-mode="custom">手动输入</button>
+      <button type="button" class="pxp-mode-btn" data-pxp-mode="direct">${isAccountEdit && currentProxy ? "清除(直连)" : "本机直连"}</button>
+    </div>
+    <div id="pxp-panel-auto" class="pxp-card"></div>
+    <div id="pxp-panel-pool" class="stack" style="gap:8px">
+      <div class="pxp-toolbar">
+        <div class="pxp-filters" id="pxp-filters">
+          <button type="button" class="pxp-flt-btn" data-pxp-flt="all" id="pxp-flt-all">全部</button>
+          <button type="button" class="pxp-flt-btn" data-pxp-flt="idle" id="pxp-flt-idle">本平台空闲</button>
+          <button type="button" class="pxp-flt-btn" data-pxp-flt="match" id="pxp-flt-match">${domestic ? "大陆匹配" : "境外匹配"}</button>
+        </div>
+        <input id="pxp-search" class="pxp-search" type="search" placeholder="搜索备注、地区、IP 或端口…" aria-label="搜索代理池节点" autocomplete="off">
+      </div>
+      <div id="pxp-list" class="pxp-list" role="listbox" aria-label="代理池节点列表"></div>
+      <div id="pxp-pool-warn" hidden></div>
+    </div>
+    <div id="pxp-panel-custom" class="pxp-card">
+      <div class="pxp-card-head">
+        <b>填写指定代理地址</b>
+        <span class="mut" style="font-size:11px">支持 HTTP / SOCKS5 及裸 host:port:user:pass</span>
+      </div>
+      <div class="pxp-custom-row">
+        <input id="pxp-custom-url" type="text" placeholder="http://user:pass@host:port 或 socks5://host:port" autocomplete="off" aria-label="代理地址">
+        <button type="button" class="ghost sm" id="pxp-btn-detect">${ic("i-network")}检测连通性</button>
+      </div>
+      <div id="pxp-detect-msg" class="pxp-detect-msg">可点击「检测连通性」自动识别 HTTP/SOCKS5 协议并核验出口归属地。${isAccountEdit && currentProxy && !initialCurrent ? `留空请切至「清除(直连)」。` : ""}</div>
+      <div class="pxp-save-row">
+        <label class="pxp-save-chk">
+          <input type="checkbox" id="pxp-save-pool" checked>
+          <span>同时保存到代理池（方便后续一键选用）</span>
+        </label>
+        <input id="pxp-custom-label" class="pxp-label-inp" type="text" placeholder="代理池备注（可选，如 住宅-广东-01）" autocomplete="off" aria-label="代理池备注名">
+      </div>
+    </div>
+    <div id="pxp-panel-direct" class="pxp-card">
+      <div class="pxp-card-head">
+        <b>${isAccountEdit && currentProxy ? "清除代理并改用本机直连" : "使用本机网络直连（不走代理）"}</b>
+        <span class="pill pending bare">⚠️ 暴露本机真实出口 IP</span>
+      </div>
+      <div id="pxp-direct-guard" hidden></div>
+      <p>${domestic
+        ? `系统不强制拦截本机直连，单账号本地运营可正常使用；但若在「${esc(pfName)}」下同时运营多个账号，共用本机真实出口 IP 容易触发关联限流或设备安全验证。`
+        : `⚠️ 「${esc(pfName)}」属于海外平台，强烈建议绑定境外独立代理。本机直连可能受本地网络环境限制导致连接超时，且多账号共用同一 IP 易触发风控。`}</p>
+    </div>
+  </div>`;
+
+  const searchInp = container.querySelector("#pxp-search");
+  const customUrlInp = container.querySelector("#pxp-custom-url");
+  const customLblInp = container.querySelector("#pxp-custom-label");
+  const savePoolChk = container.querySelector("#pxp-save-pool");
+  const detectMsgEl = container.querySelector("#pxp-detect-msg");
+  const detectBtn = container.querySelector("#pxp-btn-detect");
+
+  const updateUI = () => {
+    items = computeItems();
+    const healthyItems = items.filter(x => x.meta.healthy);
+    const compatibleHealthyItems = healthyItems.filter(x => x.meta.geoMatched !== false);
+    const idleItems = items.filter(x => x.p.enabled !== false && x.meta.otherSamePf === 0);
+    const matchItems = items.filter(x => x.p.enabled !== false && x.meta.geoMatched === true);
+    const idealAutoItems = compatibleHealthyItems.filter(x => x.meta.otherSamePf === 0);
+    const autoCandidate = idealAutoItems[0] || compatibleHealthyItems[0] || null;
+
+    const directGuard = container.querySelector("#pxp-direct-guard");
+    if (directGuard) {
+      const showGuard = !isAccountEdit && domestic && healthyItems.length > 0 && !compatibleHealthyItems.length;
+      directGuard.hidden = !showGuard;
+      directGuard.innerHTML = showGuard
+        ? `<div class="pxp-inline-warn">${ic("i-shield")}<span>已自动防呆切至「本机直连」：检测到代理池内现有可用节点均为境外 IP，海外住宅代理商通常会屏蔽「${esc(pfName)}」等大陆域名导致连接失败（ERR_SOCKS_CONNECTION_FAILED）。如需多号防关联，请点「手动输入」添加中国大陆代理。</span></div>`
+        : "";
+    }
+
+    container.querySelectorAll("[data-pxp-mode]").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.pxpMode === mode);
+    });
+    const dot = container.querySelector("#pxp-auto-dot");
+    if (dot) dot.className = "pxp-mode-dot " + (idealAutoItems.length > 0 ? "ok" : "warn");
+    const tabPool = container.querySelector("#pxp-tab-pool");
+    if (tabPool) tabPool.textContent = `代理池 (${items.length})`;
+
+    ["auto", "pool", "custom", "direct"].forEach(m => {
+      const panel = container.querySelector(`#pxp-panel-${m}`);
+      if (panel) panel.hidden = mode !== m;
+    });
+
+    // Auto panel content
+    const autoPanel = container.querySelector("#pxp-panel-auto");
+    if (autoPanel) {
+      const statsHtml = `<div style="display:flex;flex-wrap:wrap;gap:5px">
+        <span class="pill ${healthyItems.length ? "active" : "bare"} bare">可用 ${healthyItems.length}/${items.length}</span>
+        <span class="pill ${idleItems.length ? "active" : "pending"} bare">本平台空闲 ${idleItems.length}</span>
+        <span class="pill ${matchItems.length ? "active" : "bare"} bare">${domestic ? "大陆匹配" : "境外匹配"} ${matchItems.length}</span>
+      </div>`;
+      if (!items.length || !healthyItems.length) {
+        autoPanel.innerHTML = `<div class="pxp-card-head"><b>自动分配策略</b>${statsHtml}</div>
+          <p>${!items.length
+            ? `当前代理池为空，${isAccountEdit ? "无法自动分配，请先在「手动输入」中填写代理并勾选保存到代理池。" : "继续登录将自动回退为本机直连；建议切换至「手动输入」添加首个代理节点。"}`
+            : `代理池内暂无启用且连通正常的节点，${isAccountEdit ? "请切换至「代理池」测试启用节点或使用「手动输入」。" : "继续登录将回退为本机直连，也可去「代理池」重测节点。"}`}</p>
+          <div class="row" style="gap:8px">
+            <button type="button" class="ghost sm" data-pxp-jump="custom">${ic("i-plus")}手动输入新代理</button>
+            ${items.length ? `<button type="button" class="ghost sm" data-pxp-jump="pool">查看池内节点 (${items.length})</button>` : ""}
+          </div>`;
+      } else if (!compatibleHealthyItems.length) {
+        autoPanel.innerHTML = `<div class="pxp-card-head"><b>自动分配策略（地区防错配保护）</b>${statsHtml}</div>
+          <p>${domestic
+            ? `⚠️ 代理池内现有 ${healthyItems.length} 个可用节点均为境外出口 IP（无中国大陆节点）。由于海外代理商普遍屏蔽大陆网站，自动分配已启用防呆保护，${isAccountEdit ? "不会强行绑定境外节点，请添加大陆代理或切至「清除(直连)」。" : "继续登录将自动走「本机直连」，避免出现 ERR_SOCKS_CONNECTION_FAILED。"}`
+            : `⚠️ 代理池内现有可用节点均为中国大陆出口 IP，无法直达「${esc(pfName)}」，请切换至「手动输入」添加境外独立代理。`}</p>
+          <div class="row" style="gap:8px">
+            <button type="button" class="ghost sm" data-pxp-jump="custom">${ic("i-plus")}手动输入${domestic ? "大陆" : "境外"}代理</button>
+            ${domestic ? `<button type="button" class="ghost sm" data-pxp-jump="direct">改选本机直连</button>` : ""}
+          </div>`;
+      } else {
+        const desc = idealAutoItems.length > 0
+          ? `将优先从池内分配「空闲独立 + 地区匹配」节点，确保「${esc(pfName)}」一号一独立出口 IP。`
+          : `⚠️ 池内暂无空闲的匹配地区节点，自动分配将按最少占用原则复用现有同区可用节点；也可切换「手动输入」补充新节点。`;
+        autoPanel.innerHTML = `<div class="pxp-card-head"><b>自动分配最优节点</b>${statsHtml}</div>
+          <p>${desc}</p>
+          <div style="display:grid;gap:6px">
+            <div style="display:flex;align-items:center;justify-content:space-between;font-size:11.5px;color:var(--mut)">
+              <span>预计优先命中节点预览：</span>
+              <button type="button" class="ghost sm" style="min-height:24px;padding:2px 8px;font-size:11px" data-pxp-jump="pool">手动指定其他节点 →</button>
+            </div>
+            ${renderProxyNodeCard(autoCandidate.p, autoCandidate.meta, { preview: true })}
+          </div>`;
+      }
+      autoPanel.querySelectorAll("[data-pxp-jump]").forEach(btn => {
+        btn.onclick = () => { mode = btn.dataset.pxpJump; updateUI(); };
+      });
+    }
+
+    // Pool panel filters & list
+    const fltAll = container.querySelector("#pxp-flt-all");
+    const fltIdle = container.querySelector("#pxp-flt-idle");
+    const fltMatch = container.querySelector("#pxp-flt-match");
+    if (fltAll) fltAll.textContent = `全部 (${items.length})`;
+    if (fltIdle) fltIdle.textContent = `本平台空闲 (${idleItems.length})`;
+    if (fltMatch) fltMatch.textContent = `${domestic ? "大陆匹配" : "境外匹配"} (${matchItems.length})`;
+    container.querySelectorAll("[data-pxp-flt]").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.pxpFlt === filter);
+    });
+
+    if (selectedUrl && !items.some(x => x.p.url === selectedUrl)) {
+      selectedUrl = (items.find(x => x.meta.healthy) || items[0])?.p?.url || "";
+    }
+    const q = query.trim().toLowerCase();
+    const filtered = items.filter(({ p, meta }) => {
+      if (filter === "idle" && !(p.enabled !== false && meta.otherSamePf === 0)) return false;
+      if (filter === "match" && !(p.enabled !== false && meta.geoMatched === true)) return false;
+      if (q) {
+        const hay = `${meta.displayName} ${p.masked || ""} ${p.geo_loc || ""} ${p.exit_ip || ""} ${p.note || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    const listEl = container.querySelector("#pxp-list");
+    if (listEl) {
+      if (!items.length) {
+        listEl.innerHTML = `<div class="pxp-empty">
+          <span>代理池暂无节点，可在「手动输入」中添加并勾选保存到代理池</span>
+          <button type="button" class="ghost sm" id="pxp-empty-to-custom">${ic("i-plus")}切换至手动输入</button>
+        </div>`;
+        const jumpBtn = listEl.querySelector("#pxp-empty-to-custom");
+        if (jumpBtn) jumpBtn.onclick = () => { mode = "custom"; updateUI(); customUrlInp?.focus(); };
+      } else if (!filtered.length) {
+        listEl.innerHTML = `<div class="pxp-empty">
+          <span>当前筛选条件下没有匹配的代理节点</span>
+          <button type="button" class="ghost sm" id="pxp-reset-flt">显示全部节点 (${items.length})</button>
+        </div>`;
+        const rst = listEl.querySelector("#pxp-reset-flt");
+        if (rst) rst.onclick = () => { filter = "all"; query = ""; if (searchInp) searchInp.value = ""; updateUI(); };
+      } else {
+        listEl.innerHTML = filtered.map(({ p, meta }) =>
+          renderProxyNodeCard(p, meta, { selected: p.url === selectedUrl })
+        ).join("");
+        listEl.querySelectorAll("[data-pxp-url]").forEach(row => {
+          const pickRow = () => { selectedUrl = row.dataset.pxpUrl; updateUI(); };
+          row.addEventListener("click", ev => {
+            if (ev.target.closest("[data-pxp-test]")) return;
+            pickRow();
+          });
+          row.addEventListener("keydown", ev => {
+            if (ev.target.closest("[data-pxp-test]")) return;
+            if (ev.key === " " || ev.key === "Enter") { ev.preventDefault(); ev.stopPropagation(); pickRow(); }
+          });
+        });
+        listEl.querySelectorAll("[data-pxp-test]").forEach(btn => {
+          btn.addEventListener("click", async ev => {
+            ev.preventDefault(); ev.stopPropagation();
+            const pid = Number(btn.dataset.pxpTest);
+            const target = opts.find(o => Number(o.id) === pid);
+            if (!target || btn.disabled) return;
+            btn.disabled = true; btn.textContent = "测试中…";
+            try {
+              const r = await api(`/api/proxies/${pid}/test`, { method: "POST" });
+              target.status = r.ok ? "ok" : "bad";
+              if (r.geo) {
+                target.exit_ip = r.geo.ip || target.exit_ip || "";
+                target.country = r.geo.country || target.country || "";
+                target.region = r.geo.region || target.region || "";
+                target.city = r.geo.city || target.city || "";
+                target.isp = r.geo.isp || target.isp || "";
+                target.geo_loc = [target.country, target.region, target.city].filter(Boolean).join(" · ");
+                target.geo_checked = Boolean(target.exit_ip || target.country);
+                target.is_mainland = isMainlandGeoClient(target.country, target.region, target.city);
+              }
+              if (typeof refreshProxies === "function") refreshProxies();
+            } catch (e) {
+              toast("节点测试失败：" + e.message, "err");
+            } finally {
+              updateUI();
+            }
+          });
+        });
+      }
+    }
+
+    // Selected pool node inline warning
+    const warnEl = container.querySelector("#pxp-pool-warn");
+    const pickedItem = items.find(x => x.p.url === selectedUrl);
+    if (warnEl) {
+      const reasons = [];
+      if (pickedItem) {
+        if (pickedItem.p.enabled === false) reasons.push("该节点当前处于「已停用」状态");
+        if (["bad", "auth_error", "blocked"].includes(pickedItem.p.status)) reasons.push("最近一次连通性检测未通过，建议先点右侧「测试」确认可用");
+        if (pickedItem.meta.geoMatched === false) reasons.push(domestic ? "该节点为境外出口 IP，绝大多数海外住宅代理商（如 IPWO 等）会直接屏蔽大陆网站导致报 ERR_SOCKS_CONNECTION_FAILED，建议改选本机直连或大陆代理" : "该节点为中国大陆出口 IP，通常无法直达海外平台，建议更换境外代理");
+        if (pickedItem.meta.otherSamePf > 0) reasons.push(`同平台已有 ${pickedItem.meta.otherSamePf} 个其他账号共用此代理，存在同 IP 关联风险`);
+      }
+      warnEl.hidden = !reasons.length;
+      warnEl.innerHTML = reasons.length
+        ? `<div class="pxp-inline-warn">${ic("i-alert")}<span>${esc(reasons.join("；"))}（系统不强制拦截，仍可继续使用）。</span></div>`
+        : "";
+    }
+
+    if (customLblInp && savePoolChk) {
+      customLblInp.disabled = !savePoolChk.checked;
+      customLblInp.style.opacity = savePoolChk.checked ? "1" : "0.5";
+    }
+
+    if (typeof onSummary === "function") {
+      let summary = "";
+      if (mode === "auto") {
+        summary = autoCandidate
+          ? `当前策略：自动分配（预计优先：${autoCandidate.meta.displayName}）`
+          : `当前策略：自动分配${!items.length && !isAccountEdit ? "（池空将走本机直连）" : ""}`;
+      } else if (mode === "pool") {
+        summary = pickedItem
+          ? `已选池节点：${pickedItem.meta.displayName}${pickedItem.p.geo_loc ? " · " + pickedItem.p.geo_loc : ""}`
+          : "请从列表中选择一个代理节点";
+      } else if (mode === "custom") {
+        const raw = customUrlInp?.value.trim() || "";
+        summary = raw ? "已填写手动代理地址" : "请输入代理服务器地址";
+      } else {
+        summary = isAccountEdit && currentProxy ? "将清除代理并改走本机直连" : "当前策略：本机直连（无代理隔离）";
+      }
+      onSummary(summary);
+    }
+  };
+
+  container.querySelectorAll("[data-pxp-mode]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      mode = btn.dataset.pxpMode;
+      updateUI();
+      if (mode === "custom") requestAnimationFrame(() => customUrlInp?.focus());
+    });
+  });
+  container.querySelectorAll("[data-pxp-flt]").forEach(btn => {
+    btn.addEventListener("click", () => { filter = btn.dataset.pxpFlt; updateUI(); });
+  });
+  if (searchInp) {
+    searchInp.addEventListener("input", () => { query = searchInp.value; updateUI(); });
+    searchInp.addEventListener("keydown", ev => { if (ev.key === "Enter") ev.preventDefault(); });
+  }
+  if (customUrlInp) {
+    customUrlInp.addEventListener("input", () => updateUI());
+  }
+  if (savePoolChk) {
+    savePoolChk.addEventListener("change", () => updateUI());
+  }
+  if (detectBtn && customUrlInp && detectMsgEl) {
+    detectBtn.addEventListener("click", async () => {
+      const raw = customUrlInp.value.trim();
+      if (!raw) {
+        detectMsgEl.dataset.tone = "err";
+        detectMsgEl.textContent = "请先输入代理地址后再点击检测";
+        customUrlInp.focus();
+        return;
+      }
+      detectBtn.disabled = true;
+      const oldHtml = detectBtn.innerHTML;
+      detectBtn.textContent = "检测中…";
+      detectMsgEl.removeAttribute("data-tone");
+      detectMsgEl.textContent = "正在自动探测协议与出口 IP 归属地…";
+      try {
+        const r = await api("/api/proxies/detect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: raw }),
+        });
+        if (!r.ok) {
+          detectMsgEl.dataset.tone = "err";
+          detectMsgEl.textContent = "检测未通过：" + (r.error || "连接失败");
+          return;
+        }
+        customUrlInp.value = r.recommend || raw;
+        detected = { url: customUrlInp.value, geo: r.geo || null };
+        if (customLblInp && !customLblInp.value.trim() && r.geo) {
+          const g = r.geo;
+          customLblInp.value = [g.country, g.region, g.city].filter(Boolean).join("·");
+        }
+        const tag = String(r.scheme || "http").toUpperCase() + (r.auth === "required" ? " · 含认证" : " · 免密");
+        detectMsgEl.dataset.tone = "ok";
+        detectMsgEl.textContent = `✓ 连通正常（${tag}）${r.geo_text ? " · " + r.geo_text : ""}`;
+        updateUI();
+      } catch (e) {
+        detectMsgEl.dataset.tone = "err";
+        detectMsgEl.textContent = "检测失败：" + e.message;
+      } finally {
+        detectBtn.disabled = false;
+        detectBtn.innerHTML = oldHtml;
+      }
+    });
+  }
+
+  updateUI();
+
+  return {
+    getValue() {
+      if (mode === "auto") return { mode: "auto", proxy: "auto", pickedNode: null };
+      if (mode === "direct") return { mode: "direct", proxy: "", pickedNode: null };
+      if (mode === "pool") {
+        const found = items.find(x => x.p.url === selectedUrl);
+        return { mode: "pool", proxy: found ? found.p.url : "", pickedNode: found ? found.p : null, pickedMeta: found ? found.meta : null };
+      }
+      return {
+        mode: "custom",
+        proxy: customUrlInp ? customUrlInp.value.trim() : "",
+        saveToPool: Boolean(savePoolChk && savePoolChk.checked),
+        customLabel: customLblInp ? customLblInp.value.trim() : "",
+        pickedNode: null,
+      };
+    },
+    async validateAndCommitCustom(choice) {
+      if (choice.mode === "pool" && !choice.proxy) {
+        uiEditorError("请先从代理池列表中选择一个节点，或切换其他代理模式");
+      }
+      if (choice.mode === "custom") {
+        if (!choice.proxy) {
+          uiEditorError("请填写代理地址，或切换为「自动分配 / 本机直连」", "pxp-custom-url");
+        }
+        if (choice.saveToPool) {
+          const geo = (detected && detected.url === choice.proxy) ? detected.geo : null;
+          try {
+            const created = await api("/api/proxies", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url: choice.proxy, label: choice.customLabel || "", geo }),
+            });
+            if (created && created.url_full) choice.proxy = created.url_full;
+            if (typeof refreshProxies === "function") refreshProxies();
+          } catch (err) {
+            if (err && err.status === 409) {
+              // 已存在于代理池中，无需中断后续绑定/登录
+            } else {
+              uiEditorError(err.message || "代理格式无效", "pxp-custom-url");
+            }
+          }
+        }
+      }
+      return choice;
+    },
+  };
+}
+async function uiProxyPicker({
+  title = "选择代理",
+  hint = "",
+  platform = PLATFORM,
+  currentProxy = "",
+  currentProxyId = null,
+  isAccountEdit = false,
+  okText = "确定",
+  busyText = "保存中",
+  submit = null,
+} = {}) {
+  let opts = [];
+  try { opts = await api("/api/proxies/options"); } catch (e) { }
+  return new Promise(resolve => {
+    _uiResolve = resolve; _uiCancelVal = null;
+    let latestSummary = "";
+    const body = $("ui-body");
+    body.innerHTML = `<div id="pxp-standalone-mount"></div>`;
+    const picker = mountProxyPickerControl($("pxp-standalone-mount"), {
+      opts, platform, currentProxy, currentProxyId, isAccountEdit,
+      onSummary: text => {
+        latestSummary = text;
+        if (!_uiBusy && $("ui-feedback")) uiEditorNotice(text, false);
+      },
+    });
+    _uiGetVal = () => picker.getValue();
+    _uiOpen(title, hint, {
+      okText,
+      wide: true,
+      icon: "i-globe",
+      busyText,
+      noticeText: latestSummary,
+      submit: async choice => {
+        await picker.validateAndCommitCustom(choice);
+        if (submit) return await submit(choice);
+      },
+    });
+  });
+}
 async function choosePreLoginBrowserBackend({ platform = "" } = {}) {
   let catalog;
   try {
@@ -1716,65 +2461,47 @@ async function choosePreLoginBrowserBackend({ platform = "" } = {}) {
     toast("读取登录环境失败：" + e.message, "err");
     return null;
   }
-  const localOnly = platform === "xhs";
-  const options = browserChoiceOptions(catalog, { localOnly });
+  const isXhs = platform === "xhs";
+  const options = browserChoiceOptions(catalog, { localOnly: false });
   const selected = await uiSelect({
     title: "选择扫码登录环境",
-    hint: localOnly
-      ? "小红书固定使用系统 Chrome/CDP 原生环境；扫码、Cookie 和后续任务共用同一持久 Profile。"
-      : "扫码、Cookie 落地和后续账号任务将使用同一浏览器内核。新的指纹环境会同时打开 BrowserScan 体检标签。",
+    hint: isXhs
+      ? "单号推荐使用系统 Chrome/CDP 原生环境；同机运营多个小红书号时可选 Fingerprint Chromium 实现底层硬件指纹隔离。"
+      : "扫码、Cookie 落地和后续账号任务将使用同一浏览器内核。新的指纹环境会同时打开环境体检标签。",
     options,
-    value: localOnly ? "local" : preLoginBrowserBackend,
+    value: isXhs && preLoginBrowserBackend === "default" ? "local" : preLoginBrowserBackend,
   });
   if (selected !== null) preLoginBrowserBackend = selected;
   return selected;
 }
-function formatProxyOptionLabel(p, platform = PLATFORM) {
-  const domestic = (platform || "douyin") !== "tiktok";
-  const geo = p.geo_loc ? ` · ${p.geo_loc}` : "";
-  const overseasWarn = domestic && p.geo_checked && !p.is_mainland ? " · ⚠️非大陆(慢/高风控)" : "";
-  return `${p.label}${geo}${overseasWarn} · ${p.status} · 占用${p.used_by} · ${p.masked}${p.enabled ? "" : " · 已停用"}`;
-}
-// 登录前选代理:返回 "" (不用) | "auto" | 具体url | null(取消)
-async function choosePreLoginProxy({ platform = PLATFORM } = {}) {
-  let opts = [];
-  try { opts = await api("/api/proxies/options"); } catch (e) { }
-  const domestic = (platform || "douyin") !== "tiktok";
-  const usablePool = opts.filter(p => (
-    p.enabled && !["bad", "auth_error", "blocked"].includes(p.status)
-    && Number(p.used_by || 0) === 0 && (!domestic || !p.geo_checked || p.is_mainland)
-  ));
-  const preferDirect = domestic && opts.length > 0 && usablePool.length === 0;
-  const autoLabel = !opts.length
-    ? "自动分配（池为空时不用代理）"
-    : preferDirect
-      ? "自动分配（仅大陆/未标注节点；当前池内无可用节点）"
-      : "自动分配（占用最少）";
-  const options = [
-    { value: "auto", label: autoLabel },
-    ...opts.map(p => ({ value: p.url, label: formatProxyOptionLabel(p, platform) })),
-    { value: "__custom__", label: "✎ 手动输入指定代理…" },
-    { value: "", label: "不用代理（使用本机网络）" },
-  ];
-  const v = await uiSelect({
-    title: "选择本次登录使用的代理",
-    hint: preferDirect
-      ? "当前代理池无可用大陆节点；默认改用本机网络，避免境外代理导致国内平台加载慢或白屏。"
-      : "整个登录/扫码过程都走它,从一开始就绑定这条 IP(最稳)。",
-    options, value: preferDirect ? "" : "auto",
-  });
-  if (v === null) return null;
-  if (v === "__custom__") {
-    const url = await uiPrompt({
-      title: "手动输入指定代理",
-      hint: "http://user:pass@host:port 或 socks5://host:port;裸 ip:port 默认 HTTP",
-      placeholder: "http://user:pass@host:port" });
-    if (url === null || !url.trim()) return null;
-    return url.trim();
+function notifyProxyChoiceRisk(choice, pf) {
+  if (!choice) return;
+  if (choice.proxy === "") {
+    toast("⚠️ 提醒：本次登录使用本机直连，多账号或海外平台请注意真实 IP 关联与网络风控风险", "info", 5500);
+  } else if (choice.mode === "pool" && choice.pickedMeta && choice.pickedMeta.otherSamePf > 0) {
+    toast(`⚠️ 提醒：所选代理已在同平台绑定 ${choice.pickedMeta.otherSamePf} 个账号，共用同一出口 IP 存在关联风险`, "info", 6000);
   }
-  return v;
 }
-function freshPreLoginFingerprint(browserBackend) {
+// 登录前选代理(兼容独立调用):返回 "" (不用) | "auto" | 具体url | null(取消)
+async function choosePreLoginProxy({ platform = PLATFORM } = {}) {
+  const pf = platform || "douyin";
+  const domestic = isDomesticPlatform(pf);
+  const hint = domestic
+    ? "建议尽量保持「一号一独立代理」。系统不强制拦截本机直连或多号共用代理，但同平台多号共用出口 IP 容易触发关联限流。"
+    : "⚠️ 海外平台强烈建议绑定境外独立代理；系统不强制拦截本机直连或多号共用代理，但直连易受网络限制或触发风控。";
+  const choice = await uiProxyPicker({
+    title: "选择本次登录使用的代理",
+    hint,
+    platform: pf,
+    isAccountEdit: false,
+    okText: "确认代理并继续",
+    busyText: "校验中",
+  });
+  if (!choice) return null;
+  notifyProxyChoiceRisk(choice, pf);
+  return choice.proxy;
+}
+function freshPreLoginFingerprint(browserBackend, platform = PLATFORM) {
   const choice = browserChoiceParts(browserBackend);
   const runtimes = (preLoginBrowserCatalog || {}).runtimes || [];
   const runtime = runtimes.find(item => item.runtime_id === choice.runtimeId)
@@ -1782,10 +2509,13 @@ function freshPreLoginFingerprint(browserBackend) {
   const seed = (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function")
     ? globalThis.crypto.randomUUID().replaceAll("-", "")
     : `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+  const overseas = !isDomesticPlatform(platform || "");
   return {
     seed, engine_seed: "", fingerprint_id: seed.slice(0, 12),
     source_ip: "", country: "", region: "", city: "",
-    timezone: "Asia/Shanghai", locale: "zh-CN", accept_languages: "",
+    timezone: overseas ? "America/New_York" : "Asia/Shanghai",
+    locale: overseas ? "en-US" : "zh-CN",
+    accept_languages: "",
     viewport_w: 1280, viewport_h: 800, geo_lat: 0, geo_lon: 0,
     platform: "", platform_version: "", brand: "", brand_version: "",
     hardware_concurrency: 0, gpu_vendor: "", gpu_renderer: "",
@@ -1795,13 +2525,13 @@ function freshPreLoginFingerprint(browserBackend) {
     runtime_version: runtime.version || "",
   };
 }
-async function configurePreLoginFingerprint(browserBackend) {
+async function configurePreLoginFingerprint(browserBackend, platform = PLATFORM) {
   const choice = browserChoiceParts(browserBackend);
   const effectiveBackend = choice.backend === "default"
     ? (preLoginBrowserCatalog || {}).default
     : choice.backend;
   if (effectiveBackend !== "fingerprint_chromium") return "";
-  const draft = freshPreLoginFingerprint(browserBackend);
+  const draft = freshPreLoginFingerprint(browserBackend, platform);
   const account = {
     nickname: "新账号",
     environment: { runtime_version: draft.runtime_version },
@@ -1809,6 +2539,137 @@ async function configurePreLoginFingerprint(browserBackend) {
   const action = await uiFingerprintEditor(account, draft, { preLogin: true });
   if (!action) return null;
   return action.action === "auto" ? "" : action.data;
+}
+// 扫码前一体化环境与代理配置：将「选浏览器内核 + 指纹模式 + 选代理」合并为单步弹窗
+async function preparePreLoginEnvironment({ platform = PLATFORM } = {}) {
+  const pf = platform || "douyin";
+  const domestic = isDomesticPlatform(pf);
+  const isXhs = pf === "xhs";
+  const pfName = (typeof PF_NAME !== "undefined" && PF_NAME[pf]) ? PF_NAME[pf] : pf;
+  let catalog, opts = [];
+  try {
+    [catalog, opts] = await Promise.all([
+      api("/api/browser-backends"),
+      api("/api/proxies/options").catch(() => []),
+    ]);
+    preLoginBrowserCatalog = catalog;
+  } catch (e) {
+    toast("读取登录环境失败：" + e.message, "err");
+    return null;
+  }
+  const backendOpts = browserChoiceOptions(catalog, { localOnly: false });
+  const initialBackend = isXhs && preLoginBrowserBackend === "default" ? "local" : preLoginBrowserBackend;
+  const effectiveFor = val => {
+    const parts = browserChoiceParts(val);
+    return parts.backend === "default" ? catalog.default : parts.backend;
+  };
+
+  const result = await new Promise(resolve => {
+    _uiResolve = resolve; _uiCancelVal = null;
+    let fpMode = "auto";
+    let latestSummary = "";
+    const body = $("ui-body");
+    body.innerHTML = `
+      <div class="prelogin-section">
+        <div class="prelogin-sec-head">
+          <span class="prelogin-sec-title">${ic("i-monitor")}<span>浏览器内核与指纹隔离</span></span>
+          <span class="pill ${domestic ? "bare" : "pending bare"}">${esc(pfName)} · ${domestic ? "国内平台" : "海外平台"}</span>
+        </div>
+        <select id="pl-backend" style="width:100%" aria-label="浏览器内核">
+          ${backendOpts.map(o => `<option value="${esc(o.value)}"${o.value === initialBackend ? " selected" : ""}${o.disabled ? " disabled" : ""}>${esc(o.label)}</option>`).join("")}
+        </select>
+        <p class="prelogin-env-hint">${isXhs
+          ? "单号推荐使用系统 Chrome/CDP 原生环境；同机运营多个小红书号可选 Fingerprint Chromium 隔离底层硬件指纹。"
+          : "扫码、Cookie 落地与后续任务共用同一独立 Profile，确保登录态与环境一致。"}</p>
+        <div class="prelogin-fp-row" id="pl-fp-row" hidden>
+          <div>
+            <b>硬件与环境指纹</b>
+            <span>默认按代理/本机出口 IP 自动匹配时区、语言与硬件种子，无需额外弹窗</span>
+          </div>
+          <div class="fp-segment" role="group" aria-label="指纹生成方式">
+            <button type="button" class="active" data-pl-fp="auto">跟随出口 IP 自动</button>
+            <button type="button" data-pl-fp="custom">下一步手动设置…</button>
+          </div>
+        </div>
+      </div>
+      <div class="prelogin-section" style="margin-bottom:0">
+        <div class="prelogin-sec-head">
+          <span class="prelogin-sec-title">${ic("i-globe")}<span>本次登录使用的代理</span></span>
+          <span class="mut" style="font-size:11px">建议一号一独立代理防关联</span>
+        </div>
+        <div id="pl-proxy-mount"></div>
+      </div>`;
+
+    const backendSel = $("pl-backend");
+    enhanceSelect(backendSel);
+    const fpRow = $("pl-fp-row");
+    const syncOkLabel = () => {
+      const isFp = effectiveFor(backendSel.value) === "fingerprint_chromium";
+      if (fpRow) fpRow.hidden = !isFp;
+      const okBtn = $("ui-ok");
+      if (okBtn && !_uiBusy) {
+        const nextTxt = (isFp && fpMode === "custom") ? "下一步：配置指纹" : "开始扫码登录";
+        okBtn.innerHTML = `<svg aria-hidden="true"><use href="#${(isFp && fpMode === "custom") ? "i-fingerprint" : "i-qr"}"/></svg>${esc(nextTxt)}`;
+      }
+    };
+    backendSel.addEventListener("change", syncOkLabel);
+    if (fpRow) {
+      fpRow.querySelectorAll("[data-pl-fp]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          fpMode = btn.dataset.plFp;
+          fpRow.querySelectorAll("[data-pl-fp]").forEach(b => b.classList.toggle("active", b === btn));
+          syncOkLabel();
+        });
+      });
+    }
+
+    const picker = mountProxyPickerControl($("pl-proxy-mount"), {
+      opts,
+      platform: pf,
+      isAccountEdit: false,
+      onSummary: text => {
+        latestSummary = text;
+        if (!_uiBusy && $("ui-feedback")) uiEditorNotice(text, false);
+      },
+    });
+
+    _uiGetVal = () => ({
+      browserBackend: backendSel.value,
+      fpMode: effectiveFor(backendSel.value) === "fingerprint_chromium" ? fpMode : "off",
+      choice: picker.getValue(),
+    });
+    _uiOpen(
+      `配置扫码登录环境 · ${pfName}`,
+      domestic
+        ? "一次确认浏览器内核与独立代理即可直接弹出扫码窗口。"
+        : "海外平台建议绑定境外独立代理，确认后直接打开独立登录窗口。",
+      {
+        okText: "开始扫码登录",
+        wide: true,
+        icon: "i-qr",
+        busyText: "准备中",
+        noticeText: latestSummary,
+        submit: async payload => {
+          await picker.validateAndCommitCustom(payload.choice);
+        },
+      },
+    );
+    syncOkLabel();
+  });
+
+  if (!result) return null;
+  preLoginBrowserBackend = result.browserBackend;
+  notifyProxyChoiceRisk(result.choice, pf);
+  let fingerprint = "";
+  if (result.fpMode === "custom") {
+    fingerprint = await configurePreLoginFingerprint(result.browserBackend, pf);
+    if (fingerprint === null) return null;
+  }
+  return {
+    browserBackend: result.browserBackend,
+    proxy: result.choice.proxy,
+    fingerprint,
+  };
 }
 function loginStartUrl(path, proxy, browserBackend) {
   const choice = browserChoiceParts(browserBackend);
@@ -1825,12 +2686,9 @@ function loginStartOptions(fingerprint) {
   };
 }
 async function startLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend();
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "douyin" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "douyin" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开浏览器窗口…";
@@ -1844,7 +2702,7 @@ function loginEnvironmentText(env) {
   if (!env || !env.backend_label) return "";
   let text = env.backend_label;
   if (env.runtime_version && !text.includes(env.runtime_version)) text += " · " + env.runtime_version;
-  if (env.has_proxy) text += " · 账号代理";
+  text += env.has_proxy ? " · 账号代理" : " · 本机直连";
   if (env.fallback_reason) text += "（" + env.fallback_reason + "）";
   return text;
 }
@@ -1856,11 +2714,13 @@ function pollLogin(tid) {
     try {
       const res = await api("/api/login/browser/poll?task_id=" + tid);
       const envText = loginEnvironmentText(res.environment);
+      const pxWarn = res.warning || res.environment?.proxy_warning || "";
+      const warnHtml = pxWarn ? `<div style="margin-top:6px;color:var(--warn);font-size:12px">⚠️ ${esc(pxWarn)}</div>` : "";
       if (["opening", "waiting"].includes(res.status) && envText) {
-        $("qrstatus").innerHTML = `${ic("i-eye")} 浏览器已打开 · <b>${esc(envText)}</b><br>请在可见窗口完成登录。`;
+        $("qrstatus").innerHTML = `${ic("i-eye")} 浏览器已打开 · <b>${esc(envText)}</b><br>请在可见窗口完成登录。${warnHtml}`;
       }
       if (res.status === "verification") {
-        $("qrstatus").innerHTML = `${ic("i-info")} <b>需要完成一次设备安全验证</b><br>${esc(res.hint || "请扫描浏览器中的验证二维码，验证通过后会自动继续登录。")}`;
+        $("qrstatus").innerHTML = `${ic("i-info")} <b>需要完成一次设备安全验证</b><br>${esc(res.hint || "请扫描浏览器中的验证二维码，验证通过后会自动继续登录。")}${warnHtml}`;
       } else if (res.status === "persisted") {
         $("qrstatus").textContent = "扫码已确认，正在校验登录态并同步账号资料…";
         if (!accountShown) {
@@ -1877,6 +2737,7 @@ function pollLogin(tid) {
           const suffix = ["error", "deferred"].includes(res.profile_status) ? "（资料可稍后刷新）" : "";
           $("qrstatus").textContent = "登录成功 ✓ " + (res.nickname || "") + suffix;
           toast("登录成功 " + (res.nickname || "") + suffix, res.profile_status === "error" ? "info" : "ok");
+          if (pxWarn) setTimeout(() => toast("⚠️ " + pxWarn, "info", 6500), 350);
           setTimeout(() => { $("qrbox").style.display = "none"; }, 650);
         }
         refreshAccounts();
@@ -1896,12 +2757,9 @@ function pollLogin(tid) {
 
 // ─── 创作者登录(自有账号评论模式用) ───
 async function startCreatorLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend();
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "douyin" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "douyin" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开创作中心窗口…";
@@ -1914,12 +2772,9 @@ async function startCreatorLogin() {
 
 // ─── 小红书扫码登录 ───
 async function startXhsLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend({ platform: "xhs" });
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "xhs" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "xhs" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开小红书窗口…";
@@ -1937,12 +2792,9 @@ async function startXhsLogin() {
 
 // ─── 小红书创作者登录(发布用) ───
 async function startXhsCreatorLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend({ platform: "xhs" });
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "xhs" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "xhs" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开小红书创作平台窗口…";
@@ -1960,12 +2812,9 @@ async function startXhsCreatorLogin() {
 
 // ─── 快手扫码登录 ───
 async function startKsLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend();
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "kuaishou" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "kuaishou" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开快手窗口…";
@@ -1978,12 +2827,9 @@ async function startKsLogin() {
 
 // ─── 快手创作者登录(发布用) ───
 async function startKsCreatorLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend();
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "kuaishou" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "kuaishou" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开快手创作平台窗口…";
@@ -1996,12 +2842,9 @@ async function startKsCreatorLogin() {
 
 // ─── 视频号扫码登录(读取/发布共用,微信扫码) ───
 async function startChannelsLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend();
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "shipinhao" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "shipinhao" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开视频号助手窗口…";
@@ -2014,12 +2857,9 @@ async function startChannelsLogin() {
 
 // ─── TikTok Web 登录（读取、采集和写操作共用） ───
 async function startTikTokLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend({ platform: "tiktok" });
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "tiktok" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "tiktok" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开 TikTok 窗口…";
@@ -2032,12 +2872,9 @@ async function startTikTokLogin() {
 
 // ─── 哔哩哔哩扫码登录（读取、创作中心与写操作共用） ───
 async function startBilibiliLogin() {
-  const browserBackend = await choosePreLoginBrowserBackend({ platform: "bilibili" });
-  if (browserBackend === null) return;
-  const proxy = await choosePreLoginProxy({ platform: "bilibili" });
-  if (proxy === null) return;
-  const fingerprint = await configurePreLoginFingerprint(browserBackend);
-  if (fingerprint === null) return;
+  const session = await preparePreLoginEnvironment({ platform: "bilibili" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
   $("cookiebox").style.display = "none";
   $("qrbox").style.display = "block";
   $("qrstatus").textContent = "正在打开哔哩哔哩窗口…";
@@ -2046,6 +2883,80 @@ async function startBilibiliLogin() {
     $("qrstatus").innerHTML = `${ic("i-eye")} <b>哔哩哔哩窗口已打开</b>，请使用哔哩哔哩 App 扫码完成登录。<br>登录成功后会自动同步创作中心会话，可用于采集、弹幕、互动与投稿。`;
     pollLogin(res.task_id);
   } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("哔哩哔哩登录启动失败:" + e.message, "err"); }
+}
+
+// ─── 海外小红书（Rednote）登录 ───
+async function startRednoteLogin() {
+  const session = await preparePreLoginEnvironment({ platform: "rednote" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
+  $("cookiebox").style.display = "none";
+  $("qrbox").style.display = "block";
+  $("qrstatus").textContent = "正在打开海外小红书（www.rednote.com）窗口…";
+  try {
+    const res = await api(loginStartUrl("/api/login/rednote/start", proxy, browserBackend), loginStartOptions(fingerprint));
+    $("qrstatus").innerHTML = `${ic("i-eye")} <b>海外小红书（www.rednote.com）窗口已打开</b>，请使用 Rednote / 小红书海外版扫码或网页登录。<br>会话严格隔离在 <code>.rednote.com</code> 域，绝不混用国内小红书 Cookie。`;
+    pollLogin(res.task_id);
+  } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("海外小红书登录启动失败:" + e.message, "err"); }
+}
+
+async function startRednoteCreatorLogin() {
+  const session = await preparePreLoginEnvironment({ platform: "rednote" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
+  $("cookiebox").style.display = "none";
+  $("qrbox").style.display = "block";
+  $("qrstatus").textContent = "正在打开海外小红书创作服务平台（creator.rednote.com）窗口…";
+  try {
+    const res = await api(loginStartUrl("/api/login/rednote-creator/start", proxy, browserBackend), loginStartOptions(fingerprint));
+    $("qrstatus").innerHTML = `${ic("i-eye")} <b>海外小红书创作平台（creator.rednote.com）窗口已打开</b>，请完成创作者扫码登录，用于图文/视频笔记发布与作品管理。`;
+    pollLogin(res.task_id);
+  } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("创作者登录启动失败:" + e.message, "err"); }
+}
+
+// ─── Instagram 独立浏览器登录（Mobile API 与 Web 端共用会话） ───
+async function startInstagramLogin() {
+  const session = await preparePreLoginEnvironment({ platform: "instagram" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
+  $("cookiebox").style.display = "none";
+  $("qrbox").style.display = "block";
+  $("qrstatus").textContent = "正在打开 Instagram 窗口…";
+  try {
+    const res = await api(loginStartUrl("/api/login/instagram/start", proxy, browserBackend), loginStartOptions(fingerprint));
+    $("qrstatus").innerHTML = `${ic("i-eye")} <b>Instagram 窗口已打开</b>，请在该窗口完成登录（含两步验证/TOTP）。<br>登录成功后会自动同步 <code>sessionid</code> 与令牌，支持采集、互动、私信与发布。`;
+    pollLogin(res.task_id);
+  } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("Instagram 登录启动失败:" + e.message, "err"); }
+}
+
+// ─── Twitter (X) 独立浏览器登录（Web 与 Syndication/REST 共用会话） ───
+async function startTwitterLogin() {
+  const session = await preparePreLoginEnvironment({ platform: "twitter" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
+  $("cookiebox").style.display = "none";
+  $("qrbox").style.display = "block";
+  $("qrstatus").textContent = "正在打开 X (Twitter) 登录窗口…";
+  try {
+    const res = await api(loginStartUrl("/api/login/twitter/start", proxy, browserBackend), loginStartOptions(fingerprint));
+    $("qrstatus").innerHTML = `${ic("i-eye")} <b>X (Twitter) 窗口已打开</b>，请在该窗口完成账号登录（含两步验证/TOTP）。<br>登录成功后会自动同步 <code>auth_token</code> 与 <code>ct0</code>，支持采集、互动、私信与发推。`;
+    pollLogin(res.task_id);
+  } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("Twitter 登录启动失败:" + e.message, "err"); }
+}
+
+// ─── Facebook 独立浏览器登录（含个人号与公共主页 Profile+ 会话） ───
+async function startFacebookLogin() {
+  const session = await preparePreLoginEnvironment({ platform: "facebook" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
+  $("cookiebox").style.display = "none";
+  $("qrbox").style.display = "block";
+  $("qrstatus").textContent = "正在打开 Facebook 登录窗口…";
+  try {
+    const res = await api(loginStartUrl("/api/login/facebook/start", proxy, browserBackend), loginStartOptions(fingerprint));
+    $("qrstatus").innerHTML = `${ic("i-eye")} <b>Facebook 窗口已打开</b>，请在该窗口完成账号登录及安全验证/2FA。<br>登录成功后会自动同步 <code>c_user</code> 与 <code>xs</code>，支持采集、公共主页/群组发布、多表情互动与 Messenger 私信。`;
+    pollLogin(res.task_id);
+  } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("Facebook 登录启动失败:" + e.message, "err"); }
 }
 
 // ─── Cookie 登录 ───
@@ -2059,17 +2970,25 @@ async function saveCookie() {
   const cookie = $("ck-val").value.trim();
   if (!cookie) { toast("请先粘贴 Cookie", "err"); return; }
   try {
-    await api("/api/login/cookie", {
+    const res = await api("/api/login/cookie", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cookie, nickname: $("ck-nick").value.trim(), platform: PLATFORM }),
     });
     $("ck-val").value = ""; $("cookiebox").style.display = "none";
-    toast("Cookie 已保存", "ok"); refreshAccounts();
+    if (res && res.warning) toast(`账号已保存(${res.nickname || ""})，但状态异常：${res.warning}`, "err");
+    else toast((PLATFORM === "twitter" || PLATFORM === "facebook") && res && res.nickname ? `Cookie 已导入：${res.nickname}` : "Cookie 已保存", "ok");
+    if (res && res.proxy_warning) setTimeout(() => toast("⚠️ " + res.proxy_warning, "info", 6500), 300);
+    refreshAccounts();
   } catch (e) { toast("保存失败:" + e.message, "err"); }
 }
 
+// 05-accounts.js — 账号列表渲染、环境指纹编辑、浏览器内核目录与账号级操作。
 // ─── 账号 ───
-let ACCOUNTS = [];
+let ACCOUNTS = [], ALL_ACCOUNTS = [];
+function findAnyAccount(id) {
+  const num = Number(id);
+  return ALL_ACCOUNTS.find(x => Number(x.id) === num) || ACCOUNTS.find(x => Number(x.id) === num);
+}
 let BROWSER_RUNTIMES = [];
 let BROWSER_RUNTIME_ROOT = "";
 let MONITORS = [], WATCHES = [], CONTENTS = [];
@@ -2499,7 +3418,7 @@ function showWatchRecords(kind, id) {
   const view = watchRecordConfig(kind);
   if (kind === "comment") { COMMENT_SRC = value; COMMENT_GROUP = COMMENT_TAG = ""; selComment.clear(); }
   else DANMAKU_SRC = value;
-  for (const suffix of ["query", "group", "tag", "type", "min-likes", "time-start", "time-end", "captured-from", "captured-to"]) {
+  for (const suffix of ["query", "ip-label", "group", "tag", "type", "min-likes", "time-start", "time-end", "captured-from", "captured-to"]) {
     const node = $(kind + "-" + suffix); if (node) { node.value = ""; node._csSync?.(); }
   }
   if ($(kind + "-sort")) { $(kind + "-sort").value = "captured_desc"; $(kind + "-sort")._csSync?.(); }
@@ -2607,12 +3526,12 @@ function waitForAccountPaint(isCurrent) {
 }
 async function refreshAccounts() {
   const isCurrent = beginViewRequest("accounts");
-  let accs, workbench = [], inbox = { items: [] };
+  let allAccs, workbench = [];
+  const scopePf = GLOBAL_MODE ? "" : PLATFORM;
   try {
-    [accs, workbench, inbox] = await Promise.all([
-      api("/api/accounts?platform=" + PLATFORM),
-      api("/api/accounts/workbench?platform=" + PLATFORM).catch(() => []),
-      api("/api/dm/inbox?platform=" + PLATFORM + "&limit=100").catch(() => ({ items: [] })),
+    [allAccs, workbench] = await Promise.all([
+      api("/api/accounts"),
+      api("/api/accounts/workbench" + (scopePf ? "?platform=" + scopePf : "")).catch(() => []),
     ]);
   }
   catch (e) {
@@ -2622,7 +3541,9 @@ async function refreshAccounts() {
   if (!isCurrent()) return;
   await waitForAccountPaint(isCurrent);
   if (!isCurrent()) return;
-  ACCOUNTS = accs;
+  ALL_ACCOUNTS = Array.isArray(allAccs) ? allAccs : [];
+  ACCOUNTS = ALL_ACCOUNTS.filter(a => a.platform === PLATFORM);
+  const accs = GLOBAL_MODE ? ALL_ACCOUNTS : ACCOUNTS;
   const accountWork = new Map((workbench || []).map(value => [Number(value.account_id), value]));
   $("stat-acc").textContent = accs.length;
   $("acc-table").querySelector("tbody").innerHTML = accs.map(a => {
@@ -2633,8 +3554,11 @@ async function refreshAccounts() {
     const isChannels = a.platform === "shipinhao";
     const isTikTok = a.platform === "tiktok";
     const isBili = a.platform === "bilibili";
-    const idName = isXhs ? "小红书号 " : isKs ? "快手号 " : isChannels ? "视频号 " : isTikTok ? "TikTok号 " : isBili ? "UID " : "抖音号 ";
-    const secName = isChannels ? "finder_id " : isKs ? "主页ID " : isXhs ? "user_id " : isTikTok ? "unique_id " : isBili ? "mid " : "sec_uid ";
+    const isIg = a.platform === "instagram";
+    const isTw = a.platform === "twitter";
+    const isFb = a.platform === "facebook";
+    const idName = isXhs ? "小红书号 " : isKs ? "快手号 " : isChannels ? "视频号 " : isTikTok ? "TikTok号 " : isBili ? "UID " : (isIg || isTw) ? "@ " : isFb ? "FB " : "抖音号 ";
+    const secName = isChannels ? "finder_id " : isKs ? "主页ID " : isXhs ? "user_id " : isTikTok ? "unique_id " : isBili ? "mid " : isIg ? "pk " : isTw ? "screen_name " : isFb ? "UID " : "sec_uid ";
     const rawSecUid = String(a.sec_uid || "");
     const shortSecUid = rawSecUid.length > 18 ? rawSecUid.slice(0, 18) + "…" : rawSecUid;
     const idline = [
@@ -2668,12 +3592,23 @@ async function refreshAccounts() {
           ? `<span class="pill active has-ic ic-text" title="已完成创作者登录,可发布">${ic("i-film")}创作者号</span>`
           : `<span class="pill bare has-ic ic-text" title="仅监控/读取,未授权创作平台,不能发布">${ic("i-eye")}读取号</span>`)
       : `<span class="pill ${a.has_creator ? "active" : "bare"} has-ic ic-text" title="${a.has_creator ? "创作者登录,可用于创作中心评论模式,也可抓取" : "普通抓取账号"}">${a.has_creator ? ic("i-film") + "创作者号" : ic("i-card") + "抓取号"}</span>`;
-    // 代理(风控隔离):有代理显示脱敏地址 + 状态;无代理高亮提醒(多账号同 IP 有关联风险)
-    const pxText = { ok: "代理正常", rotating: "代理正常（轮换出口）", drifted: "代理正常（出口已变化）", bad: "代理不可用", bound: "代理已绑定（待检测）", unknown: "代理已绑定（未检测）", auth_error: "代理认证失败", blocked: "代理被拦截" };
-    const pxCls = ["ok", "rotating", "drifted"].includes(a.proxy_status) ? "active" : ["bad", "auth_error", "blocked"].includes(a.proxy_status) ? "invalid" : "bare";
+    // 代理(风控隔离):有代理显示脱敏地址 + 状态 + 共用提醒;无代理高亮提醒直连风险(均不强制拦截)
+    const pxText = { ok: "代理正常", rotating: "代理正常（轮换出口）", drifted: "代理正常（出口已变化）", bad: "代理不可用", disabled: "池节点已停用", bound: "代理已绑定（待检测）", unknown: "代理已绑定（未检测）", auth_error: "代理认证失败", blocked: "代理被拦截" };
+    const pxCls = ["ok", "rotating", "drifted"].includes(a.proxy_status) ? "active" : ["bad", "auth_error", "blocked", "disabled"].includes(a.proxy_status) ? "invalid" : "bare";
+    const pxWarnings = Array.isArray(a.proxy_warnings) ? a.proxy_warnings : [];
+    const pxWarnTitle = pxWarnings.join("；");
+    const sharedBadge = a.shared_proxy
+      ? `<span class="pill pending" title="${esc(pxWarnTitle || "同平台多账号正共用此代理或出口 IP，建议尽量一号一独立代理")}">⚠️ 共用代理(${Number(a.shared_proxy_count || 2)}号)</span>`
+      : (a.cross_platform_shared_proxy ? `<span class="pill bare" title="${esc(pxWarnTitle || "跨平台复用同一代理")}">跨平台复用</span>` : "");
+    const directPill = pxWarnings.length
+      ? `<span class="pill pending" title="${esc(pxWarnTitle)}">⚠️ 本机直连</span>`
+      : `<span class="mut" title="当前走本机真实网络，多号或海外平台建议配置独立代理">本机直连</span>`;
+    const proxyWarnDetail = pxWarnings.length
+      ? `<div class="ic-text" style="font-size:11px;margin-top:3px;color:var(--warn)">${ic("i-info")}${esc(pxWarnTitle)}</div>`
+      : "";
     const proxyLine = a.has_proxy
-      ? `<div class="mut" style="font-size:11px;margin-top:2px">代理 <code>${esc(a.proxy)}</code> <span class="pill ${pxCls}">${pxText[a.proxy_status] || a.proxy_status}</span></div>`
-      : `<div class="ic-text" style="font-size:11px;margin-top:2px;color:var(--warn)">${ic("i-info")}未配置代理(走本机真实 IP,多账号有关联风险)</div>`;
+      ? `<div class="mut" style="font-size:11px;margin-top:2px">代理 <code>${esc(a.proxy)}</code> <span class="pill ${pxCls}">${pxText[a.proxy_status] || a.proxy_status}</span> ${sharedBadge}</div>${proxyWarnDetail}`
+      : `<div class="ic-text" style="font-size:11px;margin-top:2px;color:var(--warn)">${ic("i-info")}${esc(pxWarnTitle || "未配置代理（当前走本机直连；不拦截任务，同平台多账号建议配置独立代理防关联）")}</div>`;
     const browserLine = a.environment
       ? `<div class="mut" style="font-size:11px;margin-top:2px">浏览器 ${esc(loginEnvironmentText(a.environment))}</div>`
       : "";
@@ -2705,7 +3640,7 @@ async function refreshAccounts() {
           <div>
             <button type="button" class="wb-account-name" data-account-detail="${a.id}" aria-haspopup="dialog">${esc(a.nickname || "未命名账号")}${ic("i-next")}</button>
             <div class="wb-account-meta">${idline || `账号 #${a.id}`} · ${a.monitor_count || 0} 个监控</div>
-            <div class="wb-account-pills">${pill}${!a.has_proxy ? '<span class="mut">本机网络</span>' : `<span class="pill ${pxCls}">${pxText[a.proxy_status] || "代理状态未知"}</span>`}</div>
+            <div class="wb-account-pills">${pill}${!a.has_proxy ? directPill : `<span class="pill ${pxCls}">${pxText[a.proxy_status] || "代理状态未知"}</span>${sharedBadge}`}</div>
           </div>
         </div>
         <div data-account-info hidden><div class="wb-inspector-block"><h3>账号资料</h3><p>${idline}</p><p>${esc(detail)}</p></div>
@@ -2724,7 +3659,7 @@ async function refreshAccounts() {
         <button class="ghost sm" onclick="openAccountBrowser(${a.id})" title="用该账号登录态弹出真实浏览器窗口,手动收发私信 / 维护 / 抓接口(关窗即保存)">打开浏览器</button>
         <button class="ghost sm" onclick="setBrowserBackend(${a.id})" title="选择本地 Chrome/Patchright 或开源 Fingerprint Chromium 内核">环境</button>
         <button class="ghost sm" onclick="manageFingerprint(${a.id})" title="根据账号当前出口 IP 生成稳定指纹、时区、语言和地理位置">指纹</button>
-        ${environmentCheck && environmentCheck.enabled ? `<button class="ghost sm" onclick="checkBrowserEnvironment(${a.id})" title="在该账号独立 Profile 中打开 BrowserScan，查看实际 IP、时区、WebRTC 和指纹">环境检测</button>` : ""}
+        ${environmentCheck && environmentCheck.enabled ? `<button class="ghost sm" onclick="checkBrowserEnvironment(${a.id})" title="在该账号独立 Profile 中打开环境检测页，查看实际 IP、时区、WebRTC 和指纹">环境检测</button>` : ""}
         <button class="ghost sm" onclick="setProxy(${a.id})" title="设置/分配该账号专属代理(防多账号关联)">代理</button>
         ${a.has_proxy ? `<button class="ghost sm" onclick="testProxy(${a.id})" title="经该代理实连一次,验证可用">测代理</button>` : ""}
         <button class="ghost sm danger" onclick="delAccount(${a.id})" aria-label="删除账号">${ic("i-trash")}删除</button>
@@ -2732,12 +3667,6 @@ async function refreshAccounts() {
       </td>
     </tr>`;
   }).join("") || empty(3, "还没有账号", "i-user", "用上方按钮扫码登录,或粘贴 Cookie 添加一个账号");
-  if ($("dm-inbox-table")) $("dm-inbox-table").innerHTML = (inbox.items || []).map(row => `<tr>
-    <td><b>${esc(row.account_name || `账号 #${row.account_id}`)}</b><div class="mut">${esc(PF_NAME[row.platform] || row.platform)}</div></td>
-    <td><b>${esc(row.peer_nickname || row.peer_uid || "未命名会话")}</b>${row.group_chat ? '<div class="mut">群聊</div>' : ""}${row.unread_count ? `<span class="pill pending">${Number(row.unread_count)} 未读</span>` : ""}</td>
-    <td title="${esc(row.last_text || "")}">${esc((row.last_text || "暂无文本消息").slice(0, 120))}</td>
-    <td>${row.last_time ? fmtTime(row.last_time) : "—"}</td>
-    <td class="acttd"><button class="ghost sm" onclick="openAggregatedDm(${Number(row.account_id)},${jsArg(row.conv_id)})">${ic("i-send")}处理</button></td></tr>`).join("") || empty(5, "暂无私信会话", "i-send", "在账号管理中同步私信后，会话会聚合显示在这里");
   globalThis.CreatorHubWorkbench?.accountsUpdated?.();
   if ($("tb-acc")) $("tb-acc").textContent = accs.length;
   populateAccountSelect();
@@ -2766,6 +3695,7 @@ function populateTikTokAccounts() {
     else if (accounts.length) select.value = String(accounts[0].id);
     select._csSync?.();
   }
+  if (!TIKTOK_USERS.length) renderTikTokUsers();
 }
 function renderTikTokUsers() {
   const body = $("tk-user-results");
@@ -2784,7 +3714,7 @@ function renderTikTokUsers() {
       + '">sec_uid ' + esc(secUid ? secUid.slice(0, 22) + (secUid.length > 22 ? "…" : "") : "—") + '</div></td>'
       + '<td>' + fmtNum(user.follower_count || 0) + ' 粉丝<div class="mut">'
       + fmtNum(user.following_count || 0) + ' 关注 · ' + fmtNum(user.video_count || 0) + ' 视频</div></td>'
-      + '<td title="' + esc(user.signature || "") + '">' + esc((user.signature || "—").slice(0, 120)) + '</td>'
+      + '<td class="wrap" style="max-width:260px" title="' + esc(user.signature || "") + '">' + esc((user.signature || "—").slice(0, 120)) + '</td>'
       + '<td class="acttd"><button class="ghost sm"' + disabled + ' onclick="runTikTokUserAction(' + index + ',\'follow\')">关注</button>'
       + '<button class="ghost sm"' + disabled + ' onclick="runTikTokUserAction(' + index + ',\'unfollow\')">取关</button>'
       + '<button class="ghost sm"' + disabled + ' onclick="runTikTokUserAction(' + index + ',\'send_dm\')">私信</button></td></tr>';
@@ -2902,9 +3832,11 @@ async function createTikTokCommentTask() {
   });
 }
 
+// 06-risk-center.js — 风控中心看板、场景方案与分项规则开关、人工验证解除与审计日志。
 // ═══════════ 风控中心 ═══════════
 let RISK_ACCOUNTS = [];
 let RISK_CONFIG = null;
+let RISK_DIRTY = false;
 
 function riskDate(value) {
   if (!value) return null;
@@ -2943,13 +3875,180 @@ const RISK_OUTCOME_LABELS = {
   success: "成功", risk: "平台风控", auth: "登录失效", network: "网络异常",
   business: "业务异常", manual: "人工操作",
 };
+const RISK_MODULE_LABELS = {
+  cooldown: "异常冷却恢复",
+  write_limits: "写操作频控",
+  pacing: "读写防抖休息",
+  quiet_hours: "夜间休眠",
+  network_guard: "同出口防连坐",
+  jitter: "随机错峰",
+  native_write_gate: "写入环境门禁",
+};
+
+const RISK_PRESETS = {
+  off: {
+    label: "关闭风控",
+    risk_control: {
+      enabled: false,
+      cooldown_enabled: false,
+      write_limits_enabled: false,
+      pacing_enabled: false,
+      network_guard_enabled: false,
+      jitter_enabled: false,
+    },
+    schedule: {
+      quiet_hours_enabled: false,
+      quiet_hours_include_reads: false,
+      native_write_gate_enabled: false,
+    },
+  },
+  light: {
+    label: "轻度防护",
+    risk_control: {
+      enabled: true,
+      mode: "custom",
+      cooldown_enabled: true,
+      write_limits_enabled: false,
+      pacing_enabled: true,
+      network_guard_enabled: false,
+      jitter_enabled: true,
+      cooldown_steps_seconds: [900, 3600, 10800, 43200],
+      recovery_probe_gap_seconds: 600,
+      recovery_successes: 2,
+      read_light_gap_seconds: 5,
+      read_heavy_gap_seconds: 15,
+      operation_gap_min_seconds: 3,
+      operation_gap_max_seconds: 8,
+      session_operation_limit: 0,
+      session_rest_min_seconds: 120,
+      session_rest_max_seconds: 300,
+      network_retry_jitter_seconds: 15,
+    },
+    schedule: {
+      quiet_hours_enabled: false,
+      quiet_hours_include_reads: false,
+      quiet_hours_wake_jitter_minutes: 0,
+      scan_jitter: 0.1,
+      comment_jitter: 0.2,
+      xhs_dm_poll_jitter: 0.15,
+      initial_scan_spread_seconds: 20,
+      native_write_gate_enabled: false,
+    },
+  },
+  balanced: {
+    label: "稳妥防护",
+    risk_control: {
+      enabled: true,
+      mode: "custom",
+      cooldown_enabled: true,
+      write_limits_enabled: true,
+      pacing_enabled: true,
+      network_guard_enabled: true,
+      jitter_enabled: true,
+      cooldown_steps_seconds: [1800, 7200, 21600, 86400],
+      recovery_probe_gap_seconds: 600,
+      recovery_successes: 3,
+      read_light_gap_seconds: 15,
+      read_heavy_gap_seconds: 45,
+      operation_gap_min_seconds: 6,
+      operation_gap_max_seconds: 18,
+      session_operation_limit: 15,
+      session_rest_min_seconds: 120,
+      session_rest_max_seconds: 300,
+      network_group_concurrency: 1,
+      network_group_risk_accounts: 2,
+      network_group_risk_window_seconds: 900,
+      network_group_cooldown_seconds: 7200,
+      shared_write_gap_seconds: 180,
+      comment_min_gap_seconds: 300, comment_hourly_cap: 6, comment_daily_cap: 20,
+      social_min_gap_seconds: 480, social_hourly_cap: 4, social_daily_cap: 15,
+      dm_min_gap_seconds: 480, dm_hourly_cap: 4, dm_daily_cap: 15,
+      publish_min_gap_seconds: 3600, publish_hourly_cap: 2, publish_daily_cap: 5,
+      combined_action_hourly_cap: 6, combined_action_daily_cap: 20,
+      network_retry_jitter_seconds: 30,
+    },
+    schedule: {
+      quiet_hours_enabled: true,
+      quiet_hours_include_reads: true,
+      active_hours_start: 8,
+      active_hours_end: 24,
+      quiet_hours_wake_jitter_minutes: 30,
+      scan_jitter: 0.15,
+      comment_jitter: 0.3,
+      xhs_dm_poll_jitter: 0.25,
+      initial_scan_spread_seconds: 45,
+      native_write_gate_enabled: false,
+    },
+  },
+  strict: {
+    label: "严格保守",
+    risk_control: {
+      enabled: true,
+      mode: "custom",
+      cooldown_enabled: true,
+      write_limits_enabled: true,
+      pacing_enabled: true,
+      network_guard_enabled: true,
+      jitter_enabled: true,
+      cooldown_steps_seconds: [1800, 7200, 21600, 86400],
+      recovery_probe_gap_seconds: 600,
+      recovery_successes: 3,
+      read_light_gap_seconds: 20,
+      read_heavy_gap_seconds: 60,
+      operation_gap_min_seconds: 8,
+      operation_gap_max_seconds: 25,
+      session_operation_limit: 12,
+      session_rest_min_seconds: 180,
+      session_rest_max_seconds: 480,
+      network_group_concurrency: 1,
+      network_group_risk_accounts: 2,
+      network_group_risk_window_seconds: 900,
+      network_group_cooldown_seconds: 7200,
+      shared_write_gap_seconds: 300,
+      comment_min_gap_seconds: 600, comment_hourly_cap: 3, comment_daily_cap: 10,
+      social_min_gap_seconds: 900, social_hourly_cap: 2, social_daily_cap: 8,
+      dm_min_gap_seconds: 900, dm_hourly_cap: 2, dm_daily_cap: 8,
+      publish_min_gap_seconds: 7200, publish_hourly_cap: 1, publish_daily_cap: 3,
+      combined_action_hourly_cap: 3, combined_action_daily_cap: 10,
+      network_retry_jitter_seconds: 30,
+    },
+    schedule: {
+      quiet_hours_enabled: true,
+      quiet_hours_include_reads: true,
+      active_hours_start: 8,
+      active_hours_end: 24,
+      quiet_hours_wake_jitter_minutes: 35,
+      scan_jitter: 0.15,
+      comment_jitter: 0.4,
+      xhs_dm_poll_jitter: 0.35,
+      initial_scan_spread_seconds: 60,
+      native_write_gate_enabled: true,
+      native_write_require_system_chrome: true,
+      native_write_require_verified_proxy: true,
+      native_write_proxy_max_age_seconds: 86400,
+    },
+  },
+};
+
+function openRiskRulesSection() {
+  if (typeof switchTab === "function") switchTab("risk-control", true);
+  globalThis.CreatorHubWorkbench?.showSection?.("risk-control", "rules");
+}
+
+function setRiskConfigMsg(text, state = "") {
+  const el = $("risk-config-msg");
+  if (!el) return;
+  el.textContent = text || "";
+  if (state) el.dataset.state = state;
+  else el.removeAttribute("data-state");
+}
 
 async function refreshRiskCenter(force = false, announce = force) {
   const isCurrent = beginViewRequest("risk-center");
   try {
-    const shouldFillConfig = !RISK_CONFIG || force;
+    const shouldFillConfig = (!RISK_CONFIG || (force && !RISK_DIRTY));
     const configPromise = shouldFillConfig ? api("/api/risk-control/config") : Promise.resolve(RISK_CONFIG);
-    const platformQuery = "?platform=" + encodeURIComponent(PLATFORM);
+    const platformQuery = GLOBAL_MODE ? "" : ("?platform=" + encodeURIComponent(PLATFORM));
     const [summary, accounts, config] = await Promise.all([
       api("/api/risk-control/summary" + platformQuery),
       api("/api/risk-control/accounts" + platformQuery),
@@ -2976,6 +4075,24 @@ function renderRiskSummary(summary) {
   $("risk-stat-blocked").textContent = summary.blocked_tasks || 0;
   $("risk-stat-today").textContent = summary.risk_events_today || 0;
   if ($("tb-risk")) $("tb-risk").textContent = summary.abnormal || 0;
+
+  const banner = $("risk-status-policy-banner");
+  if (banner) {
+    const modules = Array.isArray(summary.active_modules) ? summary.active_modules : [];
+    const enabled = Boolean(summary.policy_enabled);
+    const active = (enabled && modules.length > 0) || Boolean(summary.native_write_gate_enabled);
+    banner.dataset.state = active ? "on" : "off";
+    const titleEl = $("risk-status-policy-title");
+    const descEl = $("risk-status-policy-desc");
+    if (!active) {
+      if (titleEl) titleEl.textContent = "风控规则当前未开启";
+      if (descEl) descEl.textContent = "所有采集、发布、评论与互动任务将直接执行，不做额外拦截或冷却。";
+    } else {
+      const names = modules.map(key => RISK_MODULE_LABELS[key] || key);
+      if (titleEl) titleEl.textContent = `风控保护运行中（${names.length} 项）`;
+      if (descEl) descEl.textContent = "已生效：" + names.join(" · ");
+    }
+  }
 }
 
 function riskAccountWait(account, now = Date.now()) {
@@ -3023,13 +4140,11 @@ function renderRiskAccounts() {
       : "尚未获取平台账号 ID";
     return `<tr>
       <td><div class="risk-account"><b>${esc(account.nickname || "未命名账号")}</b><small title="${esc(actualAccountId)}">${esc(riskPlatformLabel(account.platform))} · ${esc(actualAccountId)}</small></div></td>
-      <td><span class="risk-status ${esc(account.status_tone)}">${esc(account.status_label)}</span></td>
-      <td class="num"><b>L${Number(account.risk_level) || 0}</b></td>
+      <td><div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap"><span class="risk-status ${esc(account.status_tone)}">${esc(account.status_label)}</span><span class="pill bare num">L${Number(account.risk_level) || 0}</span></div></td>
       <td><div class="risk-reason"><span title="${esc(reason)}">${esc(reason)}</span><small>${account.last_risk_at ? "触发于 " + esc(riskTime(account.last_risk_at)) : "暂无风险记录"}</small></div></td>
-      <td><div class="risk-account">${timing}</div></td>
-      <td><div class="risk-progress"><div class="risk-progress-track"><i style="width:${progress}%"></i></div><span>${account.risk_level > 0 ? `${account.recovery_successes}/${account.recovery_target}` : "完成"}</span></div></td>
+      <td><div class="risk-account">${timing}<div class="risk-progress" style="margin-top:4px"><div class="risk-progress-track"><i style="width:${progress}%"></i></div><span>${account.risk_level > 0 ? `${account.recovery_successes}/${account.recovery_target}` : "完成"}</span></div></div></td>
       <td><b class="num">${account.blocked_tasks || 0} / ${queue.total || 0}</b><div class="mut" style="font-size:11px" title="${esc(account.latest_block_reason || "")}">受阻 / 待执行${account.task_next_allowed_at ? ` · ${esc(riskRemaining(account.task_next_allowed_at))}` : ""}</div></td>
-      <td><div class="risk-account"><span>${account.proxy ? `<code>${esc(account.proxy)}</code>` : "本机直连"}</span><small>${esc(account.proxy_status || "unknown")} · ${esc(account.network_key || "—")}</small></div></td>
+      <td><div class="risk-account"><span>${account.proxy ? `<code>${esc(account.proxy)}</code>` : '<span style="color:var(--warn)">⚠️ 本机直连</span>'}</span><small>${esc(account.proxy_status || "unknown")} · ${esc(account.network_key || "—")}</small>${account.proxy_warning ? `<small style="color:var(--warn)" title="${esc(account.proxy_warning)}">⚠️ ${esc(account.proxy_warning)}</small>` : ""}</div></td>
       <td class="acttd">
         <button class="ghost sm" onclick="probeRiskAccount(${account.account_id})" ${wait.waiting ? "disabled" : ""} title="${esc(wait.title)}">${wait.manual ? "待验证" : wait.waiting ? "等待探测" : "探测"}</button>
         <button class="ghost sm" onclick="showRiskEvents(${account.account_id})">记录</button>
@@ -3037,43 +4152,353 @@ function renderRiskAccounts() {
         ${account.status !== "normal" ? `<button class="ghost sm danger" onclick="clearRiskAccount(${account.account_id})">解除</button>` : ""}
       </td>
     </tr>`;
-  }).join("") || empty(9, "没有匹配的账号状态", "i-shield", "调整筛选条件或先添加平台账号");
+  }).join("") || empty(7, "没有匹配的账号状态", "i-shield", "调整筛选条件或先添加平台账号");
+}
+
+function _riskValNum(id, fallback = 0) {
+  const v = Number($(id)?.value);
+  return Number.isFinite(v) ? v : fallback;
+}
+function _riskFmtHour(hour) {
+  const h = Number(hour) || 0;
+  if (h <= 24) return `${String(h).padStart(2, "0")}:00`;
+  return `次日${String(h - 24).padStart(2, "0")}:00`;
+}
+
+function detectRiskPreset() {
+  const enabled = !!$("risk-enabled")?.checked;
+  const nativeGate = !!$("risk-native-gate-enabled")?.checked;
+  if (!enabled && !nativeGate) return "off";
+  if (!enabled) return "";
+  const flags = {
+    cooldown: !!$("risk-cooldown-enabled")?.checked,
+    write_limits: !!$("risk-write-limits-enabled")?.checked,
+    pacing: !!$("risk-pacing-enabled")?.checked,
+    quiet_hours: !!$("risk-quiet-enabled")?.checked,
+    network_guard: !!$("risk-network-guard-enabled")?.checked,
+    jitter: !!$("risk-jitter-enabled")?.checked,
+    native_gate: nativeGate,
+  };
+  if (flags.cooldown && !flags.write_limits && flags.pacing && !flags.quiet_hours && !flags.network_guard && flags.jitter && !flags.native_gate
+      && _riskValNum("risk-read-light") === 5 && _riskValNum("risk-session-limit") === 0) {
+    return "light";
+  }
+  if (flags.cooldown && flags.write_limits && flags.pacing && flags.quiet_hours && flags.network_guard && flags.jitter && !flags.native_gate
+      && _riskValNum("risk-comment-gap") === 5 && _riskValNum("risk-publish-gap") === 60) {
+    return "balanced";
+  }
+  if (flags.cooldown && flags.write_limits && flags.pacing && flags.quiet_hours && flags.network_guard && flags.jitter && flags.native_gate
+      && _riskValNum("risk-comment-gap") === 10 && _riskValNum("risk-publish-gap") === 120) {
+    return "strict";
+  }
+  return "";
+}
+
+function syncRiskConfigUI() {
+  const enabled = !!$("risk-enabled")?.checked;
+  const modulesGrid = $("risk-modules-grid");
+  if (modulesGrid) modulesGrid.classList.toggle("is-master-off", !enabled);
+  const offHint = $("risk-master-off-hint");
+  if (offHint) offHint.hidden = enabled;
+
+  const nativeOn = !!$("risk-native-gate-enabled")?.checked;
+  const nativeSub = $("risk-native-gate-sub");
+  if (nativeSub) nativeSub.classList.toggle("is-disabled", !nativeOn);
+
+  const moduleChecks = [
+    ["cooldown", "risk-cooldown-enabled"],
+    ["write_limits", "risk-write-limits-enabled"],
+    ["pacing", "risk-pacing-enabled"],
+    ["quiet_hours", "risk-quiet-enabled"],
+    ["network_guard", "risk-network-guard-enabled"],
+    ["jitter", "risk-jitter-enabled"],
+  ];
+
+  const activeNames = [];
+  moduleChecks.forEach(([key, id]) => {
+    const checked = !!$(id)?.checked;
+    const effective = enabled && checked;
+    const card = document.querySelector(`.risk-module[data-risk-module="${key}"]`);
+    if (card) card.classList.toggle("is-active", effective);
+    const badge = $(`risk-badge-${key}`);
+    if (badge) {
+      badge.textContent = effective ? "生效中" : (checked && !enabled ? "总开关已关" : "未开启");
+    }
+    if (effective) activeNames.push(key);
+  });
+
+  // 各模块精简参数预览
+  const stepsStr = ($("risk-cooldown-steps")?.value || "").split(/[,，\s]+/).filter(Boolean).join("/");
+  if ($("risk-summary-cooldown")) {
+    $("risk-summary-cooldown").textContent =
+      `阶梯 ${stepsStr || "—"} 分 · 探测间隔 ${_riskValNum("risk-probe-gap")} 分 · 成功 ${_riskValNum("risk-recovery-count")} 次恢复`;
+  }
+  if ($("risk-summary-write_limits")) {
+    const cGap = _riskValNum("risk-comment-gap"), cH = _riskValNum("risk-comment-hourly"), cD = _riskValNum("risk-comment-daily");
+    const pGap = _riskValNum("risk-publish-gap"), pD = _riskValNum("risk-publish-daily");
+    const sh = _riskValNum("risk-shared-write");
+    const parts = [];
+    if (sh > 0) parts.push(`共享写间隔 ${sh}分`);
+    parts.push(`评论 ${cGap ? cGap + "分" : "不限"}/${cH ? cH + "次/时" : "不限"}/${cD ? cD + "次/日" : "不限"}`);
+    parts.push(`发布 ${pGap ? pGap + "分" : "不限"}/${pD ? pD + "次/日" : "不限"}`);
+    $("risk-summary-write_limits").textContent = parts.join(" · ");
+  }
+  if ($("risk-summary-pacing")) {
+    const rl = _riskValNum("risk-read-light"), rh = _riskValNum("risk-read-heavy");
+    const omin = _riskValNum("risk-operation-min"), omax = _riskValNum("risk-operation-max");
+    const slim = _riskValNum("risk-session-limit"), rmin = _riskValNum("risk-rest-min"), rmax = _riskValNum("risk-rest-max");
+    $("risk-summary-pacing").textContent =
+      `轻/重读 ${rl}/${rh}秒 · 跨功能 ${omin}–${omax}秒 · ${slim > 0 ? `连续 ${slim}次休 ${rmin}–${rmax}秒` : "关闭连续休息"}`;
+  }
+  if ($("risk-summary-quiet_hours")) {
+    const st = _riskFmtHour(_riskValNum("risk-active-start", 8));
+    const ed = _riskFmtHour(_riskValNum("risk-active-end", 24));
+    const inc = !!$("risk-quiet-include-reads")?.checked;
+    const jit = _riskValNum("risk-quiet-jitter");
+    $("risk-summary-quiet_hours").textContent =
+      `活跃 ${st}–${ed} · ${inc ? "含后台监控与采集" : "仅限制自动写操作"}${jit > 0 ? ` · ±${jit}分错峰` : ""}`;
+  }
+  if ($("risk-summary-network_guard")) {
+    const conc = _riskValNum("risk-network-concurrency", 1);
+    const accs = _riskValNum("risk-network-accounts");
+    const win = _riskValNum("risk-network-window");
+    const cd = _riskValNum("risk-network-cooldown");
+    $("risk-summary-network_guard").textContent =
+      `同出口并发 ${conc} · ${accs >= 2 ? `${win}分内 ${accs}号命中熔断 ${cd}分` : "关闭多号熔断"}`;
+  }
+  if ($("risk-summary-jitter")) {
+    const sj = _riskValNum("risk-scan-jitter"), cj = _riskValNum("risk-comment-jitter");
+    const dj = _riskValNum("risk-dm-poll-jitter"), sp = _riskValNum("risk-initial-spread");
+    const rj = _riskValNum("risk-retry-jitter");
+    $("risk-summary-jitter").textContent =
+      `扫描 +${sj}% · 评论 +${cj}% · 私信 +${dj}% · 首跑 ${sp}秒 · 重试 ${rj}秒`;
+  }
+
+  // 场景方案高亮
+  const activePreset = detectRiskPreset();
+  document.querySelectorAll(".risk-preset[data-risk-preset]").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.riskPreset === activePreset);
+  });
+
+  // 顶部态势 Hero
+  const hero = $("risk-rules-hero");
+  const titleEl = $("risk-hero-title");
+  const pillEl = $("risk-hero-pill");
+  const descEl = $("risk-hero-desc");
+  const chipsEl = $("risk-hero-chips");
+  if (!hero) return;
+
+  if (!enabled && !nativeOn) {
+    hero.dataset.state = "off";
+    titleEl.textContent = "风控规则当前全部关闭";
+    pillEl.textContent = "默认不拦截";
+    descEl.textContent = "所有采集、发布、评论与互动任务将直接按计划执行，不做额外拦截、冷却或随机延迟。如需防护，可在下方一键套用方案或单独勾选规则。";
+    if (chipsEl) { chipsEl.hidden = true; chipsEl.innerHTML = ""; }
+  } else if (!enabled && nativeOn) {
+    hero.dataset.state = "empty";
+    titleEl.textContent = "统一风控已关闭（仅 native 写入环境门禁开启）";
+    pillEl.textContent = "1 项环境门禁";
+    descEl.textContent = "统一频控、冷却与休眠均未开启；仅高级维护中的 native 写入环境门禁生效，可在下方「高级与维护参数」中关闭。";
+    if (chipsEl) {
+      chipsEl.hidden = false;
+      chipsEl.innerHTML = `<span class="risk-active-chip env">native 写入环境门禁</span>`;
+    }
+  } else if (enabled && activeNames.length === 0 && !nativeOn) {
+    hero.dataset.state = "empty";
+    titleEl.textContent = "总开关已开启，但尚未启用任何子规则";
+    pillEl.textContent = "0 项生效";
+    descEl.textContent = "当前仍不会对任务做额外拦截或延迟。请点击下方快捷方案，或勾选需要的分项规则开关后保存。";
+    if (chipsEl) { chipsEl.hidden = true; chipsEl.innerHTML = ""; }
+  } else {
+    hero.dataset.state = "on";
+    const totalActive = activeNames.length + (nativeOn ? 1 : 0);
+    const presetLabel = activePreset && RISK_PRESETS[activePreset] ? RISK_PRESETS[activePreset].label : "自定义组合";
+    titleEl.textContent = `统一风控已开启 · ${presetLabel}`;
+    pillEl.textContent = `已启用 ${totalActive} 项规则`;
+    descEl.textContent = "仅下方标注「生效中」的规则会参与后台调度；所有参数所见即所得，保存后立即生效。";
+    if (chipsEl) {
+      chipsEl.hidden = false;
+      const chipHtml = activeNames.map(key => `<span class="risk-active-chip">${esc(RISK_MODULE_LABELS[key] || key)}</span>`);
+      if (nativeOn) chipHtml.push(`<span class="risk-active-chip env">写入环境门禁</span>`);
+      chipsEl.innerHTML = chipHtml.join("");
+    }
+  }
+}
+
+function onRiskMasterToggle() {
+  RISK_DIRTY = true;
+  syncRiskConfigUI();
+  setRiskConfigMsg("有未保存修改 · 点击「保存并立即生效」应用", "dirty");
+}
+
+function onRiskModuleToggle(moduleKey) {
+  const idMap = {
+    cooldown: "risk-cooldown-enabled",
+    write_limits: "risk-write-limits-enabled",
+    pacing: "risk-pacing-enabled",
+    quiet_hours: "risk-quiet-enabled",
+    network_guard: "risk-network-guard-enabled",
+    jitter: "risk-jitter-enabled",
+  };
+  const checked = !!$(idMap[moduleKey])?.checked;
+  if (checked && $("risk-enabled") && !$("risk-enabled").checked) {
+    $("risk-enabled").checked = true;
+  }
+  // 首次单独开启随机错峰时若参数全为 0，自动填入温和默认错峰参数，避免开启后无效果
+  if (checked && moduleKey === "jitter") {
+    const allZero = ["risk-scan-jitter", "risk-comment-jitter", "risk-dm-poll-jitter", "risk-initial-spread", "risk-retry-jitter"]
+      .every(id => _riskValNum(id) <= 0);
+    if (allZero) {
+      $("risk-scan-jitter").value = 15;
+      $("risk-comment-jitter").value = 30;
+      $("risk-dm-poll-jitter").value = 25;
+      $("risk-initial-spread").value = 45;
+      $("risk-retry-jitter").value = 30;
+    }
+  }
+  if (checked && moduleKey === "quiet_hours") {
+    if (_riskValNum("risk-active-end") <= _riskValNum("risk-active-start")) {
+      $("risk-active-start").value = 8;
+      $("risk-active-end").value = 24;
+    }
+  }
+  RISK_DIRTY = true;
+  syncRiskConfigUI();
+  setRiskConfigMsg("有未保存修改 · 点击「保存并立即生效」应用", "dirty");
+}
+
+function onRiskFieldChange() {
+  RISK_DIRTY = true;
+  syncRiskConfigUI();
+  setRiskConfigMsg("有未保存修改 · 点击「保存并立即生效」应用", "dirty");
+}
+
+function applyRiskPreset(presetKey) {
+  const preset = RISK_PRESETS[presetKey];
+  if (!preset) return;
+  const r = preset.risk_control || {};
+  const s = preset.schedule || {};
+  const setVal = (id, val) => { const el = $(id); if (el && val !== undefined) el.value = val; };
+  const setChk = (id, val) => { const el = $(id); if (el && val !== undefined) el.checked = !!val; };
+
+  setChk("risk-enabled", r.enabled);
+  setChk("risk-cooldown-enabled", r.cooldown_enabled);
+  setChk("risk-write-limits-enabled", r.write_limits_enabled);
+  setChk("risk-pacing-enabled", r.pacing_enabled);
+  setChk("risk-network-guard-enabled", r.network_guard_enabled);
+  setChk("risk-jitter-enabled", r.jitter_enabled);
+
+  if (Array.isArray(r.cooldown_steps_seconds)) setVal("risk-cooldown-steps", r.cooldown_steps_seconds.map(v => v / 60).join(", "));
+  if (r.recovery_probe_gap_seconds !== undefined) setVal("risk-probe-gap", r.recovery_probe_gap_seconds / 60);
+  setVal("risk-recovery-count", r.recovery_successes);
+  setVal("risk-read-light", r.read_light_gap_seconds);
+  setVal("risk-read-heavy", r.read_heavy_gap_seconds);
+  setVal("risk-operation-min", r.operation_gap_min_seconds);
+  setVal("risk-operation-max", r.operation_gap_max_seconds);
+  setVal("risk-session-limit", r.session_operation_limit);
+  setVal("risk-rest-min", r.session_rest_min_seconds);
+  setVal("risk-rest-max", r.session_rest_max_seconds);
+  setVal("risk-retry-jitter", r.network_retry_jitter_seconds);
+  setVal("risk-network-concurrency", r.network_group_concurrency);
+  setVal("risk-network-accounts", r.network_group_risk_accounts);
+  if (r.network_group_risk_window_seconds !== undefined) setVal("risk-network-window", r.network_group_risk_window_seconds / 60);
+  if (r.network_group_cooldown_seconds !== undefined) setVal("risk-network-cooldown", r.network_group_cooldown_seconds / 60);
+  if (r.shared_write_gap_seconds !== undefined) setVal("risk-shared-write", r.shared_write_gap_seconds / 60);
+  setVal("risk-combined-hourly", r.combined_action_hourly_cap);
+  setVal("risk-combined-daily", r.combined_action_daily_cap);
+  ["comment", "social", "dm", "publish"].forEach(key => {
+    if (r[`${key}_min_gap_seconds`] !== undefined) setVal(`risk-${key}-gap`, r[`${key}_min_gap_seconds`] / 60);
+    setVal(`risk-${key}-hourly`, r[`${key}_hourly_cap`]);
+    setVal(`risk-${key}-daily`, r[`${key}_daily_cap`]);
+  });
+
+  setChk("risk-quiet-enabled", s.quiet_hours_enabled);
+  setChk("risk-quiet-include-reads", s.quiet_hours_include_reads);
+  setVal("risk-active-start", s.active_hours_start);
+  setVal("risk-active-end", s.active_hours_end);
+  setVal("risk-quiet-jitter", s.quiet_hours_wake_jitter_minutes);
+  if (s.scan_jitter !== undefined) setVal("risk-scan-jitter", Math.round(s.scan_jitter * 100));
+  if (s.comment_jitter !== undefined) setVal("risk-comment-jitter", Math.round(s.comment_jitter * 100));
+  if (s.xhs_dm_poll_jitter !== undefined) setVal("risk-dm-poll-jitter", Math.round(s.xhs_dm_poll_jitter * 100));
+  setVal("risk-initial-spread", s.initial_scan_spread_seconds);
+  setChk("risk-native-gate-enabled", s.native_write_gate_enabled);
+  setChk("risk-native-chrome", s.native_write_require_system_chrome);
+  setChk("risk-native-proxy", s.native_write_require_verified_proxy);
+  if (s.native_write_proxy_max_age_seconds !== undefined) setVal("risk-native-proxy-age", Math.round(s.native_write_proxy_max_age_seconds / 3600));
+
+  RISK_DIRTY = true;
+  syncRiskConfigUI();
+  setRiskConfigMsg(`已套用「${preset.label}」方案 · 点击「保存并立即生效」应用`, "dirty");
+}
+
+function resetRiskConfigToOff() {
+  applyRiskPreset("off");
 }
 
 function fillRiskConfig(config) {
   if (!config) return;
   const r = config.risk_control || {}, s = config.schedule || {};
   const set = (id, value) => { const el = $(id); if (el) { el.value = value ?? ""; if (el._csSync) el._csSync(); } };
-  $("risk-enabled").checked = !!r.enabled;
-  set("risk-mode", r.mode); set("risk-retention", r.event_retention_days);
-  set("risk-read-light", r.read_light_gap_seconds); set("risk-read-heavy", r.read_heavy_gap_seconds);
-  set("risk-operation-min", r.operation_gap_min_seconds); set("risk-operation-max", r.operation_gap_max_seconds);
+  const setChk = (id, value) => { const el = $(id); if (el) el.checked = !!value; };
+
+  setChk("risk-enabled", r.enabled);
+  setChk("risk-cooldown-enabled", r.cooldown_enabled);
+  setChk("risk-write-limits-enabled", r.write_limits_enabled);
+  setChk("risk-pacing-enabled", r.pacing_enabled);
+  setChk("risk-network-guard-enabled", r.network_guard_enabled);
+  setChk("risk-jitter-enabled", r.jitter_enabled);
+
+  set("risk-retention", r.event_retention_days);
+  set("risk-read-light", r.read_light_gap_seconds);
+  set("risk-read-heavy", r.read_heavy_gap_seconds);
+  set("risk-operation-min", r.operation_gap_min_seconds);
+  set("risk-operation-max", r.operation_gap_max_seconds);
   set("risk-session-limit", r.session_operation_limit);
-  set("risk-rest-min", r.session_rest_min_seconds); set("risk-rest-max", r.session_rest_max_seconds);
+  set("risk-rest-min", r.session_rest_min_seconds);
+  set("risk-rest-max", r.session_rest_max_seconds);
   set("risk-retry-jitter", r.network_retry_jitter_seconds);
   set("risk-scan-jitter", Math.round((s.scan_jitter || 0) * 100));
   set("risk-comment-jitter", Math.round((s.comment_jitter || 0) * 100));
   set("risk-dm-poll-jitter", Math.round((s.xhs_dm_poll_jitter || 0) * 100));
   set("risk-initial-spread", s.initial_scan_spread_seconds);
-  set("risk-recovery-count", r.recovery_successes); set("risk-probe-gap", (r.recovery_probe_gap_seconds || 0) / 60);
+  set("risk-recovery-count", r.recovery_successes);
+  set("risk-probe-gap", (r.recovery_probe_gap_seconds || 0) / 60);
   set("risk-cooldown-steps", (r.cooldown_steps_seconds || []).map(v => v / 60).join(", "));
-  set("risk-network-concurrency", r.network_group_concurrency); set("risk-network-accounts", r.network_group_risk_accounts);
-  set("risk-network-window", (r.network_group_risk_window_seconds || 0) / 60); set("risk-network-cooldown", (r.network_group_cooldown_seconds || 0) / 60);
-  set("risk-account-check", (s.account_check_interval_seconds || 0) / 60); set("risk-captcha-wait", (s.douyin_captcha_wait_seconds || 0) / 60);
-  $("risk-quiet-enabled").checked = !!s.quiet_hours_enabled;
-  set("risk-active-start", s.active_hours_start); set("risk-active-end", s.active_hours_end);
+  set("risk-network-concurrency", r.network_group_concurrency);
+  set("risk-network-accounts", r.network_group_risk_accounts);
+  set("risk-network-window", (r.network_group_risk_window_seconds || 0) / 60);
+  set("risk-network-cooldown", (r.network_group_cooldown_seconds || 0) / 60);
+  set("risk-account-check", (s.account_check_interval_seconds || 0) / 60);
+  set("risk-captcha-wait", (s.douyin_captcha_wait_seconds || 0) / 60);
+  setChk("risk-quiet-enabled", s.quiet_hours_enabled);
+  setChk("risk-quiet-include-reads", s.quiet_hours_include_reads);
+  set("risk-active-start", s.active_hours_start);
+  set("risk-active-end", s.active_hours_end);
+  set("risk-quiet-jitter", s.quiet_hours_wake_jitter_minutes ?? 0);
+  setChk("risk-native-gate-enabled", s.native_write_gate_enabled);
+  setChk("risk-native-chrome", s.native_write_require_system_chrome !== false);
+  setChk("risk-native-proxy", s.native_write_require_verified_proxy !== false);
+  set("risk-native-proxy-age", Math.round((s.native_write_proxy_max_age_seconds ?? 86400) / 3600));
   [["comment", "comment"], ["social", "social"], ["dm", "dm"], ["publish", "publish"]].forEach(([id, key]) => {
     set(`risk-${id}-gap`, (r[`${key}_min_gap_seconds`] || 0) / 60);
-    set(`risk-${id}-hourly`, r[`${key}_hourly_cap`]); set(`risk-${id}-daily`, r[`${key}_daily_cap`]);
+    set(`risk-${id}-hourly`, r[`${key}_hourly_cap`]);
+    set(`risk-${id}-daily`, r[`${key}_daily_cap`]);
   });
   set("risk-shared-write", (r.shared_write_gap_seconds || 0) / 60);
-  set("risk-combined-hourly", r.combined_action_hourly_cap); set("risk-combined-daily", r.combined_action_daily_cap);
+  set("risk-combined-hourly", r.combined_action_hourly_cap);
+  set("risk-combined-daily", r.combined_action_daily_cap);
+
+  const legacyNote = $("risk-legacy-mode-note");
+  if (legacyNote) legacyNote.hidden = !(r.enabled && r.mode === "conservative");
+
   if ($("risk-admin-token-btn")) {
     $("risk-admin-token-btn").style.display = config.admin_token_required ? "" : "none";
     let configured = false;
     try { configured = !!sessionStorage.getItem("creatorhub-risk-admin-token"); } catch (e) {}
     $("risk-admin-token-btn").innerHTML = `${ic("i-shield")}${configured ? "管理口令已设置" : "设置管理口令"}`;
   }
+  RISK_DIRTY = false;
+  syncRiskConfigUI();
 }
 
 async function setRiskAdminToken() {
@@ -3091,43 +4516,77 @@ async function setRiskAdminToken() {
   toast(token.trim() ? "管理口令已保存到当前会话" : "管理口令已清除", "ok");
 }
 
+function _revealRiskField(field) {
+  if (!field) return;
+  for (let d = field.closest("details"); d; d = d.parentElement?.closest("details")) d.open = true;
+  field.focus?.();
+}
+
 function riskNumber(id, multiplier = 1) {
   const field = $(id), raw = String(field.value ?? "").trim(), value = Number(raw);
   field.removeAttribute("aria-invalid");
   if (!raw || !Number.isFinite(value) || value < Number(field.min || 0)
       || (field.max !== undefined && field.max !== "" && value > Number(field.max))) {
-    field.setAttribute("aria-invalid", "true"); field.focus?.();
+    field.setAttribute("aria-invalid", "true");
+    _revealRiskField(field);
     throw new Error((field.labels?.[0]?.textContent || id) + "填写不正确，请检查取值范围");
   }
   return Math.round(value * multiplier);
 }
 
 async function saveRiskConfig() {
-  const msg = $("risk-config-msg");
-  const restore = btnLoading(evtBtn(), "保存中");
+  const restore = btnLoading(evtBtn() || $("risk-save-btn"), "保存中");
   INFLIGHT++; _barSync();
   try {
-    const steps = $("risk-cooldown-steps").value.split(/[,，\s]+/).filter(Boolean).map(Number);
-    if (!steps.length || steps.some(v => !Number.isFinite(v) || v <= 0)) throw new Error("冷却阶梯需要填写有效的分钟数");
+    const stepsField = $("risk-cooldown-steps");
+    const steps = stepsField.value.split(/[,，\s]+/).filter(Boolean).map(Number);
+    if (!steps.length || steps.length > 8 || steps.some(v => !Number.isFinite(v) || v <= 0)) {
+      _revealRiskField(stepsField);
+      throw new Error("阶梯冷却时长需要填写 1–8 个正数（分钟）");
+    }
+    const stepSeconds = steps.map(v => Math.round(v * 60));
+    for (let i = 1; i < stepSeconds.length; i++) {
+      if (stepSeconds[i] < stepSeconds[i - 1]) {
+        _revealRiskField(stepsField);
+        throw new Error("阶梯冷却时长须按由短到长排列（例如 30, 120, 360, 1440）");
+      }
+    }
     const r = {
-      enabled: $("risk-enabled").checked, mode: $("risk-mode").value,
+      enabled: $("risk-enabled").checked,
+      mode: "custom",
+      cooldown_enabled: $("risk-cooldown-enabled").checked,
+      write_limits_enabled: $("risk-write-limits-enabled").checked,
+      pacing_enabled: $("risk-pacing-enabled").checked,
+      network_guard_enabled: $("risk-network-guard-enabled").checked,
+      jitter_enabled: $("risk-jitter-enabled").checked,
       network_group_concurrency: riskNumber("risk-network-concurrency"),
-      read_light_gap_seconds: riskNumber("risk-read-light"), read_heavy_gap_seconds: riskNumber("risk-read-heavy"),
-      operation_gap_min_seconds: riskNumber("risk-operation-min"), operation_gap_max_seconds: riskNumber("risk-operation-max"),
+      read_light_gap_seconds: riskNumber("risk-read-light"),
+      read_heavy_gap_seconds: riskNumber("risk-read-heavy"),
+      operation_gap_min_seconds: riskNumber("risk-operation-min"),
+      operation_gap_max_seconds: riskNumber("risk-operation-max"),
       session_operation_limit: riskNumber("risk-session-limit"),
-      session_rest_min_seconds: riskNumber("risk-rest-min"), session_rest_max_seconds: riskNumber("risk-rest-max"),
+      session_rest_min_seconds: riskNumber("risk-rest-min"),
+      session_rest_max_seconds: riskNumber("risk-rest-max"),
       network_retry_jitter_seconds: riskNumber("risk-retry-jitter"),
       shared_write_gap_seconds: riskNumber("risk-shared-write", 60),
-      cooldown_steps_seconds: steps.map(v => Math.round(v * 60)),
-      recovery_successes: riskNumber("risk-recovery-count"), recovery_probe_gap_seconds: riskNumber("risk-probe-gap", 60),
+      cooldown_steps_seconds: stepSeconds,
+      recovery_successes: riskNumber("risk-recovery-count"),
+      recovery_probe_gap_seconds: riskNumber("risk-probe-gap", 60),
       event_retention_days: riskNumber("risk-retention"),
       network_group_risk_accounts: riskNumber("risk-network-accounts"),
       network_group_risk_window_seconds: riskNumber("risk-network-window", 60),
       network_group_cooldown_seconds: riskNumber("risk-network-cooldown", 60),
-      combined_action_hourly_cap: riskNumber("risk-combined-hourly"), combined_action_daily_cap: riskNumber("risk-combined-daily"),
+      combined_action_hourly_cap: riskNumber("risk-combined-hourly"),
+      combined_action_daily_cap: riskNumber("risk-combined-daily"),
     };
-    if (r.operation_gap_max_seconds < r.operation_gap_min_seconds) throw new Error("跨功能间隔上限应不小于下限");
-    if (r.session_rest_max_seconds < r.session_rest_min_seconds) throw new Error("休息上限应不小于下限");
+    if (r.operation_gap_max_seconds < r.operation_gap_min_seconds) {
+      _revealRiskField($("risk-operation-max"));
+      throw new Error("跨功能最大间隔应不小于最小间隔");
+    }
+    if (r.session_rest_max_seconds < r.session_rest_min_seconds) {
+      _revealRiskField($("risk-rest-max"));
+      throw new Error("休息最长时长应不小于最短时长");
+    }
     ["comment", "social", "dm", "publish"].forEach(key => {
       r[`${key}_min_gap_seconds`] = riskNumber(`risk-${key}-gap`, 60);
       r[`${key}_hourly_cap`] = riskNumber(`risk-${key}-hourly`);
@@ -3135,21 +4594,41 @@ async function saveRiskConfig() {
     });
     const schedule = {
       quiet_hours_enabled: $("risk-quiet-enabled").checked,
-      active_hours_start: riskNumber("risk-active-start"), active_hours_end: riskNumber("risk-active-end"),
+      quiet_hours_include_reads: $("risk-quiet-include-reads").checked,
+      quiet_hours_wake_jitter_minutes: riskNumber("risk-quiet-jitter"),
+      active_hours_start: riskNumber("risk-active-start"),
+      active_hours_end: riskNumber("risk-active-end"),
       account_check_interval_seconds: riskNumber("risk-account-check", 60),
       douyin_captcha_wait_seconds: riskNumber("risk-captcha-wait", 60),
       scan_jitter: riskNumber("risk-scan-jitter") / 100,
       comment_jitter: riskNumber("risk-comment-jitter") / 100,
       xhs_dm_poll_jitter: riskNumber("risk-dm-poll-jitter") / 100,
       initial_scan_spread_seconds: riskNumber("risk-initial-spread"),
+      native_write_gate_enabled: $("risk-native-gate-enabled").checked,
+      native_write_require_system_chrome: $("risk-native-chrome").checked,
+      native_write_require_verified_proxy: $("risk-native-proxy").checked,
+      native_write_proxy_max_age_seconds: riskNumber("risk-native-proxy-age", 3600),
     };
-    msg.textContent = "保存中…";
+    if (schedule.active_hours_end <= schedule.active_hours_start) {
+      _revealRiskField($("risk-active-end"));
+      throw new Error("活跃结束小时必须晚于开始小时");
+    }
+    setRiskConfigMsg("保存中…");
     RISK_CONFIG = await api("/api/risk-control/config", {
-      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ risk_control: r, schedule }),
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ risk_control: r, schedule }),
     });
-    fillRiskConfig(RISK_CONFIG); msg.textContent = "已保存并生效"; toast("风控规则已保存并立即生效", "ok");
+    const woken = Number(RISK_CONFIG.woken_tasks || 0);
+    fillRiskConfig(RISK_CONFIG);
+    setRiskConfigMsg(woken ? `已保存并生效（已放行 ${woken} 条等待任务）` : "已保存并生效", "ok");
+    toast(woken ? `风控规则已保存并生效，已自动放行 ${woken} 条等待任务` : "风控规则已保存并立即生效", "ok");
+    globalThis.CreatorHubEngineSettings?.load?.();
     await refreshRiskCenter();
-  } catch (e) { msg.textContent = e.message; toast("保存失败：" + e.message, "err"); }
+  } catch (e) {
+    setRiskConfigMsg(e.message, "err");
+    toast("保存失败：" + e.message, "err");
+  }
   finally { INFLIGHT--; restore(); _barSync(); }
 }
 
@@ -3167,7 +4646,9 @@ async function probeRiskAccount(accountId) {
 }
 
 async function clearRiskAccount(accountId) {
-  const nickname = RISK_ACCOUNTS.find(account => account.account_id === accountId)?.nickname || `账号 ${accountId}`;
+  const nickname = RISK_ACCOUNTS.find(account => account.account_id === accountId)?.nickname
+    || ACCOUNTS.find(account => account.id === accountId)?.nickname
+    || `账号 ${accountId}`;
   const reason = await uiPrompt({
     title: "填写解除原因",
     hint: `请说明已对「${nickname}」完成的人工检查。该内容会进入审计记录。`,
@@ -3181,7 +4662,9 @@ async function clearRiskAccount(accountId) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ confirmed: true, reason: reason.trim() }),
     });
-    toast(`账号风控状态已解除${result.woken_tasks ? `，已唤醒 ${result.woken_tasks} 条任务` : ""}`, "ok"); await refreshRiskCenter();
+    toast(`账号风控状态已解除${result.woken_tasks ? `，已唤醒 ${result.woken_tasks} 条任务` : ""}`, "ok");
+    await refreshRiskCenter();
+    if (CURRENT_TAB === "collections") await refreshCollections();
   } catch (e) { toast("解除失败：" + e.message, "err"); }
 }
 
@@ -3226,6 +4709,7 @@ document.addEventListener("keydown", event => {
   if (event.key === "Escape" && $("risk-event-modal")?.style.display !== "none") hideRiskEvents();
 });
 
+// 07-account-hub.js — 账号中心（本账号作品、关注列表、粉丝列表与异步同步进度）。
 // ═══════════ 账号管理(独立面板:我的作品 / 关注 / 粉丝 / 私信)═══════════
 // 当前操作的账号 id —— 按平台各记各的,切平台不串号、不串数
 let HUB_ACC = "";
@@ -3238,12 +4722,13 @@ function loadHubAcc() { try { HUB_ACC = localStorage.getItem(hubAccKey()) || "";
 function setHubAcc(id) { HUB_ACC = String(id || ""); try { localStorage.setItem(hubAccKey(), HUB_ACC); } catch (e) {} if (HUB_TAB === "dm") startDmStream(); }
 
 // 用该账号登录态弹出真实浏览器窗口,留给用户手动操作(收发私信 / 维护 / F12 抓接口)
-async function openAccountBrowser(id) {
+async function openAccountBrowser(id, url = "") {
   await withBusy(evtBtn(), "打开中", async () => {
     try {
-      const result = await api("/api/accounts/" + id + "/open-browser", { method: "POST" });
+      const qs = url ? "?url=" + encodeURIComponent(url) : "";
+      const result = await api("/api/accounts/" + id + "/open-browser" + qs, { method: "POST" });
       const checkHint = result.environment_check_opened
-        ? " 已同时打开 BrowserScan 环境体检标签。" : "";
+        ? " 已同时打开浏览器环境体检标签。" : "";
       if (result.logged_out) {
         toast("该账号登录态已失效，请关闭当前窗口后点「重新登录」完成扫码。" + checkHint, "err", 8000);
         refreshAccounts();
@@ -3255,6 +4740,7 @@ async function openAccountBrowser(id) {
         const scope = result.login_scope === "creator" ? "创作平台" : "主站读取";
         toast("已弹出该账号" + scope + "浏览器窗口;用完请关窗(关窗即保存登录态)。窗口开着时该账号后台同步会暂停。" + checkHint, "ok", 7000);
       }
+      window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
     } catch (e) { toast("打开失败:" + e.message, "err"); }
   });
 }
@@ -3262,15 +4748,15 @@ async function openAccountBrowser(id) {
 async function checkBrowserEnvironment(id) {
   const btn = evtBtn();
   const confirmed = await uiConfirm({
-    title: "打开第三方环境检测",
-    message: "将在该账号的独立指纹环境中访问 BrowserScan。该站点会看到当前出口 IP 和浏览器指纹；检测结果仅用于环境核对，不代表平台风控一定通过。",
+    title: "打开浏览器环境检测",
+    message: "将在该账号的独立指纹环境中打开外部环境检测页。检测站点会读取当前出口 IP 和浏览器特征；结果仅用于环境核对，不代表平台风控一定通过。",
     okText: "打开检测页",
   });
   if (!confirmed) return;
   await withBusy(btn, "打开中", async () => {
     try {
       await api("/api/accounts/" + id + "/environment-check", { method: "POST" });
-      toast("BrowserScan 已在该账号独立环境中打开，请核对 IP、时区、WebRTC 与指纹一致性", "ok", 8000);
+      toast("环境检测页已在该账号独立环境中打开，请核对 IP、时区、WebRTC 与指纹一致性", "ok", 8000);
       await refreshAccounts();
     } catch (e) {
       toast("环境检测打开失败:" + e.message, "err", 8000);
@@ -3284,20 +4770,46 @@ function openHubAccountBrowser() {
   openAccountBrowser(+HUB_ACC);
 }
 
-// 从「账号」面板某行跳转查看该账号的本账号数据(作品/关注/粉丝/私信)
+// 从「账号」面板或跨平台矩阵跳转查看该账号的本账号数据(作品/关注/粉丝/私信)
 function openAccountHub(id) {
+  const targetAcc = typeof findAnyAccount === "function" ? findAnyAccount(id) : null;
+  if (targetAcc && targetAcc.platform && (GLOBAL_MODE || targetAcc.platform !== PLATFORM)) {
+    GLOBAL_MODE = false;
+    PLATFORM = targetAcc.platform;
+    try {
+      localStorage.setItem("dym-global", "0");
+      localStorage.setItem("dym-pf", PLATFORM);
+    } catch (e) {}
+    ACCOUNTS = ALL_ACCOUNTS.filter(a => a.platform === PLATFORM);
+    applyPlatformUI();
+    populateHubAccounts();
+  }
   setHubAcc(id);
   const s = $("hub-acc"); if (s) { s.value = HUB_ACC; if (s._csSync) s._csSync(); }
   DM_CONV = null;
   DM_NEW_TARGET = "";
+  window.dispatchEvent(new CustomEvent("creatorhub:hub-mode", { detail: { mode: "single", accountId: Number(id) } }));
   refreshHubSummary();
-  switchTab("hub");
+  switchTab("hub", true);
   switchHubTab("myworks");   // 默认落到「我的作品」,可再切关注/粉丝/私信
 }
 function openAggregatedDm(accountId, convId) {
+  const targetAcc = typeof findAnyAccount === "function" ? findAnyAccount(accountId) : null;
+  if (targetAcc && targetAcc.platform && (GLOBAL_MODE || targetAcc.platform !== PLATFORM)) {
+    GLOBAL_MODE = false;
+    PLATFORM = targetAcc.platform;
+    try {
+      localStorage.setItem("dym-global", "0");
+      localStorage.setItem("dym-pf", PLATFORM);
+    } catch (e) {}
+    ACCOUNTS = ALL_ACCOUNTS.filter(a => a.platform === PLATFORM);
+    applyPlatformUI();
+    populateHubAccounts();
+  }
   setHubAcc(accountId);
   const select = $("hub-acc"); if (select) { select.value = HUB_ACC; select._csSync?.(); }
-  switchTab("hub");
+  window.dispatchEvent(new CustomEvent("creatorhub:hub-mode", { detail: { mode: "single", accountId: Number(accountId) } }));
+  switchTab("hub", true);
   switchHubTab("dm");
   setTimeout(async () => { await refreshDmConvs(); await openDmConv(convId); }, 0);
 }
@@ -3342,7 +4854,7 @@ function switchHubTab(name) {
 // 计数徽章:纯查库汇总,进面板/换账号/切平台即刷新,不用点进子页才有数
 async function refreshHubSummary() {
   const isCurrent = beginViewRequest("hub-summary", () => String(HUB_ACC));
-  const ids = { works: "hb-myworks", following: "hb-following", fans: "hb-fans", dm: "hb-dm" };
+  const ids = { works: "hb-myworks", following: "hb-following", fans: "hb-fans", dm: "hb-dm", stats: "hb-stats" };
   const setAll = r => Object.entries(ids).forEach(([k, i]) => { const el = $(i); if (el) el.textContent = (r && r[k]) || 0; });
   if (!HUB_ACC) { setAll(null); return; }
   try { const data = await api("/api/hub/summary?account_id=" + HUB_ACC); if (isCurrent()) setAll(data); }
@@ -3358,7 +4870,7 @@ function refreshHubPanel() {
   else if (HUB_TAB === "stats") loadHubStats();
 }
 
-// ── 本账号数据分析(B4)──
+// ── 本账号数据分析 ──
 function _kpiCard(label, val, delta) {
   const d = (delta === undefined || delta === null || delta === 0) ? ""
     : `<span class="kpi-delta ${delta > 0 ? "pos" : "neg"}">较上次 ${delta > 0 ? "+" : "−"}${fmtNum(Math.abs(delta))}</span>`;
@@ -3399,9 +4911,12 @@ async function loadHubStats() {
         + `<div class="spark-wrap" role="img" aria-label="${summary}">${_spark(vals)}</div></div>`;
     }
     if (wb) wb.innerHTML = (d.works || []).length
-      ? d.works.map(w => `<tr><td>${esc((w.desc || w.item_id || "").slice(0, 30))}</td>`
-        + `<td class="num">${fmtNum(w.play_count || 0)}</td><td class="num">${fmtNum(w.like_count || 0)}</td><td class="num">${fmtNum(w.comment_count || 0)}</td>`
-        + `<td><span class="pill bare">${esc(w.status || "—")}</span></td></tr>`).join("")
+      ? d.works.map(w => {
+        const fullTitle = w.desc || w.item_id || "无描述";
+        return `<tr><td class="wrap" style="max-width:340px"><span class="content-desc-text clickable" title="${esc(fullTitle)}" onclick="openWork(${jsArg(w.platform || PLATFORM)},${jsArg(w.item_id)})">${esc(fullTitle)}</span></td>`
+          + `<td class="num">${fmtNum(w.play_count || 0)}</td><td class="num">${fmtNum(w.like_count || 0)}</td><td class="num">${fmtNum(w.comment_count || 0)}</td>`
+          + `<td><span class="pill bare">${esc(w.status || "—")}</span></td></tr>`;
+      }).join("")
       : `<tr><td colspan="5" class="mut">暂无作品数据,先到「我的作品」点「同步作品」</td></tr>`;
   } catch (e) { if (!isCurrent()) return;
     kpi.innerHTML = `<div class="mut">加载失败:${esc(e.message)}</div>`;
@@ -3428,6 +4943,7 @@ async function refreshMyWorks() {
 function workLink(platform, id) {
   id = encodeURIComponent(id);
   if (platform === "xhs") return "https://www.xiaohongshu.com/explore/" + id;
+  if (platform === "rednote") return "https://www.rednote.com/zh/discovery/item/" + id;
   if (platform === "kuaishou") return "https://www.kuaishou.com/short-video/" + id;
   if (platform === "shipinhao") return "https://channels.weixin.qq.com/platform/post/list";
   if (platform === "tiktok") {
@@ -3442,6 +4958,17 @@ function workLink(platform, id) {
     if (/^av\d+$/i.test(raw)) return "https://www.bilibili.com/video/" + encodeURIComponent(raw.toLowerCase());
     if (/^\d{15,}$/.test(raw)) return "https://www.bilibili.com/opus/" + encodeURIComponent(raw);
     return "https://www.bilibili.com/video/av" + id;
+  }
+  if (platform === "twitter") {
+    return "https://x.com/i/web/status/" + id;
+  }
+  if (platform === "facebook") {
+    const raw = decodeURIComponent(id);
+    if (/^https?:\/\//i.test(raw)) return raw;
+    return "https://www.facebook.com/" + id;
+  }
+  if (platform === "instagram") {
+    return "https://www.instagram.com/p/" + id + "/";
   }
   return "https://www.douyin.com/video/" + id;
 }
@@ -3468,6 +4995,7 @@ function workCard(w) {
       <div class="ncard-actions">
         ${w.platform === "douyin" ? `<button class="ghost sm" onclick="monitorOwnWorkDanmaku(${jsArg(w.item_id)},${Number(w.account_id) || "null"})">${ic("i-msg")}弹幕</button>` : ""}
         <button class="ghost sm" onclick="openWorkComments(${Number(w.id)},${jsArg(w.platform)},${jsArg(w.desc || "无描述")})">${ic("i-msg")}评论</button>
+        ${w.platform === "rednote" ? `<button class="ghost sm" onclick="toggleRednoteWorkVisibility(${Number(w.id)},${jsArg(w.status || "")})">${w.status === "仅自己可见" ? "设为公开" : "设为私密"}</button><button class="ghost sm danger" onclick="deleteRednoteWork(${Number(w.id)})">${ic("i-trash")}</button>` : ""}
       </div>
     </div>
   </div>`;
@@ -3482,6 +5010,25 @@ function monitorOwnWorkDanmaku(itemId, accountId) {
   if ($("d-w-acc") && accountId) $("d-w-acc").value = String(accountId);
   toast("已填入作品 ID，请确认后开始弹幕监控", "info", 5000);
 }
+async function toggleRednoteWorkVisibility(workId, currentStatus) {
+  const nextVis = currentStatus === "仅自己可见" ? "public" : "private";
+  try {
+    await api(`/api/account-works/${workId}/rednote-visibility`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ visibility: nextVis }),
+    });
+    toast(nextVis === "private" ? "已设为仅自己可见" : "已设为公开可见", "ok");
+    refreshMyWorks();
+  } catch (e) { toast("修改可见性失败:" + e.message, "err"); }
+}
+async function deleteRednoteWork(workId) {
+  if (!await uiConfirm({ title: "删除海外小红书笔记", message: "确定从海外小红书平台删除这条已发布笔记吗？删除后不可恢复。", okText: "删除笔记", danger: true })) return;
+  try {
+    await api(`/api/account-works/${workId}/rednote-delete`, { method: "DELETE" });
+    toast("已从海外小红书删除该笔记", "ok");
+    refreshMyWorks();
+  } catch (e) { toast("删除失败:" + e.message, "err"); }
+}
 async function syncMyWorks() {
   if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
   await withBusy(evtBtn(), "同步中", async () => {
@@ -3493,6 +5040,9 @@ async function syncMyWorks() {
     catch (e) { toast("同步失败:" + e.message, "err"); }
   });
   refreshMyWorks();
+  refreshHubSummary();
+  if (typeof refreshAccounts === "function") refreshAccounts();
+  window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
 }
 
 // ── 作品评论(弹窗:抖音直连分页 / 小红书客户端 / 快手拦截,落库后展示)──
@@ -3578,7 +5128,7 @@ function renderFollowPager(direction, payload) {
   if (buttons[1]) buttons[1].disabled = state.page >= state.pages;
   const synced = $(`${prefix}-synced-at`);
   if (synced) synced.textContent = payload.synced_at ? `同步于 ${fmtTime(payload.synced_at)}` : "";
-  pager.hidden = state.total <= FOLLOW_PAGE_SIZE;
+  pager.hidden = state.total <= 0;
 }
 function changeFollowPage(direction, delta) {
   const state = FOLLOW_STATE[direction];
@@ -3599,9 +5149,11 @@ function renderFollowSyncStatus(direction, job) {
   const fetched = Math.max(0, Number(job.fetched || 0));
   const expected = Math.max(0, Number(job.expected_total || 0));
   const saved = Math.max(0, Number(job.saved || 0));
+  const cappedNote = job.status === "completed" && (job.capped || (expected > fetched && fetched > 0))
+    ? "（平台仅返回可见用户）" : "";
   const detail = job.phase === "saving"
     ? `已写入 ${fmtNum(saved)} / ${fmtNum(fetched)} 条`
-    : expected ? `已获取 ${fmtNum(fetched)} / 约 ${fmtNum(expected)} 条 · ${fmtNum(job.pages || 0)} 页`
+    : expected ? `已获取 ${fmtNum(fetched)} / 约 ${fmtNum(expected)} 条${cappedNote} · ${fmtNum(job.pages || 0)} 页`
       : `已获取 ${fmtNum(fetched)} 条 · ${fmtNum(job.pages || 0)} 页`;
   const percent = job.percent == null ? 0 : Math.max(0, Math.min(100, Number(job.percent)));
   const error = job.error ? `<div class="mut" style="margin-top:6px;color:var(--danger)">${esc(job.error)}</div>` : "";
@@ -3623,6 +5175,8 @@ async function pollFollowSync(direction, jobId) {
           toast(`同步完成:共 ${fmtNum(job.saved || job.fetched || 0)} 条,新增 ${fmtNum(job.added || 0)}${transportSourceSuffix(job.source)}`, "ok", 5000);
           await refreshFollows(direction, 1);
           refreshHubSummary();
+          if (typeof refreshAccounts === "function") refreshAccounts();
+          window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
         } else if (job.status === "failed") toast("同步失败:" + (job.error || "未知错误"), "err");
         else if (job.status === "deferred") toast("同步暂缓:" + (job.error || "操作间隔尚未结束"), "info", 5000);
         return;
@@ -3681,7 +5235,7 @@ function followRow(f, direction) {
     : `<button class="ghost sm" onclick="actFollow('follow',${f.id})">回关</button>`;
   return `<tr>
     <td><div class="fu-cell">
-      ${f.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(f.avatar))}" referrerpolicy="no-referrer" alt="">` : `<span class="avatar"></span>`}
+      ${f.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(f.avatar))}" referrerpolicy="no-referrer" alt="">` : `<span class="wb-avatar-fallback" style="width:36px;height:36px;flex:0 0 36px;font-size:15px" aria-hidden="true">${esc((f.nickname || "用").slice(0, 1))}</span>`}
       <div><div><b>${esc(f.nickname)}</b></div>${f.signature ? `<div class="fu-sign">${esc(f.signature)}</div>` : ""}</div>
     </div></td>
     <td>${rel}</td>
@@ -3740,6 +5294,7 @@ async function actFollow(action, edgeId) {
   if (HUB_ACC === accountId) refreshFollows(dir);
 }
 
+// 08-dm-center.js — 私信会话收件箱、SSE 实时消息流、历史消息拉取与自动回复规则。
 // ── 私信 ──
 // ─── 私信实时接收(SSE):进 DM 面板订阅,新消息即时刷新;离开断开 ───
 let DM_SSE = null, DM_SSE_ACC = "", DM_AUTO_TASKS = [], DM_AUTO_RULES = [], DM_REFRESH_TIMER = null;
@@ -3960,10 +5515,10 @@ function markDmRead(convId) {
 function dmVideoCard(c) {
   const url = c.item_id ? `https://www.douyin.com/video/${encodeURIComponent(c.item_id)}` : "#";
   const cover = c.cover
-    ? `<img src="${esc(c.cover)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+    ? `<img src="${esc(safeMediaUrl(c.cover))}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
     : "";
   const avatar = c.avatar
-    ? `<img class="av" src="${esc(c.avatar)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
+    ? `<img class="av" src="${esc(safeMediaUrl(c.avatar))}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">`
     : "";
   return `<a class="dm-vcard" href="${url}" target="_blank" rel="noopener">
     <div class="cov">${cover}<span class="play">▶</span></div>
@@ -4078,7 +5633,7 @@ function populateWatchAccount() {
   const xhs = PLATFORM === "xhs";
   const tiktok = PLATFORM === "tiktok";
   const channels = PLATFORM === "shipinhao";
-  const required = xhs || tiktok;
+  const required = xhs || PLATFORM === "rednote" || tiktok;
   const creatorOnly = PLATFORM === "douyin" && $("w-mode") && $("w-mode").value === "creator";
   const list = tiktok
     ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
@@ -4143,7 +5698,7 @@ async function refreshProfile(id) {
         toast("\u672c\u6b21\u672a\u6267\u884c\u8d44\u6599\u5237\u65b0:" + (r.reason || "\u8d26\u53f7\u5f53\u524d\u4e0d\u53ef\u63a2\u6d4b"), "info");
         return;
       }
-      if ((r.platform || PLATFORM) === "xhs" && r.login_scope === "creator" && !r.has_read_login) {
+      if (["xhs", "rednote"].includes(r.platform || PLATFORM) && r.login_scope === "creator" && !r.has_read_login) {
         toast("创作平台登录有效，资料已更新；主站读取登录尚未配置", "info", 8000);
         return;
       }
@@ -4152,57 +5707,59 @@ async function refreshProfile(id) {
         : refreshedPlatform === "kuaishou" ? " · 快手号 "
         : refreshedPlatform === "shipinhao" ? " · 视频号 "
         : refreshedPlatform === "tiktok" ? " · TikTok号 "
-        : refreshedPlatform === "bilibili" ? " · UID " : " · 抖音号 ";
+        : refreshedPlatform === "rednote" ? " · Rednote号 " : refreshedPlatform === "bilibili" ? " · UID " : " · 抖音号 ";
       toast("\u8d44\u6599\u5df2\u66f4\u65b0\uff0c\u767b\u5f55\u72b6\u6001\u5df2\u6062\u590d:" + (r.nickname || "") + (r.douyin_id ? idLbl + r.douyin_id : ""), "ok");
     } catch (e) {
       toast("\u5237\u65b0\u5931\u8d25:" + e.message, "err");
     }
   });
   await refreshAccounts();
+  window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
 }
 async function setProxy(id) {
-  const a = ACCOUNTS.find(x => x.id === id);
-  let opts = [];
-  try { opts = await api("/api/proxies/options"); } catch (e) { }
+  const a = findAnyAccount(id);
   const cur = a && a.has_proxy ? a.proxy : "";
-  const options = [
-    { value: "auto", label: "🔀 自动分配(占用最少)" },
-    ...opts.map(p => ({ value: p.url, label: formatProxyOptionLabel(p, a ? a.platform : PLATFORM) })),
-    { value: "__custom__", label: "✎ 手动输入地址…" },
-    { value: "", label: "🚫 清除代理(走真实 IP)" },
-  ];
-  const v = await uiSelect({
-    title: "账号代理",
-    hint: (a ? a.nickname + " · " : "") + "当前:" + (cur || "未配置"),
-    options, value: (cur && opts.some(o => o.value === cur)) ? cur : "auto",
+  const curId = a ? a.proxy_id : null;
+  const pf = a ? a.platform : PLATFORM;
+  const pfLabel = (typeof PF_NAME !== "undefined" && PF_NAME[pf]) ? PF_NAME[pf] : (pf || "当前平台");
+  let apiResult = null;
+  const choice = await uiProxyPicker({
+    title: `账号代理配置${a && a.nickname ? " · " + a.nickname : ""}`,
+    hint: `所属平台：${pfLabel}。建议尽量保持「一号一独立代理」；切换代理后会自动关闭该账号当前常驻浏览器上下文，下次任务使用新网络出口。`,
+    platform: pf,
+    currentProxy: cur,
+    currentProxyId: curId,
+    isAccountEdit: true,
+    okText: "保存代理配置",
+    busyText: "保存中",
+    submit: async picked => {
+      if (picked.mode === "auto") {
+        apiResult = await api("/api/accounts/" + id + "/assign-proxy", { method: "POST" });
+      } else {
+        apiResult = await api("/api/accounts/" + id + "/proxy", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ proxy: picked.proxy }),
+        });
+      }
+    },
   });
-  if (v === null) return;
-  try {
-    if (v === "auto") {
-      const r = await api("/api/accounts/" + id + "/assign-proxy", { method: "POST" });
-      toast("已从代理池分配:" + r.proxy, "ok");
-    } else if (v === "__custom__") {
-      const url = await uiPrompt({
-        title: "手动输入代理", value: cur,
-        hint: "http://user:pass@host:port 或 socks5://host:port;留空=清除",
-        placeholder: "http://user:pass@host:port" });
-      if (url === null) return;
-      const r = await api("/api/accounts/" + id + "/proxy", {
-        method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ proxy: url.trim() }) });
-      toast(url.trim() ? "代理已设置:" + r.proxy : "代理已清除", "ok");
-    } else {
-      const r = await api("/api/accounts/" + id + "/proxy", {
-        method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ proxy: v }) });
-      toast(v ? "代理已设置:" + r.proxy : "代理已清除", "ok");
-    }
-    refreshAccounts(); refreshProxies();
-  } catch (e) { toast("设置失败:" + e.message, "err"); }
+  if (!choice || !apiResult) return;
+  if (choice.mode === "auto") {
+    toast("已从代理池分配：" + apiResult.proxy, "ok");
+  } else {
+    toast(choice.proxy ? "代理已设置：" + apiResult.proxy : "已清除代理，当前改用本机直连", "ok");
+  }
+  if (apiResult.warning) {
+    setTimeout(() => toast("⚠️ " + apiResult.warning, "info", 7000), 280);
+  }
+  refreshAccounts();
+  refreshProxies();
+  window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
 }
 
 async function setBrowserBackend(id) {
-  const account = ACCOUNTS.find(item => item.id === id);
+  const account = findAnyAccount(id);
   if (!account) return;
   let catalog;
   try {
@@ -4211,16 +5768,15 @@ async function setBrowserBackend(id) {
     toast("读取浏览器环境失败:" + e.message, "err");
     return;
   }
-  const localOnly = account.platform === "xhs";
-  const options = browserChoiceOptions(catalog, { localOnly });
-  const currentChoice = localOnly ? "local"
-    : account.browser_backend === "fingerprint_chromium" && account.browser_runtime_id
+  const isXhs = account.platform === "xhs";
+  const options = browserChoiceOptions(catalog, { localOnly: false });
+  const currentChoice = account.browser_backend === "fingerprint_chromium" && account.browser_runtime_id
     ? `fingerprint_chromium::${account.browser_runtime_id}`
-    : (account.browser_backend || "default");
+    : (account.browser_backend || (isXhs ? "local" : "default"));
   const selected = await uiSelect({
     title: "账号浏览器环境",
-    hint: localOnly
-      ? `${account.nickname} · 小红书固定使用系统 Chrome/CDP 原生环境。`
+    hint: isXhs
+      ? `${account.nickname} · 单号推荐系统 Chrome/CDP；同机多小红书号推荐切换至 Fingerprint Chromium 隔离硬件指纹。`
       : `${account.nickname} · 切换时会关闭该账号当前浏览器，下次任务使用新内核。`,
     options,
     value: currentChoice,
@@ -4238,6 +5794,7 @@ async function setBrowserBackend(id) {
     });
     toast("浏览器环境已切换：" + loginEnvironmentText(result.environment), "ok");
     refreshAccounts();
+    window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
   } catch (e) {
     toast("切换失败:" + e.message, "err");
   }
@@ -4560,7 +6117,7 @@ function uiFingerprintEditor(account, fp, options = {}) {
 }
 
 async function manageFingerprint(id) {
-  const account = ACCOUNTS.find(item => item.id === id);
+  const account = findAnyAccount(id);
   if (!account) return;
   let current;
   try { current = await api(`/api/accounts/${id}/fingerprint`); }
@@ -4585,16 +6142,23 @@ async function manageFingerprint(id) {
       const result = await api(`/api/accounts/${id}/fingerprint/from-ip`, { method: "POST" });
       toast(`已恢复自动指纹：${result.fingerprint.fingerprint_id || "-"}`, "ok", 7000);
       await refreshAccounts();
+      window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
     } catch (e) { toast("自动生成失败:" + e.message, "err", 8000); }
     return;
   }
   toast(`指纹已保存：${savedFingerprint?.fingerprint?.fingerprint_id || "-"}`, "ok", 7000);
   await refreshAccounts();
+  window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
 }
 
+// 09-proxies-settings.js — 代理池增删改查、连通性归属地探测、兼容矩阵与全局下载/AI 设置。
 // ─── 代理池 ───
 let PROXIES = [];
 let LAST_DETECT = null;   // {url, geo} 判别结果,加入池时一并带上归属地
+let PROXY_FILTER = "all";
+const SELECTED_PROXY_IDS = new Set();
+const PROXY_TESTING_IDS = new Set();
+
 function dismissProxyFormatHelp(event) {
   const help = $("px-format-help");
   if (!help?.open) return;
@@ -4604,17 +6168,11 @@ function dismissProxyFormatHelp(event) {
     $("px-format-toggle")?.focus();
     event.preventDefault();
     event.stopPropagation();
-  } else if (!help.contains(event.target)) {
-    help.open = false;
   }
 }
 function syncProxyFormatHelp(help) {
-  // Native details provides keyboard toggling and expanded-state semantics.
-  // Only listen while open; outside click, focus exit and Escape dismiss it.
   const method = help.open ? "addEventListener" : "removeEventListener";
-  for (const type of ["pointerdown", "focusin", "keydown"]) {
-    document[method](type, dismissProxyFormatHelp, true);
-  }
+  document[method]("keydown", dismissProxyFormatHelp, true);
 }
 function proxyInputOptions() {
   return {
@@ -4622,158 +6180,635 @@ function proxyInputOptions() {
     input_format: $("px-format")?.value || "auto",
   };
 }
+function suggestGeoLabel(g, existingLabels = new Set()) {
+  if (!g) return "";
+  const parts = [g.country, g.city || g.region].map(x => String(x || "").trim()).filter(Boolean);
+  const base = parts.join("·");
+  if (!base) return "";
+  if (!existingLabels.has(base)) return base;
+  let seq = 2;
+  while (existingLabels.has(`${base}-${String(seq).padStart(2, "0")}`)) seq++;
+  return `${base}-${String(seq).padStart(2, "0")}`;
+}
+function showProxyDetectBanner(message, tone = "neutral") {
+  const el = $("px-detect-banner");
+  if (!el) return;
+  if (!message) { el.hidden = true; el.innerHTML = ""; return; }
+  el.hidden = false;
+  if (tone === "ok" || tone === "err") el.dataset.tone = tone;
+  else el.removeAttribute("data-tone");
+  el.innerHTML = `<span>${esc(message)}</span><button type="button" class="ghost sm" style="min-height:22px;padding:1px 6px" onclick="showProxyDetectBanner('')">关闭</button>`;
+}
+function filteredPoolProxies() {
+  return PROXIES.filter(p => {
+    if (PROXY_FILTER === "ok") return p.enabled !== false && p.status === "ok";
+    if (PROXY_FILTER === "idle") return p.enabled !== false && !Number(p.used_by || 0);
+    if (PROXY_FILTER === "bound") return Number(p.used_by || 0) > 0;
+    if (PROXY_FILTER === "mainland") return Boolean(p.geo_checked && p.is_mainland);
+    if (PROXY_FILTER === "overseas") return Boolean(p.geo_checked && !p.is_mainland);
+    if (PROXY_FILTER === "issue") return p.enabled === false || ["bad", "auth_error", "blocked", "unknown"].includes(p.status);
+    return true;
+  });
+}
+function syncProxyBatchBar() {
+  const validIds = new Set(PROXIES.map(p => p.id));
+  for (const id of [...SELECTED_PROXY_IDS]) {
+    if (!validIds.has(id)) SELECTED_PROXY_IDS.delete(id);
+  }
+  const bar = $("px-batch-bar");
+  const cnt = $("px-sel-count");
+  if (cnt) cnt.textContent = String(SELECTED_PROXY_IDS.size);
+  if (bar) bar.hidden = SELECTED_PROXY_IDS.size === 0;
+  const checkAll = $("px-check-all");
+  if (checkAll) {
+    const visible = filteredPoolProxies();
+    const selVisible = visible.filter(p => SELECTED_PROXY_IDS.has(p.id)).length;
+    checkAll.checked = visible.length > 0 && selVisible === visible.length;
+    checkAll.indeterminate = selVisible > 0 && selVisible < visible.length;
+  }
+}
+function setProxyPoolFilter(flt) {
+  PROXY_FILTER = flt || "all";
+  renderProxyPoolView();
+}
+function onRowProxySelect(id, checked) {
+  if (checked) SELECTED_PROXY_IDS.add(Number(id));
+  else SELECTED_PROXY_IDS.delete(Number(id));
+  syncProxyBatchBar();
+}
+function toggleSelectAllProxies(checked) {
+  filteredPoolProxies().forEach(p => {
+    if (checked) SELECTED_PROXY_IDS.add(p.id);
+    else SELECTED_PROXY_IDS.delete(p.id);
+  });
+  renderProxyPoolView();
+}
+function clearProxySelection() {
+  SELECTED_PROXY_IDS.clear();
+  renderProxyPoolView();
+}
+async function copyPoolProxyUrl(id) {
+  const p = PROXIES.find(x => x.id === id);
+  const text = p && (p.url_full || p.url);
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("已复制完整代理地址", "ok", 2200);
+  } catch (e) {
+    toast("复制失败，可在「编辑」中查看完整地址", "err");
+  }
+}
+function renderProxyPoolView() {
+  const tb = $("proxy-table");
+  if (!tb) return;
+  const kpiEl = $("px-kpi-bar");
+  if (kpiEl) {
+    const counts = {
+      all: PROXIES.length,
+      ok: PROXIES.filter(p => p.enabled !== false && p.status === "ok").length,
+      idle: PROXIES.filter(p => p.enabled !== false && !Number(p.used_by || 0)).length,
+      bound: PROXIES.filter(p => Number(p.used_by || 0) > 0).length,
+      mainland: PROXIES.filter(p => p.geo_checked && p.is_mainland).length,
+      overseas: PROXIES.filter(p => p.geo_checked && !p.is_mainland).length,
+      issue: PROXIES.filter(p => p.enabled === false || ["bad", "auth_error", "blocked", "unknown"].includes(p.status)).length,
+    };
+    const specs = [
+      ["all", "全部节点", counts.all],
+      ["ok", "连通正常", counts.ok],
+      ["idle", "空闲未绑", counts.idle],
+      ["bound", "已绑账号", counts.bound],
+      ["mainland", "大陆节点", counts.mainland],
+      ["overseas", "境外节点", counts.overseas],
+      ["issue", "待测 / 异常", counts.issue],
+    ];
+    kpiEl.innerHTML = specs.map(([key, label, num]) =>
+      `<button type="button" class="px-kpi-chip${PROXY_FILTER === key ? " active" : ""}" onclick="setProxyPoolFilter('${key}')"><span>${esc(label)}</span><b>${num}</b></button>`
+    ).join("");
+  }
+
+  const stCls = s => s === "ok" ? "active" : ["bad", "auth_error", "blocked"].includes(s) ? "invalid" : "bare";
+  const stTxt = { ok: "可连接", bad: "连接失败", auth_error: "认证失败", blocked: "检测受限", unknown: "未测" };
+  const geoCell = p => {
+    if (!p.geo_checked) {
+      return `<span class="pill bare">尚未检测</span><div class="mut" style="font-size:11px;margin-top:3px">点击右侧「测试」获取出口 IP</div>`;
+    }
+    const regionBadge = p.is_mainland
+      ? `<span class="pill active bare">大陆 · ${esc(p.geo_loc || "CN")}</span>`
+      : `<span class="pill downloading bare" title="境外/港澳台出口 IP，适配 TikTok / Instagram / Twitter / Rednote；国内平台登录可能触发异地验证">境外 · ${esc(p.geo_loc || "境外")}</span>`;
+    return `<div>${regionBadge}</div>` +
+      (p.exit_ip ? `<div class="mut" style="font-size:11px;margin-top:3px"><code>${esc(p.exit_ip)}</code>${p.isp ? " · " + esc(p.isp) : ""}</div>` : "");
+  };
+  const boundCell = p => {
+    const accs = Array.isArray(p.bound_accounts) ? p.bound_accounts : [];
+    const count = Number(p.used_by || accs.length || 0);
+    if (!count) return `<span class="pill bare">空闲独立</span>`;
+    if (!accs.length) {
+      return `<span class="pill ${count > 1 ? "pending" : "active"}">${count > 1 ? `⚠️ 共用 ${count} 号` : `${count} 个账号`}</span>`;
+    }
+    const visibleAccs = accs.slice(0, 3);
+    const rest = accs.length - visibleAccs.length;
+    const allNames = accs.map(a => `${(typeof PF_NAME !== "undefined" && PF_NAME[a.platform]) || a.platform} · ${a.nickname}`).join("；");
+    return `<div class="px-acc-list" title="${esc(allNames)}">
+      ${visibleAccs.map(a => `<span class="px-acc-chip"><small>${esc((typeof PF_NAME !== "undefined" && PF_NAME[a.platform]) || a.platform)}</small>${esc(a.nickname)}</span>`).join("")}
+      ${rest > 0 ? `<span class="pill bare">+${rest}</span>` : ""}
+      ${p.same_platform_shared ? `<span class="pill pending bare" title="同平台下有多个账号共用该代理，建议尽量一号一独立代理">⚠️ 同平台共用</span>` : ""}
+    </div>`;
+  };
+
+  const rows = filteredPoolProxies();
+  if (!PROXIES.length) {
+    tb.querySelector("tbody").innerHTML = empty(5, "代理池为空", "i-shield", "在上方粘贴地址快速添加，或点击右上角「批量导入」");
+  } else if (!rows.length) {
+    tb.querySelector("tbody").innerHTML = `<tr><td colspan="5"><div class="empty"><div class="empty-t">当前筛选条件下暂无节点</div><div class="empty-sub"><button type="button" class="ghost sm" onclick="setProxyPoolFilter('all')">查看全部节点 (${PROXIES.length})</button></div></div></td></tr>`;
+  } else {
+    tb.querySelector("tbody").innerHTML = rows.map(p => {
+      const testing = PROXY_TESTING_IDS.has(p.id);
+      const checked = SELECTED_PROXY_IDS.has(p.id);
+      const scheme = String(p.scheme || (String(p.url || "").split("://")[0]) || "http").toUpperCase();
+      const autoHint = !p.label && p.geo_checked ? suggestGeoLabel(p) : "";
+      const titleHtml = p.label
+        ? `<b>${esc(p.label)}</b>`
+        : `<span class="mut"><b>${esc(autoHint || p.host_port || "(未命名)")}</b> <small>(未设备注)</small></span>`;
+      return `<tr>
+        <td><input type="checkbox" ${checked ? "checked" : ""} onchange="onRowProxySelect(${p.id}, this.checked)" aria-label="选择代理 ${esc(p.label || p.url)}"></td>
+        <td>
+          <div class="px-node-head">
+            ${titleHtml}
+            <span class="pxp-proto">${esc(scheme)}</span>
+            <span class="pill ${stCls(p.status)}">${stTxt[p.status] || p.status}</span>
+            ${p.enabled === false ? '<span class="pill bare">已停用</span>' : ""}
+          </div>
+          <div class="px-node-sub">
+            <code>${esc(p.url)}</code>
+            ${p.user_hint ? `<span class="px-user-hint" title="认证用户名首尾特征（密码已脱敏），用于区分同一网关下的不同通道">账号 ${esc(p.user_hint)}</span>` : ""}
+            <button type="button" class="ghost sm px-mini-copy" onclick="copyPoolProxyUrl(${p.id})" title="复制含账密的完整代理地址">复制</button>
+          </div>
+          ${p.note ? `<div class="mut" style="font-size:11px;margin-top:3px">${esc(p.note)}</div>` : ""}
+        </td>
+        <td>${geoCell(p)}</td>
+        <td>${boundCell(p)}</td>
+        <td class="acttd">
+          <button class="ghost sm" ${testing ? "disabled" : ""} onclick="testPoolProxy(${p.id})">${testing ? "测试中…" : "测试"}</button>
+          <button class="ghost sm" onclick="editPoolProxy(${p.id})">编辑</button>
+          <button class="ghost sm" onclick="togglePoolProxy(${p.id},${p.enabled})">${p.enabled ? "停用" : "启用"}</button>
+          <button class="ghost sm danger" onclick="delPoolProxy(${p.id},${p.used_by})">${ic("i-trash")}删除</button>
+        </td>
+      </tr>`;
+    }).join("");
+  }
+  syncProxyBatchBar();
+}
 async function refreshProxies() {
   const tb = $("proxy-table"); if (!tb) return;
   let rows = [];
   try { rows = await api("/api/proxies"); } catch (e) { return; }
   PROXIES = rows;
-  const stCls = s => s === "ok" ? "active" : ["bad", "auth_error", "blocked"].includes(s) ? "invalid" : "bare";
-  const stTxt = { ok: "可连接", bad: "连接失败", auth_error: "认证失败", blocked: "检测受限", unknown: "未测" };
-  const geoCell = p => {
-    if (!p.geo_checked) return `<span class="pill bare">未测</span>`;
-    const cls = p.is_mainland ? "active" : "invalid";
-    const warn = p.is_mainland ? "" : ' <span title="非中国大陆 IP,与抖音/小红书国内账号时区不符,有风控风险">⚠️</span>';
-    return `<div><span class="pill ${cls}">${esc(p.geo_loc || "未知")}</span>${warn}</div>` +
-      (p.exit_ip ? `<div class="mut" style="font-size:11px;margin-top:2px">${esc(p.exit_ip)}${p.isp ? " · " + esc(p.isp) : ""}</div>` : "");
-  };
-  tb.querySelector("tbody").innerHTML = rows.map(p => `<tr>
-      <td>
-        <div><b>${esc(p.label || "(未命名)")}</b> <span class="pill ${stCls(p.status)}">${stTxt[p.status] || p.status}</span>${p.enabled ? "" : ' <span class="pill bare">已停用</span>'}</div>
-        <div class="mut" style="font-size:11px;margin-top:2px"><code>${esc(p.url)}</code></div>
-        ${p.note ? `<div class="mut" style="font-size:11px">${esc(p.note)}</div>` : ""}
-      </td>
-      <td>${geoCell(p)}</td>
-      <td><span class="pill ${p.used_by ? "active" : "bare"}">${p.used_by} 个账号</span></td>
-      <td class="acttd">
-        <button class="ghost sm" onclick="editPoolProxy(${p.id})">编辑</button>
-        <button class="ghost sm" onclick="testPoolProxy(${p.id})">测试</button>
-        <button class="ghost sm" onclick="togglePoolProxy(${p.id},${p.enabled})">${p.enabled ? "停用" : "启用"}</button>
-        <button class="ghost sm danger" onclick="delPoolProxy(${p.id},${p.used_by})">${ic("i-trash")}删除</button>
-      </td>
-    </tr>`).join("") || empty(4, "代理池为空", "i-shield", "添加住宅/4G 代理,账号即可一号一代理关联使用");
+  renderProxyPoolView();
 }
 async function detectProxy() {
   const raw = $("px-url").value.trim();
-  if (!raw) { toast("请先填代理地址", "err"); return; }
-  const btn = event.target.closest("button"); btn.disabled = true; const old = btn.textContent; btn.textContent = "判别中…";
+  if (!raw) { toast("请先填写代理地址", "err"); $("px-url").focus(); return; }
+  const btn = $("px-btn-detect") || (typeof event !== "undefined" && event?.target?.closest?.("button"));
+  const oldHtml = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.textContent = "检测中…"; }
+  showProxyDetectBanner("正在自动探测 HTTP / SOCKS5 协议并查询出口 IP 归属地…");
   try {
     const r = await api("/api/proxies/detect", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: raw, ...proxyInputOptions() }) });
-    if (!r.ok) { toast("判别失败:" + (r.error || ""), "err"); return; }
+    if (!r.ok) {
+      showProxyDetectBanner("检测未通过：" + (r.error || "连接失败"), "err");
+      return;
+    }
     if ($("px-proto") && (r.scheme === "http" || r.scheme === "socks5")) $("px-proto").value = r.scheme;
-    $("px-url").value = r.recommend;        // 回填带协议的规范地址
-    if ($("px-format")) $("px-format").value = "auto";  // 回填后已是标准 URL
+    $("px-url").value = r.recommend;
+    if ($("px-format")) $("px-format").value = "auto";
     if (typeof csSyncAll === "function") csSyncAll();
     LAST_DETECT = { url: r.recommend, geo: r.geo || null };
-    // 归属地写进备注(若备注为空),方便核对 IP 地区与账号是否一致
-    if (r.geo_text && $("px-label") && !$("px-label").value.trim()) {
-      const g = r.geo || {};
-      $("px-label").value = [g.country, g.region, g.city].filter(Boolean).join("·") || "已判别";
+    if (r.geo && $("px-label") && !$("px-label").value.trim()) {
+      const existing = new Set(PROXIES.map(x => x.label).filter(Boolean));
+      $("px-label").value = suggestGeoLabel(r.geo, existing) || "已验证节点";
     }
-    const tag = r.scheme.toUpperCase() + (r.auth === "required" ? " · 含账密" : " · 免密");
-    toast("判别:" + tag + (r.geo_text ? "  |  " + r.geo_text : "  |  归属地未取到"), r.browser_ok ? "ok" : "info");
-    if (!r.browser_ok) toast("⚠️ " + r.note, "err", 8000);
-  } catch (e) { toast("判别失败:" + e.message, "err"); }
-  finally { btn.disabled = false; btn.textContent = old; }
+    const tag = r.scheme.toUpperCase() + (r.auth === "required" ? " · 含认证" : " · 免密");
+    showProxyDetectBanner(`✓ 连通正常（${tag}）${r.geo_text ? " · " + r.geo_text : ""} — 点击「加入代理池」即可保存`, "ok");
+    if (!r.browser_ok && r.note) toast("⚠️ " + r.note, "err", 8000);
+  } catch (e) {
+    showProxyDetectBanner("检测失败：" + e.message, "err");
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+  }
 }
 async function addProxy() {
   const url = $("px-url").value.trim();
-  if (!url) { toast("请填代理地址", "err"); return; }
-  // 由后端统一解析，避免给导出格式加前缀后误认用户名/主机。
-  const geo = (LAST_DETECT && LAST_DETECT.url === url) ? LAST_DETECT.geo : null;
+  if (!url) { toast("请先粘贴代理地址", "err"); $("px-url").focus(); return; }
+  const matchedDetect = (LAST_DETECT && LAST_DETECT.url === url) ? LAST_DETECT : null;
+  const geo = matchedDetect ? matchedDetect.geo : null;
+  const existingLabels = new Set(PROXIES.map(x => x.label).filter(Boolean));
+  let label = $("px-label").value.trim();
+  if (!label && geo) label = suggestGeoLabel(geo, existingLabels);
+  const note = $("px-note") ? $("px-note").value.trim() : "";
   try {
-    await api("/api/proxies", {
+    const created = await api("/api/proxies", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, label: $("px-label").value.trim(), geo, ...proxyInputOptions() }) });
-    $("px-url").value = ""; $("px-label").value = "";
-    toast("已加入代理池", "ok"); refreshProxies();
-  } catch (e) { toast("添加失败:" + e.message, "err"); }
+      body: JSON.stringify({ url, label, note, geo, ...proxyInputOptions() }) });
+    $("px-url").value = "";
+    $("px-label").value = "";
+    if ($("px-note")) $("px-note").value = "";
+    LAST_DETECT = null;
+    showProxyDetectBanner("");
+    toast("已加入代理池" + (!geo ? "，正在后台自动检测出口…" : ""), "ok");
+    await refreshProxies();
+    // 未提前点「检测并识别」时，加入后自动探测一次出口与归属地（若无备注顺手按地区补齐）
+    if (created && created.id && !geo) {
+      runConcurrentProxyTests([created.id], { autoNameUnnamed: !label, quiet: true });
+    }
+  } catch (e) { toast("添加失败：" + e.message, "err"); }
 }
 async function delPoolProxy(id, used) {
-  if (!await uiConfirm({ title: "删除代理", okText: "删除", danger: true,
-    message: "删除该代理?" + (used ? `\n⚠️ 有 ${used} 个账号正在用它,删除后这些账号需另选代理。` : "") })) return;
-  try { await api("/api/proxies/" + id, { method: "DELETE" }); toast("已删除", "ok"); refreshProxies(); }
-  catch (e) { toast("删除失败:" + e.message, "err"); }
+  if (!await uiConfirm({ title: "删除代理节点", okText: "确认删除", danger: true,
+    message: "确认从代理池删除该节点？" + (used ? `\n⚠️ 当前有 ${used} 个账号正在引用该代理，删除后请及时核对这些账号的代理设置。` : "") })) return;
+  try {
+    const res = await api("/api/proxies/" + id, { method: "DELETE" });
+    SELECTED_PROXY_IDS.delete(id);
+    toast("已从代理池删除", "ok");
+    if (res && res.warning) setTimeout(() => toast("⚠️ " + res.warning, "info", 6500), 260);
+    refreshProxies(); refreshAccounts();
+  } catch (e) { toast("删除失败：" + e.message, "err"); }
 }
 async function editPoolProxy(id) {
   const p = PROXIES.find(x => x.id === id);
   if (!p) return;
-  const label = await uiPrompt({
-    title: "编辑代理备注",
-    hint: p.url + (p.geo_loc ? "  ·  " + p.geo_loc : ""),
-    value: p.label || "", placeholder: "如 住宅-广东-01",
-    submit: label => api("/api/proxies/" + id, {
-      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ label: label.trim() }),
-    }),
+  let detectedGeo = null;
+  const saved = await new Promise(resolve => {
+    _uiResolve = resolve; _uiCancelVal = null;
+    const body = $("ui-body");
+    const canSuggest = Boolean(p.country || p.city || p.region);
+    body.innerHTML = `
+      <div class="stack" style="gap:12px">
+        <div class="form-field">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+            <label for="pxe-label" style="margin:0;color:var(--mut);font-size:12px;font-weight:550">节点备注</label>
+            ${canSuggest ? `<button type="button" class="ghost sm" id="pxe-auto-lbl" style="min-height:22px;padding:1px 8px;font-size:11px">按当前归属地生成</button>` : ""}
+          </div>
+          <input id="pxe-label" value="${esc(p.label || "")}" placeholder="例如：美区静态-01 / 住宅-广东深圳">
+        </div>
+        <div class="form-field">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+            <label for="pxe-url" style="margin:0;color:var(--mut);font-size:12px;font-weight:550">代理地址（修改后会自动同步给已绑定的账号）</label>
+            <button type="button" class="ghost sm" id="pxe-toggle-eye" style="min-height:22px;padding:1px 8px;font-size:11px">显示完整账密</button>
+          </div>
+          <div class="pxp-custom-row">
+            <input id="pxe-url" type="password" value="${esc(p.url_full || "")}" placeholder="http://user:pass@host:port 或 socks5://host:port" autocomplete="off" spellcheck="false">
+            <button type="button" class="ghost sm" id="pxe-detect">${ic("i-network")}检测连通性</button>
+          </div>
+          <div id="pxe-detect-msg" class="pxp-detect-msg" style="margin-top:8px">${p.geo_checked ? `当前记录出口：${esc(p.exit_ip || "-")} · ${esc(p.geo_loc || "未知")}` : "尚未记录出口 IP，可点击「检测连通性」核验"}</div>
+        </div>
+        <div class="form-field">
+          <label for="pxe-note">补充说明（可选）</label>
+          <input id="pxe-note" value="${esc(p.note || "")}" placeholder="如：独享静态住宅 / 2026-12 到期 / TikTok 主号专用">
+        </div>
+        <label class="pxp-save-chk" style="padding-top:2px">
+          <input type="checkbox" id="pxe-enabled" ${p.enabled !== false ? "checked" : ""}>
+          <span>启用该节点（允许参与自动分配与健康调度）</span>
+        </label>
+      </div>`;
+
+    const urlInp = $("pxe-url");
+    const lblInp = $("pxe-label");
+    const eyeBtn = $("pxe-toggle-eye");
+    const detBtn = $("pxe-detect");
+    const detMsg = $("pxe-detect-msg");
+    const autoLblBtn = $("pxe-auto-lbl");
+    if (autoLblBtn) {
+      autoLblBtn.onclick = () => {
+        const existing = new Set(PROXIES.filter(x => x.id !== id).map(x => x.label).filter(Boolean));
+        lblInp.value = suggestGeoLabel(detectedGeo || p, existing) || lblInp.value;
+      };
+    }
+    if (eyeBtn && urlInp) {
+      eyeBtn.onclick = () => {
+        const hidden = urlInp.type === "password";
+        urlInp.type = hidden ? "text" : "password";
+        eyeBtn.textContent = hidden ? "隐藏账密" : "显示完整账密";
+      };
+    }
+    if (detBtn && urlInp && detMsg) {
+      detBtn.onclick = async () => {
+        const raw = urlInp.value.trim();
+        if (!raw) { detMsg.dataset.tone = "err"; detMsg.textContent = "请先填写代理地址"; urlInp.focus(); return; }
+        detBtn.disabled = true; const old = detBtn.innerHTML; detBtn.textContent = "检测中…";
+        detMsg.removeAttribute("data-tone"); detMsg.textContent = "正在检测协议连通性与出口归属地…";
+        try {
+          const r = await api("/api/proxies/detect", {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: raw }) });
+          if (!r.ok) { detMsg.dataset.tone = "err"; detMsg.textContent = "检测未通过：" + (r.error || "连接失败"); return; }
+          urlInp.value = r.recommend || raw;
+          detectedGeo = r.geo || null;
+          if (!lblInp.value.trim() && r.geo) {
+            const existing = new Set(PROXIES.filter(x => x.id !== id).map(x => x.label).filter(Boolean));
+            lblInp.value = suggestGeoLabel(r.geo, existing);
+          }
+          detMsg.dataset.tone = "ok";
+          detMsg.textContent = `✓ 连通正常（${String(r.scheme || "").toUpperCase()}）${r.geo_text ? " · " + r.geo_text : ""}`;
+        } catch (e) {
+          detMsg.dataset.tone = "err"; detMsg.textContent = "检测失败：" + e.message;
+        } finally { detBtn.disabled = false; detBtn.innerHTML = old; }
+      };
+    }
+    _uiGetVal = () => ({
+      label: $("pxe-label").value.trim(),
+      url: $("pxe-url").value.trim(),
+      note: $("pxe-note").value.trim(),
+      enabled: $("pxe-enabled").checked,
+    });
+    _uiOpen("编辑代理节点", p.used_by ? `当前已关联 ${p.used_by} 个账号，保存后会自动同步最新配置。` : "可同时修改备注、代理地址、账密或启用状态。", {
+      okText: "保存修改",
+      wide: true,
+      icon: "i-edit",
+      submit: async val => {
+        if (!val.url) uiEditorError("代理地址不能为空", "pxe-url");
+        await api("/api/proxies/" + id, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...val, geo: detectedGeo }),
+        });
+      },
+    });
   });
-  if (label === null) return;
-  toast("备注已更新", "ok"); refreshProxies();
+  if (!saved) return;
+  toast("代理节点已更新", "ok");
+  refreshProxies();
+  refreshAccounts();
+  window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
 }
 async function togglePoolProxy(id, enabled) {
   try {
     await api("/api/proxies/" + id, {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: !enabled }) });
-    refreshProxies();
-  } catch (e) { toast("操作失败:" + e.message, "err"); }
+    refreshProxies(); refreshAccounts();
+  } catch (e) { toast("操作失败：" + e.message, "err"); }
+}
+async function runConcurrentProxyTests(ids, { autoNameUnnamed = false, quiet = false, triggerBtn = null } = {}) {
+  const targetIds = [...new Set(ids.map(Number).filter(Boolean))];
+  if (!targetIds.length) return { okCount: 0, failCount: 0 };
+  targetIds.forEach(id => PROXY_TESTING_IDS.add(id));
+  renderProxyPoolView();
+  const oldHtml = triggerBtn ? triggerBtn.innerHTML : "";
+  if (triggerBtn) triggerBtn.disabled = true;
+  let done = 0, okCount = 0, failCount = 0;
+  const syncProgress = () => {
+    if (triggerBtn) triggerBtn.textContent = `测试中 ${done}/${targetIds.length}…`;
+  };
+  syncProgress();
+  const queue = [...targetIds];
+  const existingLabels = new Set(PROXIES.map(x => x.label).filter(Boolean));
+  const worker = async () => {
+    while (queue.length) {
+      const pid = queue.shift();
+      try {
+        const r = await api("/api/proxies/" + pid + "/test", { method: "POST" });
+        if (r.ok) okCount++; else failCount++;
+        const row = PROXIES.find(x => x.id === pid);
+        if (row) {
+          row.status = r.ok ? "ok" : "bad";
+          if (r.geo) {
+            row.exit_ip = r.geo.ip || row.exit_ip || "";
+            row.country = r.geo.country || row.country || "";
+            row.region = r.geo.region || row.region || "";
+            row.city = r.geo.city || row.city || "";
+            row.isp = r.geo.isp || row.isp || "";
+            row.geo_loc = [row.country, row.region, row.city].filter(Boolean).join(" · ");
+            row.geo_checked = Boolean(row.exit_ip || row.country);
+            if (typeof isMainlandGeoClient === "function") {
+              row.is_mainland = isMainlandGeoClient(row.country, row.region, row.city);
+            }
+            if (autoNameUnnamed && !row.label) {
+              const newLabel = suggestGeoLabel(r.geo, existingLabels);
+              if (newLabel) {
+                existingLabels.add(newLabel);
+                row.label = newLabel;
+                await api("/api/proxies/" + pid, {
+                  method: "PUT", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ label: newLabel }),
+                }).catch(() => {});
+              }
+            }
+          }
+        }
+      } catch (e) {
+        failCount++;
+      } finally {
+        done++;
+        PROXY_TESTING_IDS.delete(pid);
+        syncProgress();
+        renderProxyPoolView();
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, targetIds.length) }, () => worker()));
+  if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.innerHTML = oldHtml; }
+  await refreshProxies();
+  if (!quiet) {
+    toast(`检测完成：可连接 ${okCount} 个${failCount ? ` · 未通过 ${failCount} 个` : ""}`, failCount && !okCount ? "err" : "ok");
+  }
+  return { okCount, failCount };
 }
 async function testPoolProxy(id) {
-  const btn = event.target.closest("button"); btn.disabled = true; const old = btn.textContent; btn.textContent = "测试中…";
-  try { const r = await api("/api/proxies/" + id + "/test", { method: "POST" });
-    toast((r.ok ? "通用连接可用 ✓ " : "通用检测未通过 ✗ ") + (r.detail || "") + (r.geo_text ? "  |  " + r.geo_text : ""), r.ok ? "ok" : "err"); }
-  catch (e) { toast("测试失败:" + e.message, "err"); }
-  finally { btn.disabled = false; btn.textContent = old; refreshProxies(); }
+  if (PROXY_TESTING_IDS.has(id)) return;
+  PROXY_TESTING_IDS.add(id);
+  renderProxyPoolView();
+  try {
+    const r = await api("/api/proxies/" + id + "/test", { method: "POST" });
+    toast((r.ok ? "连接可用 ✓ " : "检测未通过 ✗ ") + (r.geo_text || r.detail || ""), r.ok ? "ok" : "err");
+  } catch (e) {
+    toast("测试失败：" + e.message, "err");
+  } finally {
+    PROXY_TESTING_IDS.delete(id);
+    refreshProxies();
+  }
 }
 async function testAllProxies() {
-  if (!PROXIES.length) { toast("代理池为空", "info"); return; }
-  toast("开始逐个测试…", "info");
-  for (const p of PROXIES) {
-    try { await api("/api/proxies/" + p.id + "/test", { method: "POST" }); } catch (e) { }
+  if (!PROXIES.length) { toast("代理池为空，请先添加节点", "info"); return; }
+  const targets = filteredPoolProxies();
+  const list = targets.length ? targets : PROXIES;
+  await runConcurrentProxyTests(list.map(p => p.id), { triggerBtn: $("px-btn-test-all") });
+}
+async function batchTestPoolProxies() {
+  const ids = [...SELECTED_PROXY_IDS];
+  if (!ids.length) return;
+  await runConcurrentProxyTests(ids, { triggerBtn: typeof event !== "undefined" ? event?.target?.closest?.("button") : null });
+}
+async function batchAutoNameProxies() {
+  const targets = PROXIES.filter(p => SELECTED_PROXY_IDS.has(p.id) && !p.label && p.geo_checked);
+  if (!targets.length) {
+    toast("所选节点均已有备注，或尚未检测出归属地（可先执行批量测试）", "info");
+    return;
   }
-  toast("测试完成", "ok"); refreshProxies();
+  const usedLabels = new Set(PROXIES.map(x => x.label).filter(Boolean));
+  let updated = 0;
+  for (const p of targets) {
+    const nextLbl = suggestGeoLabel(p, usedLabels);
+    if (!nextLbl) continue;
+    usedLabels.add(nextLbl);
+    try {
+      await api("/api/proxies/" + p.id, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ label: nextLbl }) });
+      updated++;
+    } catch (e) {}
+  }
+  toast(`已按归属地自动命名 ${updated} 个节点`, "ok");
+  refreshProxies();
+}
+async function batchTogglePoolProxies(enabled) {
+  const ids = [...SELECTED_PROXY_IDS];
+  if (!ids.length) return;
+  let count = 0;
+  for (const id of ids) {
+    try {
+      await api("/api/proxies/" + id, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: !!enabled }) });
+      count++;
+    } catch (e) {}
+  }
+  toast(`已批量${enabled ? "启用" : "停用"} ${count} 个节点`, "ok");
+  refreshProxies(); refreshAccounts();
+}
+async function batchDeletePoolProxies() {
+  const rows = PROXIES.filter(p => SELECTED_PROXY_IDS.has(p.id));
+  if (!rows.length) return;
+  const boundTotal = rows.reduce((s, p) => s + Number(p.used_by || 0), 0);
+  if (!await uiConfirm({
+    title: `批量删除代理（共 ${rows.length} 个）`,
+    okText: "确认批量删除",
+    danger: true,
+    message: `确定从代理池删除已选的 ${rows.length} 个节点？` + (boundTotal ? `\n⚠️ 其中关联了 ${boundTotal} 个账号引用，删除后请核对相关账号代理设置。` : ""),
+  })) return;
+  let deleted = 0;
+  for (const p of rows) {
+    try {
+      await api("/api/proxies/" + p.id, { method: "DELETE" });
+      SELECTED_PROXY_IDS.delete(p.id);
+      deleted++;
+    } catch (e) {}
+  }
+  toast(`已删除 ${deleted} 个代理节点`, "ok");
+  refreshProxies(); refreshAccounts();
 }
 async function importProxies() {
-  const options = proxyInputOptions();
-  const text = await uiPrompt({
-    title: "批量导入代理",
-    hint: "每行一条，支持六种格式、标准 URL、# 注释及空行；备注推荐写「备注 | 地址」。\n使用页面所选输入格式；未带协议时默认 " + options.default_scheme.toUpperCase() + "，已带协议时保留原值。",
-    multiline: true, rows: 8,
-    placeholder: "住宅-01 | proxy.example:8080:USER:TOKEN\nproxy.example,8080,USER,TOKEN\nsocks5://USER:TOKEN@proxy.example:1080" });
-  if (text === null || !text.trim()) return;
-  try {
-    const r = await api("/api/proxies/import", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, ...options }) });
-    let msg = `导入完成:新增 ${r.added}`;
-    if (r.skipped) msg += ` · 重复跳过 ${r.skipped}`;
-    if (r.invalid) msg += ` · 格式无效 ${r.invalid}`;
-    toast(msg, r.added ? "ok" : "info");
-    if (r.invalid_samples?.length) toast(r.invalid_samples.join("\n"), "err", 10000);
-    refreshProxies();
-  } catch (e) { toast("导入失败:" + e.message, "err"); }
+  const defaults = proxyInputOptions();
+  let importRes = null;
+  const result = await new Promise(resolve => {
+    _uiResolve = resolve; _uiCancelVal = null;
+    const body = $("ui-body");
+    body.innerHTML = `
+      <div class="stack" style="gap:12px">
+        <div class="form-grid" style="grid-template-columns:1fr 1.3fr;gap:10px">
+          <div class="form-field">
+            <label for="pxi-proto">未带协议时默认按</label>
+            <select id="pxi-proto">
+              <option value="http"${defaults.default_scheme === "http" ? " selected" : ""}>HTTP</option>
+              <option value="socks5"${defaults.default_scheme === "socks5" ? " selected" : ""}>SOCKS5</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="pxi-format">账密分隔格式</label>
+            <select id="pxi-format">
+              <option value="auto"${defaults.input_format === "auto" ? " selected" : ""}>自动识别（推荐）</option>
+              <option value="host_colon">主机:端口:用户名:密码</option>
+              <option value="host_csv">主机,端口,用户名,密码</option>
+              <option value="host_at">主机:端口@用户名:密码</option>
+              <option value="auth_colon">用户名:密码:主机:端口</option>
+              <option value="auth_at">用户名:密码@主机:端口</option>
+              <option value="host_hash">主机:端口##用户名##密码</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-field">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+            <label for="pxi-text" style="margin:0;color:var(--mut);font-size:12px;font-weight:550">粘贴代理列表（每行一条，可写「备注 | 地址」）</label>
+            <span class="mut" id="pxi-count" style="font-size:11.5px">待粘贴</span>
+          </div>
+          <textarea id="pxi-text" rows="7" spellcheck="false" style="font-family:var(--mono);font-size:12px" placeholder="美区静态-01 | socks5://user:pass@us.example.com:1080&#10;proxy.example.com:8080:USER:TOKEN&#10;proxy.example.com,8080,USER,TOKEN"></textarea>
+        </div>
+        <label class="pxp-save-chk">
+          <input type="checkbox" id="pxi-autotest" checked>
+          <span>导入后自动并发检测连通性与归属地（并为空备注节点自动按地区命名）</span>
+        </label>
+      </div>`;
+    enhanceSelect($("pxi-proto"));
+    enhanceSelect($("pxi-format"));
+    const txt = $("pxi-text"), cnt = $("pxi-count");
+    txt.addEventListener("input", () => {
+      const n = txt.value.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith("#")).length;
+      cnt.textContent = n ? `已识别 ${n} 行待导入` : "待粘贴";
+    });
+    _uiGetVal = () => ({
+      text: txt.value,
+      default_scheme: $("pxi-proto").value,
+      input_format: $("pxi-format").value,
+      autoTest: $("pxi-autotest").checked,
+    });
+    _uiOpen("批量导入代理", "自动校验格式并过滤池内重复节点；已带 http:// 或 socks5:// 前缀的行会保留原协议。", {
+      okText: "开始导入",
+      wide: true,
+      icon: "i-plus",
+      busyText: "导入中",
+      noticeText: "",
+      submit: async payload => {
+        if (!payload.text.trim()) uiEditorError("请先粘贴至少一条代理记录", "pxi-text");
+        importRes = await api("/api/proxies/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: payload.text,
+            default_scheme: payload.default_scheme,
+            input_format: payload.input_format,
+          }),
+        });
+      },
+    });
+  });
+  if (!result || !importRes) return;
+  let msg = `导入完成：新增 ${importRes.added} 条`;
+  if (importRes.skipped) msg += ` · 重复跳过 ${importRes.skipped} 条`;
+  if (importRes.invalid) msg += ` · 格式无效 ${importRes.invalid} 条`;
+  toast(msg, importRes.added ? "ok" : "info");
+  if (importRes.invalid_samples?.length) toast(importRes.invalid_samples.join("\n"), "err", 10000);
+  await refreshProxies();
+  if (result.autoTest && Array.isArray(importRes.added_ids) && importRes.added_ids.length) {
+    runConcurrentProxyTests(importRes.added_ids, { autoNameUnnamed: true, triggerBtn: $("px-btn-test-all") });
+  }
 }
 async function assignAllProxies() {
-  const noProxy = ACCOUNTS.filter(a => !a.has_proxy).length;
+  const poolTargets = (ALL_ACCOUNTS && ALL_ACCOUNTS.length) ? ALL_ACCOUNTS : ACCOUNTS;
+  const noProxy = poolTargets.filter(a => !a.has_proxy).length;
   if (!noProxy) { toast("所有账号都已配置代理", "info"); return; }
-  if (!await uiConfirm({ title: "批量分配代理", message: `给 ${noProxy} 个未配代理的账号从池里自动分配(均衡,占用最少优先)?` })) return;
-  const btn = event.target.closest("button"); if (btn) { btn.disabled = true; btn.textContent = "分配中…"; }
+  if (!await uiConfirm({ title: "批量分配代理", message: `将为 ${noProxy} 个尚未配置代理的账号从池内自动分配（优先空闲独立且地区匹配的节点，池余量不足时按最少占用复用）。是否继续？` })) return;
+  const btn = typeof event !== "undefined" ? event?.target?.closest?.("button") : null;
+  const oldHtml = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.textContent = "分配中…"; }
   try {
     const r = await api("/api/accounts/assign-proxies-all", { method: "POST" });
-    let msg = `已分配 ${r.assigned} 个账号`;
-    if (r.unassigned) msg += `,还有 ${r.unassigned} 个没分到(代理池不够,请再加代理)`;
+    let msg = `已为 ${r.assigned} 个账号分配代理`;
+    if (r.unassigned) msg += `，仍有 ${r.unassigned} 个未分到`;
     toast(msg, r.unassigned ? "info" : "ok");
+    if (r.warning) setTimeout(() => toast("⚠️ " + r.warning, "info", 7000), 280);
     refreshAccounts(); refreshProxies();
-  } catch (e) { toast("分配失败:" + e.message, "err"); }
-  finally { if (btn) { btn.disabled = false; btn.textContent = "给账号批量分配"; } }
+    window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
+  } catch (e) { toast("分配失败：" + e.message, "err"); }
+  finally { if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; } }
 }
 async function testProxy(id) {
-  const btn = event.target.closest("button"); btn.disabled = true; const old = btn.textContent; btn.textContent = "测试中…";
-  try {
-    const r = await api("/api/accounts/" + id + "/test-proxy", { method: "POST" });
-    toast((r.ok ? "代理可用 ✓ " : "代理不可用 ✗ ") + (r.detail || ""), r.ok ? "ok" : "err");
-  } catch (e) { toast("测试失败:" + e.message, "err"); }
-  finally { btn.disabled = false; btn.textContent = old; refreshAccounts(); }
+  const btn = evtBtn();
+  await withBusy(btn, "测试中", async () => {
+    try {
+      const r = await api("/api/accounts/" + id + "/test-proxy", { method: "POST" });
+      toast((r.ok ? "代理可用 ✓ " : "代理不可用 ✗ ") + (r.detail || ""), r.ok ? "ok" : "err");
+    } catch (e) { toast("测试失败:" + e.message, "err"); }
+  });
+  refreshAccounts();
+  window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
 }
 async function relogin(id, scope = "auto") {
   const btn = evtBtn();
@@ -4796,6 +6831,7 @@ function pollReloginTask(tid) {
         persistedShown = true;
         toast("扫码已确认，正在校验登录态", "info");
         refreshAccounts();
+        window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
       } else if (r.status === "confirmed") {
         clearTimeout(t);
         if (r.profile_status === "invalid") {
@@ -4803,8 +6839,12 @@ function pollReloginTask(tid) {
         } else {
           const suffix = ["error", "deferred"].includes(r.profile_status) ? "（资料可稍后刷新）" : "";
           toast("重新登录成功 " + (r.nickname || "") + suffix, r.profile_status === "error" ? "info" : "ok");
+          const pxWarn = r.warning || r.environment?.proxy_warning || "";
+          if (pxWarn) setTimeout(() => toast("⚠️ " + pxWarn, "info", 6500), 320);
         }
-        refreshAccounts(); return;
+        refreshAccounts();
+        window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
+        return;
       } else if (r.status === "expired") {
         clearTimeout(t); toast("超时未登录,请重试", "err"); return;
       } else if (r.status === "error") {
@@ -4816,7 +6856,7 @@ function pollReloginTask(tid) {
   tick();
 }
 async function delAccount(id) {
-  const a = ACCOUNTS.find(x => x.id === id);
+  const a = findAnyAccount(id);
   const warn = a && a.monitor_count > 0 ? `\n关联的 ${a.monitor_count} 个作品监控也会暂停。` : "";
   if (!await uiConfirm({ title: "删除账号", message: "删除该账号将取消未执行任务、停用关联规则并清理独占登录环境；历史内容保留。执行中的操作需要先结束。" + warn, okText: "删除并停止关联任务", danger: true })) return;
   try {
@@ -4824,6 +6864,7 @@ async function delAccount(id) {
     toast(`账号已删除，取消 ${result.canceled_tasks || 0} 个任务，暂停 ${(result.disabled_rules || 0) + (result.disabled_monitors || 0)} 项规则/监控`, "ok", 6000);
     if (result.profile_cleanup_error) toast(result.profile_cleanup_error, "info", 7000);
     refreshAccounts(); refreshMonitors(); refreshCommentRules(); refreshCommentTasks(); refreshPublish();
+    window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
   }
   catch (e) { toast("删除失败:" + e.message, "err"); }
 }
@@ -4855,7 +6896,7 @@ function transportSourceSuffix(source) {
 function renderTransportMatrix(data) {
   const body = $("transport-matrix-body"), isolation = $("transport-isolation-body");
   if (!body || !isolation) return;
-  const platformNames = { douyin: "抖音", xhs: "小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩" };
+  const platformNames = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook" };
   const rows = Array.isArray(data?.rows) ? data.rows : [];
   body.innerHTML = rows.length ? rows.map(row => `<tr>
     <td><b>${esc(platformNames[row.platform] || row.platform)}</b></td>
@@ -4883,6 +6924,7 @@ async function refreshTransportMatrix() {
     const data = await api("/api/settings/transport-matrix");
     TRANSPORT_MATRIX = data;
     renderTransportMatrix(data);
+    globalThis.CreatorHubEngineSettings?.syncPlatforms?.(data?.accounts);
     if (status) status.textContent = `已核对 ${data.rows?.length || 0} 项能力、${data.accounts?.length || 0} 个账号环境`;
     return data;
   } catch (error) {
@@ -4892,67 +6934,446 @@ async function refreshTransportMatrix() {
 }
 globalThis.CreatorHubTransportMatrix = { load: refreshTransportMatrix, route: transportRoute };
 
-// ─── 下载设置 ───
+// ─── 下载与统一 AI 文案设置 ───
+let AI_CONFIG_STATE = null;
+let AI_CHANNELS_STATE = { active_channel_id: "default", channels: [] };
+let AI_CUSTOM_PRESETS = [];
+let AI_ALL_PRESETS = [];
+
+const AI_PROTO_LABELS = {
+  openai_compatible: "Chat Completions",
+  openai_responses: "OpenAI Responses",
+  anthropic: "Anthropic Messages",
+};
+
+function openAiChannelsManager() {
+  window.dispatchEvent(new Event("creatorhub:assistant:open-settings"));
+}
+function openAiSettingsSection() {
+  if (typeof switchTab === "function") switchTab("settings", true);
+  globalThis.CreatorHubWorkbench?.showSection?.("settings", "ai");
+}
+function _aiSelectedChannel() {
+  const cid = $("ai-channel-id")?.value || AI_CHANNELS_STATE.active_channel_id || "default";
+  return (AI_CHANNELS_STATE.channels || []).find(c => c.id === cid) || null;
+}
+function populateAiChannelSelectors(selectedId = "") {
+  const sel = $("ai-channel-id");
+  if (!sel) return;
+  const channels = AI_CHANNELS_STATE.channels || [];
+  const active = channels.find(c => c.id === AI_CHANNELS_STATE.active_channel_id);
+  const activeHint = active
+    ? `${active.display_name}${active.model ? `（${active.model}）` : "（未配模型）"}`
+    : "默认渠道";
+  const opts = [`<option value="">跟随 AI 助手当前渠道 · ${esc(activeHint)}</option>`];
+  channels.forEach(c => {
+    const status = c.configured ? (AI_PROTO_LABELS[c.provider] || c.provider) : "未完成配置";
+    opts.push(`<option value="${esc(c.id)}">${esc(c.display_name)} · ${esc(c.model || "未选模型")}（${esc(status)}）</option>`);
+  });
+  sel.innerHTML = opts.join("");
+  if (selectedId && [...sel.options].some(o => o.value === selectedId)) sel.value = selectedId;
+  else sel.value = "";
+  onAiChannelChange();
+}
+function onAiChannelChange() {
+  const ch = _aiSelectedChannel();
+  const dl = $("ai-channel-models-datalist");
+  if (dl) {
+    const models = ch?.models || [];
+    dl.innerHTML = models.map(m => `<option value="${esc(m.id)}">${esc(m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id)}</option>`).join("");
+  }
+  const help = $("ai-channel-help");
+  if (help) {
+    if (!ch) {
+      help.textContent = "暂无可用共享渠道，请点击右上角「添加/编辑渠道」在 AI 助手中先配置一个模型渠道。";
+    } else if (!ch.configured) {
+      help.textContent = `当前渠道「${ch.display_name}」尚未配置接口地址或模型 ID，请先到 AI 助手模型设置中补全保存。`;
+    } else {
+      help.textContent = `当前指向：${ch.display_name} · ${AI_PROTO_LABELS[ch.provider] || ch.provider} · 默认模型 ${ch.model}。`;
+    }
+  }
+  syncAiStatusBanner();
+  csSyncAll();
+}
+function populateAiPresetSelect(selectedId = "") {
+  const sel = $("ai-default-preset");
+  if (!sel) return;
+  sel.innerHTML = (AI_ALL_PRESETS || []).map(p =>
+    `<option value="${esc(p.id)}">${esc(p.name)}${p.builtin ? "" : "（自定义）"}</option>`
+  ).join("");
+  if (selectedId && [...sel.options].some(o => o.value === selectedId)) sel.value = selectedId;
+  onAiPresetChange();
+}
+function onAiPresetChange() {
+  const pid = $("ai-default-preset")?.value || "natural_cn";
+  const preset = (AI_ALL_PRESETS || []).find(p => p.id === pid);
+  const desc = $("ai-preset-desc");
+  if (desc && preset) {
+    desc.textContent = `${preset.description || preset.style_prompt.slice(0, 80)}（建议 ≤${preset.max_chars} 字；单条规则可单独覆盖）`;
+  }
+}
+function onAiSourceChange() {
+  const isCustom = Boolean($("ai-source-custom")?.checked);
+  if ($("ai-panel-channel")) $("ai-panel-channel").hidden = isCustom;
+  if ($("ai-panel-custom")) $("ai-panel-custom").hidden = !isCustom;
+  syncAiStatusBanner();
+  csSyncAll();
+}
+function onAiProxyModeChange() {
+  const mode = $("ai-proxy-mode")?.value || "direct";
+  const wrap = $("ai-proxy-url-wrap");
+  if (wrap) wrap.hidden = mode !== "custom";
+  if (mode !== "custom") setFieldError($("ai-proxy-url"), "");
+}
+function onAiClearKeyToggle() {
+  const keyEl = $("ai-key");
+  const clr = Boolean($("ai-clear-key")?.checked);
+  if (keyEl) {
+    keyEl.disabled = clr;
+    if (clr) keyEl.value = "";
+  }
+}
+function syncAiStatusBanner() {
+  const strip = $("ai-status-strip");
+  const title = $("ai-status-title");
+  const desc = $("ai-status-desc");
+  if (!strip || !title || !desc) return;
+  const enabled = Boolean($("ai-enabled")?.checked);
+  const isCustom = Boolean($("ai-source-custom")?.checked);
+  let ready = false, routeText = "", reason = "";
+  if (isCustom) {
+    const base = ($("ai-base")?.value || "").trim();
+    const model = ($("ai-model")?.value || "").trim();
+    const proto = AI_PROTO_LABELS[$("ai-provider")?.value || "openai_compatible"] || "OpenAI";
+    ready = Boolean(base && model);
+    routeText = ready ? `独立接口 · ${proto} · ${model}` : "独立接口尚未填完地址或模型";
+    reason = ready ? "" : "请填写接口基础地址与模型名称";
+  } else {
+    const ch = _aiSelectedChannel();
+    const ovModel = ($("ai-channel-model-override")?.value || "").trim();
+    const model = ovModel || ch?.model || "";
+    ready = Boolean(ch?.base_url && model);
+    const proto = AI_PROTO_LABELS[ch?.provider || "openai_compatible"] || "";
+    routeText = ch
+      ? `复用共享渠道「${ch.display_name}」· ${proto} · ${model || "未选模型"}`
+      : "尚未配置共享模型渠道";
+    reason = ready ? "" : "请先在「管理共享模型渠道」中配置接口地址与模型";
+  }
+  if (!enabled) {
+    strip.dataset.state = "off";
+    title.textContent = "AI 文案生成当前未启用";
+    desc.textContent = `当前路由：${routeText}。开启下方总开关并保存后，勾选 AI 的自动评论规则即可生效。`;
+  } else if (ready) {
+    strip.dataset.state = "ready";
+    title.textContent = `AI 文案已就绪 · ${routeText}`;
+    desc.textContent = "自动评论规则可直接使用此配置，也可按单条规则覆盖人设预设或指定模型。";
+  } else {
+    strip.dataset.state = "warn";
+    title.textContent = "AI 文案已开启但模型未就绪";
+    desc.textContent = `${routeText} — ${reason}。`;
+  }
+}
+function buildAiConfigDraft() {
+  const isCustom = Boolean($("ai-source-custom")?.checked);
+  const rawTemp = ($("ai-temp")?.value ?? "").trim();
+  const tempVal = rawTemp === "" ? null : Number(rawTemp);
+  return {
+    enabled: Boolean($("ai-enabled")?.checked),
+    source: isCustom ? "custom" : "channel",
+    channel_id: $("ai-channel-id")?.value || "",
+    model_override: ($("ai-channel-model-override")?.value || "").trim(),
+    provider: $("ai-provider")?.value || "openai_compatible",
+    base_url: ($("ai-base")?.value || "").trim(),
+    api_key: ($("ai-key")?.value || "").trim(),
+    clear_api_key: Boolean($("ai-clear-key")?.checked),
+    api_path_mode: $("ai-path-mode")?.value || "auto",
+    model: ($("ai-model")?.value || "").trim(),
+    output_token_parameter: $("ai-token-param")?.value || "max_tokens",
+    temperature: Number.isFinite(tempVal) ? tempVal : null,
+    max_output_tokens: Math.max(64, Math.min(2048, Number($("ai-max-output-tokens")?.value) || 256)),
+    timeout_seconds: Math.max(5, Math.min(90, Number($("ai-timeout")?.value) || 25)),
+    max_chars: Math.max(15, Math.min(300, Number($("ai-max-chars")?.value) || 60)),
+    language_mode: $("ai-language-mode")?.value || "auto",
+    disable_thinking: Boolean($("ai-disable-thinking")?.checked),
+    proxy_mode: $("ai-proxy-mode")?.value || "direct",
+    proxy_url: ($("ai-proxy-url")?.value || "").trim(),
+    default_preset_id: $("ai-default-preset")?.value || "natural_cn",
+    custom_prompt: $("ai-prompt")?.value || "",
+    custom_presets: AI_CUSTOM_PRESETS || [],
+  };
+}
+function applyAiSettingsData(s, { force = false } = {}) {
+  if (!s) return;
+  AI_CHANNELS_STATE = s.ai_channels || AI_CHANNELS_STATE;
+  const cfg = s.ai_config || {};
+  AI_CONFIG_STATE = cfg;
+  AI_ALL_PRESETS = Array.isArray(cfg.presets) ? cfg.presets : [];
+  AI_CUSTOM_PRESETS = Array.isArray(cfg.custom_presets) ? cfg.custom_presets : [];
+  if (!$("ai-enabled")) return;
+  const assign = (id, prop, val) => {
+    const el = $(id);
+    if (!el) return;
+    if (force) {
+      delete el.dataset.wbEdited;
+      el[prop] = val;
+    } else if (!globalThis.CreatorHubWorkbench?.isDirty?.(id)) {
+      el[prop] = val;
+    }
+  };
+  assign("ai-enabled", "checked", !!cfg.enabled);
+  const isCustom = cfg.source === "custom";
+  if ($("ai-source-channel")) $("ai-source-channel").checked = !isCustom;
+  if ($("ai-source-custom")) $("ai-source-custom").checked = isCustom;
+  populateAiChannelSelectors(cfg.channel_id || "");
+  assign("ai-channel-model-override", "value", cfg.model_override || "");
+  assign("ai-provider", "value", cfg.provider || "openai_compatible");
+  assign("ai-path-mode", "value", cfg.api_path_mode || "auto");
+  assign("ai-base", "value", cfg.base_url || "");
+  assign("ai-model", "value", cfg.model || "");
+  assign("ai-token-param", "value", cfg.output_token_parameter || "max_tokens");
+  assign("ai-temp", "value", cfg.temperature === null || cfg.temperature === undefined ? "" : String(cfg.temperature));
+  assign("ai-max-chars", "value", String(cfg.max_chars || 60));
+  assign("ai-language-mode", "value", cfg.language_mode || "auto");
+  assign("ai-max-output-tokens", "value", String(cfg.max_output_tokens || 256));
+  assign("ai-timeout", "value", String(cfg.timeout_seconds || 25));
+  assign("ai-proxy-mode", "value", cfg.proxy_mode || "direct");
+  assign("ai-proxy-url", "value", cfg.proxy_url || "");
+  assign("ai-disable-thinking", "checked", cfg.disable_thinking !== false);
+  assign("ai-prompt", "value", cfg.custom_prompt || "");
+  populateAiPresetSelect(cfg.default_preset_id || "natural_cn");
+  if ($("ai-key")) {
+    $("ai-key").value = "";
+    $("ai-key").disabled = false;
+    $("ai-key").placeholder = cfg.api_key_set ? "已保存（留空保留原密钥）" : "输入 API Key；本地无鉴权服务可留空";
+  }
+  if ($("ai-clear-key")) $("ai-clear-key").checked = false;
+  if ($("ai-clear-key-wrap")) $("ai-clear-key-wrap").style.display = cfg.api_key_set ? "flex" : "none";
+  if ($("ai-migrate-btn")) $("ai-migrate-btn").hidden = !(isCustom && cfg.base_url && cfg.model);
+  onAiProxyModeChange();
+  onAiSourceChange();
+  csSyncAll();
+}
+async function refreshAiSharedChannels() {
+  try {
+    const s = await api("/api/settings");
+    AI_CHANNELS_STATE = s.ai_channels || AI_CHANNELS_STATE;
+    populateAiChannelSelectors($("ai-channel-id")?.value || "");
+    toast("已刷新共享模型渠道列表", "ok", 2200);
+  } catch (e) { toast("刷新渠道失败：" + e.message, "err"); }
+}
 async function loadSettings() {
   globalThis.CreatorHubEngineSettings?.load();
   globalThis.CreatorHubChannelsProtocol?.load?.();
+  globalThis.CreatorHubDiagnostics?.load?.();
   refreshTransportMatrix();
   try {
     const s = await api("/api/settings");
     const assign = (id, property, value) => {
-      if (!globalThis.CreatorHubWorkbench?.isDirty?.(id)) $(id)[property] = value;
+      if ($(id) && !globalThis.CreatorHubWorkbench?.isDirty?.(id)) $(id)[property] = value;
     };
     assign("dl-dir", "value", s.download_dir || "");
     assign("dl-quality", "value", s.video_quality || "highest");
-    if ($("ai-enabled")) {
-      assign("ai-enabled", "checked", !!s.ai_enabled);
-      assign("ai-base", "value", s.ai_base_url || "");
-      assign("ai-model", "value", s.ai_model || "");
-      assign("ai-temp", "value", s.ai_temperature || "0.9");
-      assign("ai-prompt", "value", s.ai_prompt || "");
-      $("ai-key").placeholder = s.ai_api_key_set ? "已保存(留空=不修改)" : "API Key";
-    }
+    applyAiSettingsData(s);
     csSyncAll();
   } catch (e) {}
 }
 async function saveAiSettings() {
   if (!validateAiSettings(false)) return;
   $("ai-msg").textContent = "保存中…";
-  const body = {
-    ai_enabled: $("ai-enabled").checked, ai_base_url: $("ai-base").value.trim(),
-    ai_model: $("ai-model").value.trim(), ai_temperature: $("ai-temp").value.trim() || "0.9",
-    ai_prompt: $("ai-prompt").value,
-  };
-  const key = $("ai-key").value.trim();
-  if (key) body.ai_api_key = key;
+  const ai_config = buildAiConfigDraft();
   await withBusy(evtBtn(), "保存中", async () => {
-  try {
-    const s = await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    $("ai-key").value = ""; $("ai-key").placeholder = s.ai_api_key_set ? "已保存(留空=不修改)" : "API Key";
-    $("ai-msg").textContent = "已保存 ✓ " + (s.ai_enabled ? "(规则勾选「用 AI」即生效)" : "(当前未启用)");
-    toast("AI 设置已保存", "ok");
-  } catch (e) { $("ai-msg").textContent = "失败: " + e.message; toast("保存失败:" + e.message, "err"); }
+    try {
+      const s = await api("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ai_config }),
+      });
+      applyAiSettingsData(s, { force: true });
+      $("ai-msg").textContent = "已保存 ✓ " + (s.ai_config?.enabled ? "（已生效于自动评论规则）" : "（当前总开关未启用）");
+      toast("AI 文案设置已保存", "ok");
+      window.dispatchEvent(new Event("creatorhub:ai-config:updated"));
+    } catch (e) {
+      $("ai-msg").textContent = "保存失败：" + e.message;
+      toast("保存失败：" + e.message, "err", 7000);
+    }
   });
+}
+async function migrateAiToChannel() {
+  const name = await uiPrompt({
+    title: "转存为共享模型渠道",
+    hint: "将把当前独立接口的地址、协议、密钥和模型保存为一个共享渠道（与 AI 助手互通），并自动切换为「复用共享渠道」模式。",
+    value: "AI 文案渠道",
+    placeholder: "输入渠道显示名称",
+  });
+  if (name === null) return;
+  try {
+    const res = await api("/api/settings/ai-migrate-to-channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: name.trim() || "AI 文案渠道" }),
+    });
+    applyAiSettingsData({ ai_config: res.ai_config, ai_channels: res.ai_channels }, { force: true });
+    toast("已转存为共享渠道并自动切换 ✓", "ok", 5000);
+    window.dispatchEvent(new Event("creatorhub:ai-config:updated"));
+  } catch (e) {
+    toast("转存失败：" + e.message, "err", 7000);
+  }
 }
 async function testAi() {
   const btn = evtBtn();
   if (!validateAiSettings(true)) return;
-  $("ai-msg").textContent = "测试中…";
-  // 用当前表单值测(key 留空则用已保存的),方便保存前先验证
-  const body = {
-    base_url: $("ai-base").value.trim(), model: $("ai-model").value.trim(),
-    prompt: $("ai-prompt").value, temperature: $("ai-temp").value.trim() || "0.9",
+  if ($("ai-test-drawer")) $("ai-test-drawer").open = true;
+  $("ai-msg").textContent = "实景测试生成中…";
+  const out = $("ai-test-output");
+  if (out) { out.hidden = false; out.removeAttribute("data-tone"); out.textContent = "正在调用模型生成样例文案…"; }
+  const payload = {
+    ai_config: buildAiConfigDraft(),
+    preset_id: $("ai-default-preset")?.value || "natural_cn",
+    sample_platform: $("ai-test-platform")?.value || "douyin",
+    sample_mode: $("ai-test-mode")?.value || "auto_reply",
+    sample_work_desc: $("ai-test-work")?.value || "",
+    sample_source_text: $("ai-test-source")?.value || "",
   };
-  const key = $("ai-key").value.trim();
-  if (key) body.api_key = key;
   await withBusy(btn, "测试中", async () => {
     try {
-      const r = await api("/api/settings/ai-test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      if (r.ok) { $("ai-msg").innerHTML = `连通正常 ✓ 样例文案:<b>${esc(r.sample || "")}</b>`; toast("AI 连通正常 ✓", "ok", 6000); }
-      else { $("ai-msg").textContent = "连通失败:" + (r.error || ""); toast("AI 连通失败:" + (r.error || ""), "err", 8000); }
-    } catch (e) { $("ai-msg").textContent = "失败:" + e.message; toast("测试失败:" + e.message, "err"); }
+      const r = await api("/api/settings/ai-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        const meta = [r.source_label, r.model, r.preset_name, r.elapsed_ms ? `${r.elapsed_ms}ms` : ""].filter(Boolean).join(" · ");
+        $("ai-msg").textContent = `测试成功 ✓（${r.elapsed_ms || 0}ms）`;
+        if (out) {
+          out.dataset.tone = "ok";
+          out.innerHTML = `<div class="mut" style="font-size:11.5px;margin-bottom:4px">${esc(meta)}</div><b>${esc(r.sample || "")}</b>`;
+        }
+        toast("AI 实景生成正常 ✓", "ok", 5000);
+      } else {
+        $("ai-msg").textContent = "生成失败：" + (r.error || "");
+        if (out) { out.dataset.tone = "err"; out.textContent = "测试失败：" + (r.error || ""); }
+        toast("AI 测试失败：" + (r.error || ""), "err", 8000);
+      }
+    } catch (e) {
+      $("ai-msg").textContent = "失败：" + e.message;
+      if (out) { out.dataset.tone = "err"; out.textContent = "测试失败：" + e.message; }
+      toast("测试失败：" + e.message, "err", 8000);
+    }
   });
 }
+async function manageAiPresets() {
+  let working = (AI_CUSTOM_PRESETS || []).map(x => ({ ...x }));
+  const builtins = (AI_ALL_PRESETS || []).filter(p => p.builtin);
+  let editingIndex = -1;
+
+  const renderModalBody = () => {
+    const body = $("ui-body");
+    if (!body) return;
+    body.innerHTML = `
+      <div class="stack" style="gap:12px">
+        <div class="ac-section-box">
+          <div class="ac-section-title"><span>${editingIndex >= 0 ? "编辑自定义人设" : "新建自定义人设"}</span></div>
+          <div class="form-grid">
+            <div class="form-field"><label for="ap-name">人设名称</label><input id="ap-name" maxlength="60" placeholder="例如：美妆博主闺蜜口吻 / 跨境独立站客服"></div>
+            <div class="form-field"><label for="ap-lang">语种</label><select id="ap-lang"><option value="auto">自动匹配</option><option value="zh">中文</option><option value="en">英文</option></select></div>
+            <div class="form-field"><label for="ap-chars">建议字数上限</label><input id="ap-chars" type="number" min="15" max="300" value="60"></div>
+            <div class="form-field"><label for="ap-desc">简短说明</label><input id="ap-desc" maxlength="200" placeholder="说明适用场景（可选）"></div>
+          </div>
+          <div class="form-field"><label for="ap-style">风格与人设要求</label><textarea id="ap-style" rows="3" maxlength="2000" placeholder="描述语气、口吻、禁忌词与互动策略…"></textarea></div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            ${editingIndex >= 0 ? `<button type="button" class="ghost sm" id="ap-cancel-edit">取消编辑</button>` : ""}
+            <button type="button" class="sm" id="ap-add-btn">${editingIndex >= 0 ? "更新此人设" : "添加到自定义人设"}</button>
+          </div>
+        </div>
+        <div class="ac-section-box">
+          <div class="ac-section-title"><span>已保存的自定义人设（${working.length} / 20）</span></div>
+          ${working.length ? `<ul class="ai-preset-list">${working.map((p, idx) => `
+            <li class="ai-preset-item">
+              <div style="min-width:0;flex:1"><b>${esc(p.name)}</b> <span class="mut" style="font-size:11px">≤${p.max_chars}字 · ${p.language_mode}</span><p>${esc(p.style_prompt || p.description || "")}</p></div>
+              <div style="display:flex;gap:6px;flex:0 0 auto">
+                <button type="button" class="ghost sm" data-ap-edit="${idx}">编辑</button>
+                <button type="button" class="ghost sm danger" data-ap-del="${idx}">删除</button>
+              </div>
+            </li>`).join("")}</ul>` : `<div class="mut" style="font-size:12px">还没有自定义人设；内置的 ${builtins.length} 套常用预设可直接使用。</div>`}
+        </div>
+      </div>`;
+    if (editingIndex >= 0 && working[editingIndex]) {
+      const cur = working[editingIndex];
+      $("ap-name").value = cur.name || "";
+      $("ap-lang").value = cur.language_mode || "auto";
+      $("ap-chars").value = String(cur.max_chars || 60);
+      $("ap-desc").value = cur.description || "";
+      $("ap-style").value = cur.style_prompt || "";
+    }
+    enhanceSelect($("ap-lang"));
+    if ($("ap-cancel-edit")) $("ap-cancel-edit").onclick = () => { editingIndex = -1; renderModalBody(); };
+    $("ap-add-btn").onclick = () => {
+      const name = ($("ap-name").value || "").trim();
+      const style = ($("ap-style").value || "").trim();
+      if (!name) { toast("请填写人设名称", "err"); $("ap-name").focus(); return; }
+      if (!style) { toast("请填写风格与人设要求", "err"); $("ap-style").focus(); return; }
+      const item = {
+        id: editingIndex >= 0 ? working[editingIndex].id : `custom_${Date.now().toString(36)}`,
+        name: name.slice(0, 60),
+        description: ($("ap-desc").value || "").trim().slice(0, 200),
+        style_prompt: style.slice(0, 2000),
+        max_chars: Math.max(15, Math.min(300, Number($("ap-chars").value) || 60)),
+        temperature: 0.85,
+        language_mode: $("ap-lang").value || "auto",
+        builtin: false,
+      };
+      if (editingIndex >= 0) { working[editingIndex] = item; editingIndex = -1; }
+      else {
+        if (working.length >= 20) { toast("最多创建 20 个自定义人设", "err"); return; }
+        working.push(item);
+      }
+      renderModalBody();
+    };
+    body.querySelectorAll("[data-ap-edit]").forEach(btn => {
+      btn.onclick = () => { editingIndex = Number(btn.dataset.apEdit); renderModalBody(); };
+    });
+    body.querySelectorAll("[data-ap-del]").forEach(btn => {
+      btn.onclick = () => {
+        const idx = Number(btn.dataset.apDel);
+        working.splice(idx, 1);
+        if (editingIndex === idx) editingIndex = -1;
+        renderModalBody();
+      };
+    });
+  };
+
+  const saved = await new Promise(resolve => {
+    _uiResolve = resolve; _uiCancelVal = null;
+    _uiGetVal = () => working;
+    renderModalBody();
+    _uiOpen("管理自定义文案人设", "保存后会立即同步到 AI 文案设置与所有自动评论规则的人设下拉列表。", {
+      okText: "保存人设列表",
+      wide: true,
+      icon: "i-sparkles",
+      submit: async list => {
+        AI_CUSTOM_PRESETS = list;
+        const draft = buildAiConfigDraft();
+        draft.custom_presets = list;
+        const s = await api("/api/settings", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ai_config: draft }),
+        });
+        applyAiSettingsData(s, { force: true });
+      },
+    });
+  });
+  if (saved) {
+    toast("自定义人设已保存 ✓", "ok");
+    window.dispatchEvent(new Event("creatorhub:ai-config:updated"));
+  }
+}
+window.addEventListener("creatorhub:ai-channels:updated", () => {
+  api("/api/settings").then(s => {
+    AI_CHANNELS_STATE = s.ai_channels || AI_CHANNELS_STATE;
+    populateAiChannelSelectors($("ai-channel-id")?.value || "");
+  }).catch(() => {});
+});
 async function saveSettings() {
   $("dl-msg").textContent = "保存中…";
   await withBusy(evtBtn(), "保存中", async () => {
@@ -4970,6 +7391,7 @@ async function saveSettings() {
   });
 }
 
+// 10-channels-bridge.js — 微信视频号本地通道引导、系统代理与证书安装及桌面微信控制。
 // ─── 视频号本机微信通道可视化配置 ───
 function openChannelsProtocolSettings() {
   switchTab("settings");
@@ -4985,7 +7407,85 @@ const CreatorHubChannelsProtocol = (() => {
     "ch-proto-endpoint",
     "ch-proto-endpoint-file",
   ];
+  const _STRIP_QUERY_KEYS = new Set([
+    "exportkey", "pass_ticket", "wx_header", "uin", "key",
+    "ascene", "devicetype", "version", "nettype", "abtest_cookie", "lang", "fontgear",
+  ]);
   let lastStatus = null;
+  let pollTimer = null;
+  let pollInFlight = false;
+  let prevReadyPages = 0;
+
+  function cleanFinderUrl(rawUrl) {
+    const text = String(rawUrl || "").trim();
+    const qIdx = text.indexOf("?");
+    if (qIdx === -1) return text.split("#")[0];
+    const base = text.slice(0, qIdx);
+    const queryRaw = text.slice(qIdx + 1).split("#")[0];
+    const kept = queryRaw.split("&").filter(part => {
+      if (!part) return false;
+      const eq = part.indexOf("=");
+      const k = (eq === -1 ? part : part.slice(0, eq)).trim().toLowerCase();
+      return k && !_STRIP_QUERY_KEYS.has(k);
+    });
+    return kept.length ? `${base}?${kept.join("&")}` : base;
+  }
+
+  function stopAutoPoll() {
+    if (pollTimer !== null && typeof clearTimeout === "function") {
+      clearTimeout(pollTimer);
+    }
+    pollTimer = null;
+  }
+
+  function isCardVisibleForPoll() {
+    if (typeof document === "undefined" || document.visibilityState === "hidden") return false;
+    const card = $("channels-protocol-card");
+    if (!card || card.hidden) return false;
+    if (typeof card.closest === "function" && card.closest("[hidden]")) return false;
+    return true;
+  }
+
+  async function pollOnce() {
+    pollTimer = null;
+    if (pollInFlight) return;
+    if (!isCardVisibleForPoll()) {
+      if (lastStatus?.proxy?.running && Number(lastStatus?.proxy?.ready_pages || 0) === 0 && typeof setTimeout === "function" && typeof document !== "undefined") {
+        pollTimer = setTimeout(pollOnce, 3000);
+      }
+      return;
+    }
+    pollInFlight = true;
+    try {
+      const data = await api("/api/channels/protocol/status");
+      const wasWaiting = prevReadyPages === 0;
+      const nowReady = Number(data?.proxy?.ready_pages || 0);
+      applyConfigToForm(data, false);
+      renderStatus(data);
+      if (wasWaiting && nowReady > 0) {
+        setMsg("已自动检测到微信桥接页面接入 ✓ 现在可直接使用搜索、主页采集、二级评论与视频解密", "success");
+        toast("微信视频号通道已自动连通 ✓", "ok");
+        globalThis.CreatorHubTransportMatrix?.load?.();
+      }
+    } catch {
+      // Ignore transient network hiccups during background poll
+    } finally {
+      pollInFlight = false;
+    }
+  }
+
+  function syncAutoPoll(proxy) {
+    const running = !!proxy?.running;
+    const readyPages = Number(proxy?.ready_pages || 0);
+    prevReadyPages = readyPages;
+    if (!running || readyPages > 0) {
+      stopAutoPoll();
+      return;
+    }
+    if (pollTimer === null && typeof setTimeout === "function" && typeof document !== "undefined") {
+      pollTimer = setTimeout(pollOnce, 1800);
+    }
+  }
 
   function setMsg(text, state = "") {
     const el = $("ch-proto-msg");
@@ -5011,8 +7511,10 @@ const CreatorHubChannelsProtocol = (() => {
     if (fileWrap) fileWrap.hidden = mode !== "endpoint_file";
     const proxyPanel = $("channels-proxy-panel");
     const bridgePanel = $("channels-bridge-panel");
+    const advDetails = $("channels-advanced-details");
     if (mode === "proxy" && proxyPanel) proxyPanel.open = true;
     if (mode === "endpoint_file" && bridgePanel) bridgePanel.open = true;
+    if ((mode === "endpoint" || mode === "endpoint_file") && advDetails) advDetails.open = true;
   }
 
   function renderCapabilities(caps, readMode) {
@@ -5054,8 +7556,9 @@ const CreatorHubChannelsProtocol = (() => {
         const capList = Array.isArray(rawCaps)
           ? rawCaps.map(x => String(x || "").trim()).filter(Boolean)
           : Object.entries(rawCaps || {}).filter(([, v]) => !!v).map(([k]) => k);
+        const cleanProbeUrl = cleanFinderUrl(probe.url || "https://channels.weixin.qq.com/web/pages/");
         box.innerHTML = `<b>握手成功 · 内置微信视频号代理已就绪</b>`
-          + `<div>页面：<code>${esc(probe.url || "https://channels.weixin.qq.com/web/pages/")}</code>`
+          + `<div>页面：<code>${esc(cleanProbeUrl)}</code>`
           + (probe.title ? ` · 标题：<b>${esc(probe.title)}</b>` : "")
           + ` · 已连接页面数：<b>${Number(probe.connected_pages || 1)}</b></div>`
           + (capList.length ? `<div>已挂载服务：<code>${esc(capList.join(" / "))}</code></div>` : "");
@@ -5128,18 +7631,34 @@ const CreatorHubChannelsProtocol = (() => {
         const sysLabel = proxy.system_proxy_managed && sysProxy.proxy_enable
           ? `WinINet 系统代理已指向 ${sysProxy.proxy_server || ("127.0.0.1:" + (proxy.proxy_port || 2023))}`
           : "系统代理未托管（手动模式）";
+        const upProxy = proxy.upstream_proxy || {};
+        const upLabel = upProxy.enabled && upProxy.server
+          ? ` · 链式上游 ${upProxy.server}`
+          : "";
         const connLabel = readyPages > 0
           ? `已就绪 ${readyPages} 个视频号页面`
-          : (connectedPages > 0 ? `已接入 ${connectedPages} 页，等待模块加载` : "请在微信中打开一次视频号页面");
-        statusText.textContent = `监听 127.0.0.1:${proxy.proxy_port || 2023} · ${sysLabel} · ${connLabel} · 已转发 ${Number(proxy.commands_forwarded || 0)} 条请求`;
+          : (connectedPages > 0 ? `已接入 ${connectedPages} 页，等待模块加载` : "请在微信内打开桥接链接或视频号网页");
+        statusText.textContent = `监听 127.0.0.1:${proxy.proxy_port || 2023} · ${sysLabel}${upLabel} · ${connLabel} · 已转发 ${Number(proxy.commands_forwarded || 0)} 条请求`;
       } else if (proxy.system_proxy?.low_integrity) {
         statusText.textContent = "检测到后端处于 Windows 低完整性级别（Low IL），无法自动改写系统代理；建议用外部 Python 启动 uvicorn，或取消勾选下方开关后手动将系统代理指向 127.0.0.1:" + (proxy.proxy_port || 2023) + "。";
       } else {
-        statusText.textContent = "仅拦截 channels.weixin.qq.com，其余网站流量原样加密直通，停止或退出软件时自动恢复系统代理。";
+        statusText.textContent = "仅拦截 channels.weixin.qq.com，其余网站流量原样加密直通（自动链式复用原本地代理），停止或退出软件时自动恢复系统代理。";
       }
     }
-    if (startBtn) startBtn.disabled = running;
-    if (stopBtn) stopBtn.disabled = !running;
+    if (startBtn) {
+      startBtn.disabled = running;
+      if (!running) {
+        startBtn.innerHTML = '<svg aria-hidden="true"><use href="#i-play"/></svg>一键连接本机微信';
+      } else if (readyPages > 0) {
+        startBtn.innerHTML = '<svg aria-hidden="true"><use href="#i-check"/></svg>已连通（重启自动恢复）';
+      } else {
+        startBtn.innerHTML = '<svg aria-hidden="true"><use href="#i-refresh"/></svg>正在自动等待微信接入…';
+      }
+    }
+    if (stopBtn) {
+      stopBtn.disabled = !running;
+      stopBtn.hidden = !running;
+    }
 
     if (caBadge) {
       if (caTrusted) {
@@ -5157,7 +7676,7 @@ const CreatorHubChannelsProtocol = (() => {
       if (caTrusted) {
         caText.textContent = `已安装到 ${ca.store || "CurrentUser\\Root"}（指纹 ${String(ca.thumbprint || "").slice(0, 12)}…）。`;
       } else {
-        caText.textContent = "本地自签名 CA 仅用于签发 channels.weixin.qq.com 本机证书；安装时请在 Windows 安全弹窗点击「是」。";
+        caText.textContent = "点击上方「一键连接本机微信」会自动安装本机根证书；安装时请在 Windows 安全弹窗点击「是」。";
       }
     }
     if (caInstallBtn) caInstallBtn.disabled = caTrusted;
@@ -5165,19 +7684,37 @@ const CreatorHubChannelsProtocol = (() => {
 
     if (pagesBox) {
       const pages = Array.isArray(proxy.pages) ? proxy.pages : [];
-      if (!pages.length) {
-        pagesBox.innerHTML = running
-          ? '<span class="field-help" style="margin:0">代理已监听，等待桌面微信打开 <code>https://channels.weixin.qq.com/web/pages/*</code> 页面…</span>'
-          : '<span class="field-help" style="margin:0">启动代理并在桌面微信中打开视频号后，此处将实时显示已桥接的视频号页面。</span>';
-      } else {
-        pagesBox.innerHTML = pages.map(p => {
-          const pill = p.ready
-            ? '<span class="pill done bare">协议就绪</span>'
-            : `<span class="pill pending bare">${esc(p.reason || "等待加载")}</span>`;
-          const copyBtn = p.url
-            ? `<button type="button" class="ghost sm" onclick="CreatorHubChannelsProtocol.copyPageUrl(${jsArg(p.url)})">复制链接</button>`
+      const bridgeUrl = String(proxy.bridge_entry_url || "https://channels.weixin.qq.com/platform/bridge");
+      if (!running && !pages.length) {
+        pagesBox.hidden = true;
+        pagesBox.innerHTML = "";
+      } else if (!pages.length) {
+        pagesBox.hidden = false;
+        if (!caTrusted && proxy.system_proxy_managed) {
+          pagesBox.innerHTML = `<div class="channels-proxy-page-row" data-guide="waiting"><div class="channels-proxy-page-copy"><span class="field-help" style="margin:0"><b>需要信任本机证书</b>：点击右侧按钮并在系统弹窗点击「是」，即可让微信信任本地视频号桥接。</span></div><div class="channels-proxy-page-meta"><button type="button" class="sm" onclick="CreatorHubChannelsProtocol.installProxyCert()"><svg aria-hidden="true"><use href="#i-shield"/></svg>安装根证书</button></div></div>`;
+        } else if (proxy.wechat_needs_restart) {
+          const tipHtml = `<b>开启前微信已在运行 · 按顺序点右侧两步即可</b>：先点「<b>① 一键重开微信</b>」让微信加载新代理，登录后点「<b>② 复制桥接链接并打开微信</b>」发到「文件传输助手」点开一次（点开即自动变绿，以后重启自动恢复）。`;
+          pagesBox.innerHTML = `<div class="channels-proxy-page-row" data-guide="waiting"><div class="channels-proxy-page-copy"><span class="field-help" style="margin:0">${tipHtml}</span></div><div class="channels-proxy-page-meta"><button type="button" class="ghost sm" onclick="CreatorHubChannelsProtocol.restartWechat()">① 一键重开微信</button><button type="button" class="sm" onclick="CreatorHubChannelsProtocol.copyAndOpenWechat(${jsArg(bridgeUrl)})"><svg aria-hidden="true"><use href="#i-copy"/></svg>② 复制桥接链接并打开微信</button></div></div>`;
+        } else {
+          const tipHtml = proxy.liteapp_detected
+            ? `<b>已检测到微信 4.2+ LiteApp 流量 · 最后一步</b>：点击右侧按钮自动复制 <code>${esc(bridgeUrl)}</code> 并唤起微信，粘贴到「文件传输助手」发送并点开一次即可（点开后本页自动变绿，保持窗口最小化即可）。`
+            : `<b>最后一步：在电脑微信点开一次桥接链接</b>：点击右侧按钮自动复制 <code>${esc(bridgeUrl)}</code> 并唤起微信，粘贴到「文件传输助手」发送并点开一次即可（点开后本页自动变绿；保留该链接下次点一下即可连）。`;
+          const restartBtn = proxy.wechat_running
+            ? `<button type="button" class="ghost sm" onclick="CreatorHubChannelsProtocol.restartWechat()">重开微信</button>`
             : "";
-          return `<div class="channels-proxy-page-row"><div class="channels-proxy-page-copy"><b>${esc(p.title || "微信视频号页面")}</b> <code>${esc(p.url || "")}</code></div><div class="channels-proxy-page-meta">${copyBtn}${pill}</div></div>`;
+          pagesBox.innerHTML = `<div class="channels-proxy-page-row" data-guide="waiting"><div class="channels-proxy-page-copy"><span class="field-help" style="margin:0">${tipHtml}</span></div><div class="channels-proxy-page-meta"><button type="button" class="sm" onclick="CreatorHubChannelsProtocol.copyAndOpenWechat(${jsArg(bridgeUrl)})"><svg aria-hidden="true"><use href="#i-copy"/></svg>复制桥接链接并打开微信</button>${restartBtn}<button type="button" class="ghost sm" onclick="CreatorHubChannelsProtocol.copyPageUrl(${jsArg(bridgeUrl)})">仅复制链接</button></div></div>`;
+        }
+      } else {
+        pagesBox.hidden = false;
+        pagesBox.innerHTML = pages.map(p => {
+          const cleanUrl = cleanFinderUrl(p.url);
+          const pill = p.ready
+            ? '<span class="pill done bare">协议就绪 · 自动重连</span>'
+            : `<span class="pill pending bare">${esc(p.reason || "等待加载")}</span>`;
+          const copyBtn = cleanUrl
+            ? `<button type="button" class="ghost sm" onclick="CreatorHubChannelsProtocol.copyPageUrl(${jsArg(cleanUrl)})">复制链接</button>`
+            : "";
+          return `<div class="channels-proxy-page-row" data-guide="${p.ready ? "ready" : "waiting"}"><div class="channels-proxy-page-copy"><b>${esc(p.title || "微信视频号页面")}</b> <code>${esc(cleanUrl)}</code></div><div class="channels-proxy-page-meta">${copyBtn}${pill}</div></div>`;
         }).join("");
       }
     }
@@ -5218,28 +7755,25 @@ const CreatorHubChannelsProtocol = (() => {
     const probe = probeOverride || data.probe || null;
 
     if (badge && summaryText) {
-      if (probe && probe.ok && probe.ready) {
+      const proxyReady = cfgState.connection_mode === "proxy" && proxyState.running && Number(proxyState.ready_pages || 0) > 0;
+      if ((probe && probe.ok && probe.ready) || proxyReady) {
         badge.className = "pill done";
         badge.textContent = "已连通微信视频号";
-        summaryText.textContent = "本机桌面微信 Finder 通道握手正常，可执行搜索、创作者采集、全量二级评论与视频解密。";
+        summaryText.textContent = "本机桌面微信通道运行正常，可执行搜索、创作者主页采集、全量二级评论与视频解密（下次打开软件自动恢复）。";
       } else if (probe && !probe.ok) {
         badge.className = "pill failed";
         badge.textContent = "连接未就绪";
         summaryText.textContent = probe.error || "本地微信 Finder 通道暂不可达";
       } else if (data.configured) {
         if (cfgState.connection_mode === "proxy") {
-          if (proxyState.running && Number(proxyState.ready_pages || 0) > 0) {
-            badge.className = "pill done";
-            badge.textContent = "代理已就绪";
-            summaryText.textContent = `内置本地代理 127.0.0.1:${proxyState.proxy_port || 2023} 已接入桌面微信视频号页面，可直接使用。`;
-          } else if (proxyState.running) {
+          if (proxyState.running) {
             badge.className = "pill pending";
-            badge.textContent = "代理待微信接入";
-            summaryText.textContent = "内置本地代理已运行，请在桌面微信中打开一次视频号页面。";
+            badge.textContent = "等待微信点开链接";
+            summaryText.textContent = "本地代理已就绪并正在实时监听，请在电脑微信「文件传输助手」点开桥接链接（点开后自动变绿，无需手动检测）。";
           } else {
             badge.className = "pill pending";
-            badge.textContent = "已选代理 · 未启动";
-            summaryText.textContent = "已配置内置视频号代理模式，请先在下方安装根证书并点击「启动代理并应用」。";
+            badge.textContent = "已保存 · 未启动";
+            summaryText.textContent = "点击下方「一键连接本机微信」即可立即开启通道。";
           }
         } else if (cfgState.connection_mode === "endpoint_file" && epInfo && !epInfo.exists) {
           badge.className = "pill pending";
@@ -5259,7 +7793,7 @@ const CreatorHubChannelsProtocol = (() => {
       } else {
         badge.className = "pill skipped";
         badge.textContent = "未配置";
-        summaryText.textContent = "当前仅支持创作者助手同步本账号作品与公开分享预览；建议启用「内置本机微信代理桥接」解锁全量能力。";
+        summaryText.textContent = "点击下方「一键连接本机微信」，一键完成证书检查、本地代理与开机恢复（仅本账号同步与发布可直接使用创作者助手）。";
       }
     }
 
@@ -5278,6 +7812,7 @@ const CreatorHubChannelsProtocol = (() => {
     renderProbeBox(probe);
     renderProxy(data.proxy);
     renderBridge(data.bridge);
+    syncAutoPoll(data.proxy);
   }
 
   function applyConfigToForm(data, force = false) {
@@ -5292,6 +7827,10 @@ const CreatorHubChannelsProtocol = (() => {
     assign("ch-proto-proxy-port", String(cfgState.proxy_port || data?.proxy?.proxy_port || 2023));
     assign("ch-proto-endpoint", cfgState.cdp_endpoint || "");
     assign("ch-proto-endpoint-file", cfgState.cdp_endpoint_file || "");
+    const sysCheck = $("ch-proxy-manage-sysproxy");
+    if (sysCheck && force && typeof cfgState.proxy_manage_sysproxy === "boolean") {
+      sysCheck.checked = cfgState.proxy_manage_sysproxy;
+    }
     if (force) {
       clearDirtyFlags();
     }
@@ -5377,8 +7916,13 @@ const CreatorHubChannelsProtocol = (() => {
           }),
         });
         const probeObj = res.probe || { ok: !!res.ok, ready: !!res.ready, error: res.error || "" };
-        if (lastStatus) renderStatus(lastStatus, probeObj);
-        else renderProbeBox(probeObj);
+        if (lastStatus) {
+          if (res.proxy) lastStatus = { ...lastStatus, proxy: res.proxy };
+          renderStatus(lastStatus, probeObj);
+        } else {
+          if (res.proxy) renderProxy(res.proxy);
+          renderProbeBox(probeObj);
+        }
         if (probeObj.ok && probeObj.ready) {
           setMsg("通道握手成功 ✓ 已命中微信原生视频号页面", "success");
           toast("微信视频号通道连通正常 ✓", "ok");
@@ -5469,6 +8013,18 @@ const CreatorHubChannelsProtocol = (() => {
     if (lastStatus?.bridge) renderBridge(lastStatus.bridge);
   }
 
+  async function silentCopyText(text) {
+    const clean = String(text || "").trim();
+    if (!clean) return false;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(clean);
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
   async function startProxy() {
     const btn = $("ch-proxy-start-btn");
     const proxyPort = Number($("ch-proto-proxy-port")?.value || 2023);
@@ -5479,8 +8035,13 @@ const CreatorHubChannelsProtocol = (() => {
       $("ch-proto-proxy-port")?.focus();
       return;
     }
-    setMsg(manageSysProxy ? "正在启动内置本地视频号代理并设置系统代理…" : "正在启动内置本地视频号代理（不修改系统代理）…");
-    await withBusy(btn, "启动中", async () => {
+    const caAlreadyTrusted = !!lastStatus?.proxy?.ca?.trusted;
+    setMsg(
+      manageSysProxy && !caAlreadyTrusted
+        ? "正在自动检查根证书（首次请在系统弹窗点「是」）并开启微信通道…"
+        : (manageSysProxy ? "正在一键开启本地视频号通道并保存自动恢复…" : "正在启动内置本地视频号代理（不修改系统代理）…")
+    );
+    await withBusy(btn, "连接中", async () => {
       try {
         const data = await api("/api/channels/protocol/proxy/start", {
           method: "POST",
@@ -5489,25 +8050,33 @@ const CreatorHubChannelsProtocol = (() => {
             proxy_port: proxyPort,
             enable_system_proxy: manageSysProxy,
             apply_to_config: true,
+            auto_install_cert: true,
           }),
         });
         applyConfigToForm(data, true);
         renderStatus(data);
-        const caTrusted = !!data?.proxy?.ca?.trusted;
-        const sysManagedMsg = manageSysProxy
-          ? "内置视频号代理已启动 ✓ 请在桌面微信打开一次视频号页面"
-          : `内置视频号代理已监听 127.0.0.1:${proxyPort}（未修改系统代理），请将 channels.weixin.qq.com 流量指向该端口`;
-        setMsg(
-          caTrusted
-            ? sysManagedMsg
-            : "内置代理已启动，请先点击「安装根证书」让微信信任本机证书",
-          caTrusted ? "success" : "warning"
-        );
-        toast("内置视频号代理已启动", "ok");
+        const readyNow = Number(data?.proxy?.ready_pages || 0) > 0;
+        const bridgeUrl = String(data?.proxy?.bridge_entry_url || "https://channels.weixin.qq.com/platform/bridge");
+        if (readyNow) {
+          setMsg("微信视频号通道已连通 ✓ 下次打开软件将自动恢复", "success");
+          toast("微信视频号通道已连通 ✓", "ok");
+        } else {
+          const copied = await silentCopyText(bridgeUrl);
+          const copyNote = copied ? "（桥接链接已自动复制）" : "";
+          if (!manageSysProxy) {
+            setMsg(`内置视频号代理已监听 127.0.0.1:${proxyPort}${copyNote}，请将 channels.weixin.qq.com 分流至该端口`, "success");
+          } else if (data?.proxy?.wechat_needs_restart) {
+            setMsg(`通道已开启${copyNote} ✓ 请按上方引导点「① 一键重开微信」→「② 复制桥接链接并打开微信」`, "success");
+          } else {
+            setMsg(`通道已开启${copyNote} ✓ 点击上方「复制桥接链接并打开微信」，在「文件传输助手」粘贴点开即自动连通`, "success");
+          }
+          toast("本地通道已开启，请在微信点开桥接链接", "ok");
+        }
+        globalThis.CreatorHubEngineSettings?.load?.();
         globalThis.CreatorHubTransportMatrix?.load?.();
       } catch (e) {
-        setMsg("启动代理失败：" + e.message, "error");
-        toast("启动代理失败：" + e.message, "err", 7000);
+        setMsg("一键连接失败：" + e.message, "error");
+        toast("一键连接失败：" + e.message, "err", 7000);
       }
     });
     if (lastStatus?.proxy) renderProxy(lastStatus.proxy);
@@ -5515,20 +8084,83 @@ const CreatorHubChannelsProtocol = (() => {
 
   async function stopProxy() {
     const btn = $("ch-proxy-stop-btn");
-    setMsg("正在停止代理并恢复 Windows 系统代理…");
-    await withBusy(btn, "停止中", async () => {
+    stopAutoPoll();
+    setMsg("正在断开通道并恢复 Windows 系统代理…");
+    await withBusy(btn, "断开中", async () => {
       try {
-        const data = await api("/api/channels/protocol/proxy/stop", { method: "POST" });
+        const data = await api("/api/channels/protocol/proxy/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ disable_auto_start: true }),
+        });
         applyConfigToForm(data, true);
         renderStatus(data);
-        setMsg("内置视频号代理已停止，已恢复系统代理设置", "");
-        toast("内置视频号代理已停止", "info");
+        setMsg("已关闭视频号微信通道，系统代理已恢复原状", "");
+        toast("视频号微信通道已关闭", "info");
+        globalThis.CreatorHubEngineSettings?.load?.();
         globalThis.CreatorHubTransportMatrix?.load?.();
       } catch (e) {
-        setMsg("停止代理失败：" + e.message, "error");
+        setMsg("关闭通道失败：" + e.message, "error");
       }
     });
     if (lastStatus?.proxy) renderProxy(lastStatus.proxy);
+  }
+
+  async function copyAndOpenWechat(url) {
+    const bridgeUrl = String(url || lastStatus?.proxy?.bridge_entry_url || "https://channels.weixin.qq.com/platform/bridge").trim();
+    const copied = await silentCopyText(bridgeUrl);
+    try {
+      const res = await api("/api/channels/protocol/wechat/open", { method: "POST" });
+      if (lastStatus && res?.proxy) {
+        lastStatus = { ...lastStatus, proxy: res.proxy };
+        renderStatus(lastStatus);
+      }
+      if (res?.ok) {
+        setMsg(
+          (copied ? "桥接链接已复制，已唤起电脑微信 ✓ " : "已唤起电脑微信 ✓ ")
+            + "请在「文件传输助手」粘贴发送并点击打开一次，本页将自动变绿",
+          "success"
+        );
+        toast("链接已复制并已打开微信，请在「文件传输助手」粘贴点开", "ok", 4500);
+      } else {
+        setMsg(
+          (copied ? "桥接链接已复制 ✓ " : "")
+            + (res?.error || "请手动切换到电脑微信，在「文件传输助手」粘贴发送并点开"),
+          copied ? "success" : "warning"
+        );
+        toast(copied ? "桥接链接已复制，请切到微信粘贴点开" : (res?.error || "请手动打开电脑微信"), copied ? "ok" : "err", 4500);
+      }
+    } catch (e) {
+      if (copied) {
+        setMsg("桥接链接已复制 ✓ 请切换到电脑微信「文件传输助手」粘贴发送并点开", "success");
+        toast("桥接链接已复制，请切到微信粘贴点开", "ok", 4000);
+      } else {
+        setMsg("唤起微信失败：" + e.message, "error");
+      }
+    }
+  }
+
+  async function restartWechat() {
+    const bridgeUrl = String(lastStatus?.proxy?.bridge_entry_url || "https://channels.weixin.qq.com/platform/bridge").trim();
+    await silentCopyText(bridgeUrl);
+    setMsg("正在重启电脑微信以应用新代理…");
+    try {
+      const res = await api("/api/channels/protocol/wechat/restart", { method: "POST" });
+      if (lastStatus && res?.proxy) {
+        lastStatus = { ...lastStatus, proxy: res.proxy };
+        renderStatus(lastStatus);
+      }
+      if (res?.ok) {
+        setMsg(res.message || "已重开电脑微信 ✓ 点击「进入微信」后在「文件传输助手」粘贴并点开桥接链接", "success");
+        toast("电脑微信已重开（桥接链接已复制）✓", "ok", 5000);
+      } else {
+        setMsg(res?.error || "未能自动重开微信，请手动在右下角托盘退出微信后重新打开", "warning");
+        toast(res?.error || "请手动退出并重开电脑微信", "err", 6000);
+      }
+    } catch (e) {
+      setMsg("重启微信失败：" + e.message, "error");
+      toast("重启微信失败：" + e.message, "err", 6000);
+    }
   }
 
   async function installProxyCert() {
@@ -5683,6 +8315,10 @@ const CreatorHubChannelsProtocol = (() => {
     uninstallProxyCert,
     downloadProxyCert,
     copyPageUrl,
+    copyAndOpenWechat,
+    restartWechat,
+    pollOnce,
+    stopAutoPoll,
     startBridge,
     stopBridge,
   };
@@ -5690,6 +8326,362 @@ const CreatorHubChannelsProtocol = (() => {
 globalThis.CreatorHubChannelsProtocol = CreatorHubChannelsProtocol;
 const QMAP = { "": "默认", highest: "原画", "1080": "1080P", "720": "720P", "540": "540P", lowest: "省流" };
 
+// 10b-diagnostics.js — 系统精简日志查看、运行期调试级别切换、一键复制排查摘要与脱敏诊断包导出。
+function openDiagnosticsSettings() {
+  switchTab("settings");
+  globalThis.CreatorHubWorkbench?.showSection?.("settings", "diagnostics");
+  globalThis.CreatorHubDiagnostics?.load?.();
+}
+
+const CreatorHubDiagnostics = (() => {
+  let filterLevel = "warn";
+  let logSource = "memory";
+  let searchTimer = null;
+  let lastLogDir = "";
+  let cachedEntries = [];
+
+  function fmtBytes(bytes) {
+    const n = Number(bytes || 0);
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / (1024 * 1024)).toFixed(2) + " MB";
+  }
+
+  function compactTimestamp(ts) {
+    const s = String(ts || "").trim();
+    // 2026-11-23 17:43:13.931 -> 11-23 17:43:13.931 (保留完整时间供悬浮提示)
+    return /^\d{4}-\d{2}-\d{2}\s+/.test(s) ? s.slice(5) : (s || "-");
+  }
+
+  function levelBadge(level) {
+    const lv = String(level || "INFO").toUpperCase();
+    if (lv === "ERROR" || lv === "CRITICAL") return `<span class="pill failed bare">${esc(lv === "CRITICAL" ? "CRIT" : "ERROR")}</span>`;
+    if (lv === "WARNING" || lv === "WARN") return `<span class="pill pending bare">WARN</span>`;
+    if (lv === "DEBUG") return `<span class="pill skipped bare">DEBUG</span>`;
+    return `<span class="pill downloading bare">INFO</span>`;
+  }
+
+  function rowToneClass(level) {
+    const lv = String(level || "").toUpperCase();
+    if (lv === "ERROR" || lv === "CRITICAL") return " lvl-error";
+    if (lv === "WARNING" || lv === "WARN") return " lvl-warn";
+    return "";
+  }
+
+  function syncFilterButtons() {
+    document.querySelectorAll("#diagnostics-card [data-diag-lvl]").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.diagLvl === filterLevel);
+    });
+    const warnCard = $("diag-card-warn");
+    const errCard = $("diag-card-err");
+    if (warnCard) warnCard.classList.toggle("is-active-filter", filterLevel === "warn");
+    if (errCard) errCard.classList.toggle("is-active-filter", filterLevel === "error");
+  }
+
+  function syncSearchClearButton() {
+    const input = $("diag-search-input");
+    const clearBtn = $("diag-search-clear");
+    if (clearBtn && input) clearBtn.hidden = !input.value.length;
+  }
+
+  function renderMeta(data) {
+    const counts = data?.memory_counts || {};
+    const warns = Number(counts.warnings || 0);
+    const errs = Number(counts.errors || 0);
+    const total = Number(counts.total || 0);
+    const warnPlusErr = warns + errs;
+    const activeLvl = String(data?.level || "info").toLowerCase();
+
+    // 1. 记录模式卡片与分段开关
+    const lvlPill = $("diag-level-pill");
+    if (lvlPill) {
+      const modeMap = {
+        info: ["is-info", "INFO 精简"],
+        debug: ["is-debug", "DEBUG 调试"],
+        warning: ["is-warn", "WARN 仅告警"],
+      };
+      const [tone, label] = modeMap[activeLvl] || modeMap.info;
+      lvlPill.className = "diag-mode-pill " + tone;
+      lvlPill.innerHTML = `<i class="diag-dot"></i>${esc(label)}`;
+    }
+    document.querySelectorAll("#diagnostics-card [data-diag-mode]").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.diagMode === activeLvl);
+    });
+    const modeHint = $("diag-mode-hint");
+    if (modeHint) {
+      modeHint.textContent = activeLvl === "debug"
+        ? "正在记录详细调试信息，复现后建议切回精简"
+        : activeLvl === "warning"
+          ? "仅记录告警与异常错误，常规操作静默"
+          : "默认静默高频轮询，仅留存关键轨迹与异常";
+    }
+
+    // 2. 告警与错误指标卡
+    const warnNum = $("diag-warn-num");
+    if (warnNum) warnNum.textContent = String(warns);
+    const errNum = $("diag-err-num");
+    if (errNum) errNum.textContent = String(errs);
+    const warnCard = $("diag-card-warn");
+    if (warnCard) warnCard.classList.toggle("has-warn", warns > 0);
+    const errCard = $("diag-card-err");
+    if (errCard) errCard.classList.toggle("has-err", errs > 0);
+
+    // 3. 本地存储占用卡
+    const filesCount = Array.isArray(data?.files) ? data.files.length : 0;
+    const fileCntEl = $("diag-file-cnt");
+    if (fileCntEl) fileCntEl.textContent = `${filesCount} 个文件`;
+    const sizeValEl = $("diag-size-val");
+    if (sizeValEl) sizeValEl.textContent = fmtBytes(data?.total_bytes || 0);
+
+    // 4. 控制台顶栏计数胶囊
+    const cntWarn = $("diag-cnt-warn");
+    if (cntWarn) cntWarn.textContent = String(warnPlusErr);
+    const cntErr = $("diag-cnt-err");
+    if (cntErr) cntErr.textContent = String(errs);
+    const cntAll = $("diag-cnt-all");
+    if (cntAll) cntAll.textContent = String(total);
+
+    // 5. 底部目录路径展示
+    if (data?.log_dir) {
+      lastLogDir = String(data.log_dir);
+      const dirCode = $("diag-dir-code");
+      if (dirCode) {
+        dirCode.textContent = lastLogDir;
+        dirCode.title = lastLogDir;
+      }
+    }
+  }
+
+  function renderEntries(entries, totalMemoryCount = 0) {
+    const box = $("diag-log-list");
+    if (!box) return;
+    cachedEntries = Array.isArray(entries) ? entries : [];
+
+    if (!cachedEntries.length) {
+      const hasQuery = Boolean($("diag-search-input")?.value?.trim());
+      if (hasQuery) {
+        box.innerHTML = `<div class="diag-empty-state">
+          <div class="diag-empty-halo is-neutral"><svg aria-hidden="true"><use href="#i-search"/></svg></div>
+          <div class="diag-empty-title">没有匹配的日志记录</div>
+          <div class="diag-empty-sub">请尝试缩短搜索关键字，或切换日志读取来源后重试。</div>
+          <div class="diag-empty-act"><button type="button" class="ghost sm" onclick="CreatorHubDiagnostics.clearSearch()">清除搜索条件</button></div>
+        </div>`;
+        return;
+      }
+      const isFiltered = filterLevel !== "all";
+      const actionBtn = isFiltered
+        ? `<div class="diag-empty-act"><button type="button" class="ghost sm" onclick="CreatorHubDiagnostics.setFilter('all')">查看全部精简运行记录${totalMemoryCount ? ` (${totalMemoryCount} 条)` : ""}</button></div>`
+        : "";
+      box.innerHTML = `<div class="diag-empty-state">
+        <div class="diag-empty-halo"><svg aria-hidden="true"><use href="#i-check"/></svg></div>
+        <div class="diag-empty-title">${filterLevel === "error" ? "当前暂无错误记录" : isFiltered ? "当前运行健康，暂无告警或错误" : "暂无运行日志"}</div>
+        <div class="diag-empty-sub">服务启动、写操作轨迹与后台调度均正常运作；高频页面轮询已自动静默，不会产生冗余刷屏。</div>
+        ${actionBtn}
+      </div>`;
+      return;
+    }
+
+    box.innerHTML = cachedEntries.map((item, idx) => {
+      const reqBadge = item.req_id ? `<span class="diag-log-req">req=${esc(item.req_id)}</span>` : "";
+      const excBlock = item.exception
+        ? `<details class="diag-log-exc"><summary>展开异常堆栈详情</summary><pre>${esc(item.exception)}</pre></details>`
+        : "";
+      return `<div class="diag-log-row${rowToneClass(item.level)}">
+        <span class="diag-log-ts" title="${esc(item.timestamp || "")}">${esc(compactTimestamp(item.timestamp))}</span>
+        <span>${levelBadge(item.level)}</span>
+        <span><span class="diag-log-mod" title="${esc(item.logger || "")}">${esc(item.logger || "app")}</span></span>
+        <span class="diag-log-msg">${reqBadge}${esc(item.message || "")}</span>
+        <button type="button" class="diag-row-copy" onclick="CreatorHubDiagnostics.copyEntry(${idx})" title="复制此条日志">复制</button>
+        ${excBlock}
+      </div>`;
+    }).join("");
+  }
+
+  async function load() {
+    if (!$("diagnostics-card")) return;
+    syncFilterButtons();
+    syncSearchClearButton();
+    const q = $("diag-search-input")?.value?.trim() || "";
+    const params = new URLSearchParams({
+      level: filterLevel,
+      source: logSource,
+      limit: "150",
+    });
+    if (q) params.set("q", q);
+    try {
+      const data = await api("/api/diagnostics/logs?" + params.toString());
+      renderMeta(data);
+      renderEntries(data.entries || [], Number(data?.memory_counts?.total || 0));
+    } catch (e) {
+      const box = $("diag-log-list");
+      if (box) {
+        box.innerHTML = `<div class="diag-empty-state">
+          <div class="diag-empty-halo is-neutral"><svg aria-hidden="true"><use href="#i-alert"/></svg></div>
+          <div class="diag-empty-title">读取日志失败</div>
+          <div class="diag-empty-sub">${esc(e.message)}</div>
+        </div>`;
+      }
+    }
+  }
+
+  function setFilter(nextLevel) {
+    filterLevel = ["all", "warn", "error"].includes(nextLevel) ? nextLevel : "warn";
+    syncFilterButtons();
+    load();
+  }
+
+  function setSource(nextSource) {
+    logSource = ["memory", "error.log", "app.log"].includes(nextSource) ? nextSource : "memory";
+    load();
+  }
+
+  function onSearchInput() {
+    syncSearchClearButton();
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(load, 200);
+  }
+
+  function clearSearch() {
+    const input = $("diag-search-input");
+    if (!input) return;
+    input.value = "";
+    syncSearchClearButton();
+    input.focus();
+    load();
+  }
+
+  async function changeLevel(nextLevel) {
+    const msgEl = $("diag-status-msg");
+    try {
+      const res = await api("/api/diagnostics/log-level", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level: nextLevel }),
+      });
+      if (msgEl) msgEl.textContent = res.note || "";
+      toast(res.note || "日志级别已更新", nextLevel === "debug" ? "info" : "ok", 4200);
+      await load();
+    } catch (e) {
+      toast("切换日志级别失败：" + e.message, "err");
+      await load();
+    }
+  }
+
+  async function openDir() {
+    try {
+      await api("/api/diagnostics/open-dir", { method: "POST" });
+      toast("已在文件管理器打开日志目录", "ok", 2200);
+    } catch (e) {
+      toast("打开日志目录失败：" + e.message, "err");
+    }
+  }
+
+  async function clearLogs() {
+    if (!await uiConfirm({
+      title: "清理本地历史日志",
+      message: "确认清空当前 app.log、error.log 及历史滚动备份日志？不会影响任何账号资料、数据库或媒体文件。",
+      okText: "确认清理",
+      danger: true,
+    })) return;
+    try {
+      await api("/api/diagnostics/clear-logs", { method: "POST" });
+      toast("已清理历史日志文件", "ok");
+      await load();
+    } catch (e) {
+      toast("清理日志失败：" + e.message, "err");
+    }
+  }
+
+  async function copyTextFallback(text) {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+
+  async function copyDirPath() {
+    if (!lastLogDir) return;
+    try {
+      await copyTextFallback(lastLogDir);
+      toast("已复制日志目录路径", "ok", 2000);
+    } catch {
+      toast("复制路径失败", "err");
+    }
+  }
+
+  async function copyEntry(index) {
+    const item = cachedEntries[index];
+    if (!item) return;
+    const reqPart = item.req_id ? `[req=${item.req_id}] ` : "";
+    const text = `${item.timestamp || ""} | ${item.level || "INFO"} | ${item.logger || "app"} | ${reqPart}${item.message || ""}`
+      + (item.exception ? `\n${item.exception}` : "");
+    try {
+      await copyTextFallback(text);
+      toast("已复制该条日志", "ok", 1800);
+    } catch {
+      toast("复制失败", "err");
+    }
+  }
+
+  async function copyReport() {
+    const btn = $("diag-copy-report-btn");
+    const note = $("diag-issue-note")?.value?.trim() || "";
+    await withBusy(btn, "正在生成", async () => {
+      try {
+        const res = await api("/api/diagnostics/report-text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ note }),
+        });
+        await copyTextFallback(res.text || "");
+        toast("已复制脱敏排查摘要，可直接粘贴发送给开发者", "ok", 4000);
+      } catch (e) {
+        toast("复制排查摘要失败：" + e.message, "err");
+      }
+    });
+  }
+
+  function exportZip() {
+    const note = $("diag-issue-note")?.value?.trim() || "";
+    const params = new URLSearchParams();
+    if (note) params.set("note", note);
+    const url = "/api/diagnostics/export.zip" + (params.toString() ? "?" + params.toString() : "");
+    const link = document.createElement("a");
+    link.href = url;
+    link.rel = "noopener";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    toast("正在导出脱敏诊断压缩包 (.zip)…", "ok", 3200);
+  }
+
+  return {
+    load,
+    setFilter,
+    setSource,
+    onSearchInput,
+    clearSearch,
+    changeLevel,
+    openDir,
+    clearLogs,
+    copyDirPath,
+    copyEntry,
+    copyReport,
+    exportZip,
+  };
+})();
+
+globalThis.CreatorHubDiagnostics = CreatorHubDiagnostics;
+
+// 11-share-notifications.js — 通用分享链接无水印下载、下载历史管理及通知渠道与 Webhook。
 // ─── 通用分享链接下载 ───
 let SHARE_LINKS = [], SHARE_LINK_INDEX = 0, SHARE_SOURCE = "", SHARE_ACCOUNTS = [];
 let SHARE_HISTORY = [], SHARE_HISTORY_PAGE = 1, SHARE_HISTORY_PAGE_SIZE = 10, SHARE_HISTORY_TOTAL = 0;
@@ -5721,7 +8713,7 @@ function filterShareAccounts() {
   const old = sel.value;
   const platform = shareAccountPlatform();
   const hasDetectedLink = !!SHARE_LINKS.length;
-  const knownAccountPlatform = ["douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"].includes(platform);
+  const knownAccountPlatform = ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(platform);
   const rows = knownAccountPlatform
     ? SHARE_ACCOUNTS.filter(a => a.platform === platform)
     : [];
@@ -5851,7 +8843,12 @@ function shareHistoryTitle(row) {
 }
 function shareHistoryType(row) {
   const value = String((row && (row.media_type || row.type)) || shareHistoryMetadata(row).media_type || "").toLowerCase();
-  return value === "images" || value === "image" || value === "图文" ? "images" : value === "video" || value === "视频" ? "video" : value;
+  if (value === "images" || value === "image" || value === "图文") return "images";
+  if (value === "video" || value === "视频") return "video";
+  const path = shareHistoryFirstPath(row).toLowerCase();
+  if (/\.(?:mp4|mov|webm|mkv|m4v|flv|avi)(?:$|[?#])/.test(path) || shareHistoryNumber(row, "duration") > 0) return "video";
+  if (/\.(?:jpe?g|png|webp|gif|avif|heic)(?:$|[?#])/.test(path)) return "images";
+  return value;
 }
 function shareHistoryCreateTime(row) {
   const direct = Number(row && row.create_time || 0);
@@ -5893,20 +8890,19 @@ function shareHistoryFirstPath(row) {
 }
 function shareHistoryPathCell(row) {
   const path = shareHistoryFirstPath(row);
-  if (!path) return `<span class="local-path-empty">—</span>`;
+  if (!path) return "";
   const p = contentPathMeta({ local_path: path, aweme_id: row.item_id });
   const files = shareHistoryFiles(row);
   const totalSize = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
   const fileHint = files.length > 1
     ? `${files.length} 个文件${totalSize ? ` · ${fmtShareSize(totalSize)}` : ""}`
     : (totalSize ? fmtShareSize(totalSize) : "");
-  return `<div class="local-path">
+  const dirLabel = [p ? (p.dir || "当前目录") : "当前目录", fileHint].filter(Boolean).join(" · ");
+  return `<div class="local-path" title="${esc(path)}">
     <div class="local-path-info">
-      <div class="local-path-file"><span class="local-path-name">${esc(p ? p.name : path)}</span>${p && p.ext ? `<span class="local-path-ext">${esc(p.ext)}</span>` : ""}</div>
-      <div class="local-path-dir">${esc(p ? (p.dir || "当前目录") : "当前目录")}</div>
-      ${fileHint ? `<span class="share-history-file-count">${esc(fileHint)}</span>` : ""}
+      <div class="local-path-file"><span class="local-path-name" title="${esc(path)}">${esc(p ? p.name : path)}</span>${p && p.ext ? `<span class="local-path-ext">${esc(p.ext)}</span>` : ""}</div>
+      <div class="local-path-dir" title="${esc(dirLabel)}">${esc(dirLabel)}</div>
     </div>
-    <button type="button" class="ghost local-path-action reveal" onclick="revealShareHistoryPath(${Number(row.id)},this)" data-tip="在文件夹中显示" aria-label="在文件夹中显示">${ic("i-folder")}</button>
   </div>`;
 }
 function populateShareHistoryFacets() {
@@ -5914,8 +8910,9 @@ function populateShareHistoryFacets() {
   if (!select) return;
   const old = select.value;
   const platforms = [...new Set(SHARE_HISTORY.map(shareHistoryPlatform).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const sharePf = { wechat: "视频号", channels: "视频号", youtube: "YouTube", weibo: "微博", twitter: "X", x: "X", facebook: "Facebook", generic: "通用站点" };
   select.innerHTML = `<option value="">全部平台</option>` + platforms.map(platform =>
-    `<option value="${esc(platform)}">${esc(PF_NAME[platform] || (platform === "generic" ? "通用站点" : platform))}</option>`).join("");
+    `<option value="${esc(platform)}">${esc(PF_NAME[platform] || sharePf[platform] || platform)}</option>`).join("");
   select.value = platforms.includes(old) ? old : "";
   if (select._csSync) select._csSync();
 }
@@ -5944,7 +8941,8 @@ function shareHistoryRow(row) {
   const typeName = type === "images" ? "图文" : type === "video" ? "视频" : (row.media_type || "媒体");
   const status = shareHistoryStatus(row);
   const platform = shareHistoryPlatform(row);
-  const platformName = PF_NAME[platform] || (platform === "generic" ? "通用站点" : platform || "通用站点");
+  const sharePf = { wechat: "视频号", channels: "视频号", youtube: "YouTube", weibo: "微博", twitter: "X", x: "X", facebook: "Facebook", generic: "通用站点" };
+  const platformName = PF_NAME[platform] || sharePf[platform] || platform || "通用站点";
   const cover = row.cover_url || metadata.thumbnail || "";
   const title = shareHistoryTitle(row);
   const author = row.author || metadata.uploader || metadata.channel || "";
@@ -5964,15 +8962,18 @@ function shareHistoryRow(row) {
     ${downloadTime ? `<span class="share-history-download-time" title="下载于 ${esc(downloadTime)}">下载于 ${esc(downloadTime)}</span>` : ""}
   </div>`;
   const quality = shareHistoryQuality(row);
+  const hasPath = Boolean(shareHistoryFirstPath(row));
+  const durBadge = duration ? `<span class="thumb-dur">${esc(fmtDur(duration))}</span>` : "";
+  const specSub = [quality, mediaCount > 1 ? `${mediaCount} 媒体` : (duration ? fmtDur(duration) : "")].filter(Boolean).join(" · ");
   return `<tr>
     <td class="content-check-cell"><input type="checkbox" data-id="${Number(row.id)}" onchange="shareHistoryToggleOne(${Number(row.id)},this.checked)" ${selShareHistory.has(row.id) ? "checked" : ""} aria-label="选择下载记录"></td>
-    <td class="content-cover-cell">${cover ? `<img class="thumb" src="${esc(cover)}" alt="${esc(title.slice(0, 20))}" referrerpolicy="no-referrer" loading="lazy" onclick="openShareHistoryPreview(${Number(row.id)})">` : `<span class="content-cover-empty" onclick="openShareHistoryPreview(${Number(row.id)})">${ic(type === "images" ? "i-image" : "i-film")}</span>`}</td>
-    <td class="content-desc-cell"><div class="content-desc-text" title="${esc(title)}">${esc(title)}</div>${descriptionMeta}</td>
-    <td><span class="content-kind">${esc(typeName)}</span>${quality ? `<span class="content-quality">${esc(quality)}</span>` : ""}${mediaCount ? `<span class="content-quality">${mediaCount} 个媒体</span>` : ""}</td>
+    <td class="content-cover-cell"><span class="content-cover-box" onclick="openShareHistoryPreview(${Number(row.id)})" title="点击站内预览">${cover ? `<img class="thumb" src="${esc(safeMediaUrl(cover))}" alt="${esc(title.slice(0, 20))}" referrerpolicy="no-referrer" loading="lazy">` : `<span class="content-cover-empty">${ic(type === "images" ? "i-image" : "i-film")}</span>`}${durBadge}</span></td>
+    <td class="content-desc-cell"><div class="content-desc-text clickable" title="${esc(title)}" onclick="openShareHistoryPreview(${Number(row.id)})">${esc(title)}</div>${descriptionMeta}</td>
+    <td><span class="content-kind">${esc(typeName)}</span>${specSub ? `<span class="content-quality">${esc(specSub)}</span>` : ""}</td>
     <td class="mut num">${contentTimeCell(createTime)}</td>
-    <td class="content-metrics num"><span class="metric like">${ic("i-heart")}${fmtNum(likeCount)}</span>${commentCount ? `<span class="metric">${ic("i-msg")}${fmtNum(commentCount)}</span>` : ""}${duration ? `<span class="metric">${ic("i-clock")}${fmtDur(duration)}</span>` : ""}${!files.length && mediaCount ? `<span class="metric">${ic("i-film")}${mediaCount}</span>` : ""}</td>
-    <td class="content-action-cell"><div class="content-status-row"><span class="pill ${status}">${contentStatusLabel(status)}</span>${error}</div><div class="content-action-buttons"><button class="ghost sm content-action-delete danger" onclick="deleteShareHistory(${Number(row.id)})" data-tip="删除记录" aria-label="删除下载记录">${ic("i-trash")}</button></div>${row.error ? `<div class="mut" style="max-width:180px;white-space:normal;margin-top:5px">${esc(row.error)}</div>` : ""}</td>
-    <td class="local-path-cell">${shareHistoryPathCell(row)}</td>
+    <td class="content-metrics num"><span class="metric like">${ic("i-heart")}${fmtNum(likeCount)}</span>${commentCount ? `<span class="metric">${ic("i-msg")}${fmtNum(commentCount)}</span>` : ""}</td>
+    <td class="content-status-cell"><div class="content-status-row"><span class="pill ${status}">${contentStatusLabel(status)}</span>${error}</div>${shareHistoryPathCell(row)}${row.error ? `<div class="content-error-preview" data-tip="${esc(row.error)}" title="${esc(row.error)}">${esc(row.error)}</div>` : ""}</td>
+    <td class="content-action-cell acttd"><div class="content-action-buttons"><button type="button" class="ghost sm content-icon-btn" onclick="openShareHistoryPreview(${Number(row.id)})" data-tip="站内预览" title="站内预览" aria-label="预览媒体">${ic("i-eye")}</button>${hasPath ? `<button type="button" class="ghost sm content-icon-btn local-path-action reveal" onclick="revealShareHistoryPath(${Number(row.id)},this)" data-tip="在文件夹中显示" title="在文件夹中显示" aria-label="在文件夹中显示">${ic("i-folder")}</button>` : ""}<button type="button" class="ghost sm content-action-delete danger" onclick="deleteShareHistory(${Number(row.id)})" data-tip="删除记录" title="删除记录" aria-label="删除下载记录">${ic("i-trash")}</button></div></td>
   </tr>`;
 }
 function renderShareHistoryPager(total) {
@@ -5993,8 +8994,10 @@ function renderShareHistoryPager(total) {
 }
 function updateShareHistorySelBar() {
   const count = selShareHistory.size;
-  $("sd-history-selcount").textContent = "已选 " + count;
+  $("sd-history-selcount").textContent = "已选 " + count + " 项";
   $("sd-history-selbar").style.display = count ? "inline-flex" : "none";
+  const barWrap = $("sd-history-selbar")?.closest?.(".wb-bulk-bar");
+  if (barWrap) barWrap.hidden = !count;
   const ids = [...document.querySelectorAll('#sd-history-body input[type="checkbox"]')].map(cb => +cb.dataset.id).filter(Boolean);
   const allSelected = ids.length > 0 && ids.every(id => selShareHistory.has(id));
   const selectedOnPage = ids.filter(id => selShareHistory.has(id)).length;
@@ -6272,13 +9275,14 @@ async function refreshWebhooks() {
     WEBHOOKS = subscriptions || [];
     $("wh-table").innerHTML = WEBHOOKS.map(row => `<tr>
       <td><b>${esc(row.name || "Webhook")}</b><div class="mut">${row.secret_configured ? "签名密钥已配置" : "未配置签名密钥"}</div></td>
-      <td><code title="${esc(row.url)}">${esc(row.url)}</code></td>
+      <td class="wrap" style="max-width:280px;word-break:break-all"><code title="${esc(row.url)}">${esc(row.url)}</code></td>
       <td>${(row.event_types || []).map(value => `<span class="meta-chip">${esc(value)}</span>`).join("")}</td>
       <td><span class="pill ${row.enabled ? "active" : "invalid"}">${row.enabled ? "启用" : "停用"}</span></td>
       <td class="acttd"><button class="ghost sm" onclick="editWebhook(${row.id})">编辑</button><button class="ghost sm" onclick="toggleWebhook(${row.id},${!row.enabled})">${row.enabled ? "停用" : "启用"}</button><button class="ghost sm danger" onclick="deleteWebhook(${row.id})">${ic("i-trash")}删除</button></td></tr>`).join("") || empty(5, "还没有 Webhook 订阅", "i-bolt", "添加订阅后，账号操作和业务变化会进入事件投递队列");
+    const whSt = { delivered: "已投递", failed: "投递失败", pending: "待投递", sending: "投递中" };
     $("wh-event-table").innerHTML = (events || []).map(row => `<tr>
       <td><b>${esc(row.event_type)}</b></td><td>${esc([row.aggregate_type, row.aggregate_id].filter(Boolean).join(" / ") || "—")}</td>
-      <td><span class="pill ${row.status === "delivered" ? "active" : row.status === "failed" ? "invalid" : "pending"}">${esc(row.status)}</span>${row.last_error ? `<div class="mut" title="${esc(row.last_error)}">${esc(row.last_error.slice(0, 100))}</div>` : ""}</td>
+      <td><span class="pill ${row.status === "delivered" ? "active" : row.status === "failed" ? "invalid" : "pending"}">${esc(whSt[row.status] || row.status)}</span>${row.last_error ? `<div class="mut" title="${esc(row.last_error)}">${esc(row.last_error.slice(0, 100))}</div>` : ""}</td>
       <td>${Number(row.delivered_count || 0)} 成功 / ${Number(row.attempts || 0)} 次</td><td>${collectionDate(row.created_at)}</td>
       <td class="acttd"><button class="ghost sm" onclick="dispatchWebhookEvent(${row.id})">${ic("i-play")}投递</button></td></tr>`).join("") || empty(6, "还没有事件", "i-inbox", "业务事件产生后会显示在这里");
   } catch (e) { toast("Webhook 事件中心加载失败：" + e.message, "err"); }
@@ -6372,6 +9376,7 @@ async function testChannel(id) {
 async function toggleChannel(id, enabled) { try { await api("/api/notifications/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }); refreshChannels(); } catch (e) { toast("操作失败:" + e.message, "err"); } }
 async function delChannel(id) { if (await uiConfirm({ title: "删除渠道", message: "删除该通知渠道?", okText: "删除", danger: true })) { try { await api("/api/notifications/" + id, { method: "DELETE" }); toast("渠道已删除", "ok"); refreshChannels(); } catch (e) { toast("删除失败:" + e.message, "err"); } } }
 
+// 12-collections.js — 关键词与创作者批量作品采集任务管理、结果筛选与报表导出。
 // ─── 监控 ───
 // ═══════════ 抖音 / 小红书关键词批量采集 ═══════════
 function parseCollectionKeywords(raw) {
@@ -6392,13 +9397,13 @@ function collectionSourceValue() {
 async function loadCollectionFavoriteBoards() {
   const accountId = Number($("col-account")?.value || 0);
   const select = $("col-board");
-  if (!select || !accountId || PLATFORM !== "xhs") return;
+  if (!select || !accountId || !["xhs", "rednote"].includes(PLATFORM)) return;
   const requestedAccount = accountId;
   select.disabled = true;
   select.innerHTML = '<option value="">正在加载收藏夹…</option>';
   $("col-board-help").textContent = "";
   try {
-    const boards = await api(`/api/accounts/${accountId}/xhs/favorite-boards`);
+    const boards = await api(`/api/accounts/${accountId}/${PLATFORM === "rednote" ? "rednote" : "xhs"}/favorite-boards`);
     if (Number($("col-account")?.value || 0) !== requestedAccount) return;
     COLLECTION_FAVORITE_BOARDS = boards || [];
     select.innerHTML = '<option value="">请选择收藏夹</option>' + COLLECTION_FAVORITE_BOARDS.map(board =>
@@ -6434,11 +9439,15 @@ function rebuildCollectionSources(xhs, channels, tiktok) {
   if (!sel) return;
   const current = sel.value;
   const bilibili = PLATFORM === "bilibili";
+  const rednote = PLATFORM === "rednote";
+  const instagram = PLATFORM === "instagram";
+  const twitter = PLATFORM === "twitter";
+  const facebook = PLATFORM === "facebook";
   sel.innerHTML = "";
   for (const o of COL_SOURCE_DEFS) {
     let keep;
-    if (o.channels) keep = channels || bilibili;
-    else if (o.xhs) keep = xhs;
+    if (o.channels) keep = channels || bilibili || instagram || twitter || facebook;
+    else if (o.xhs) keep = xhs || rednote;
     else keep = !(tiktok && o.value !== "keyword");
     if (!keep) continue;
     const opt = document.createElement("option");
@@ -6466,7 +9475,10 @@ function applyCollectionForm() {
   const source = collectionSourceValue();
   const channelsAccountOnly = channels && source === "account_works";
   const biliAccountOnly = PLATFORM === "bilibili" && source === "account_works";
-  const accountWorksOnly = channelsAccountOnly || biliAccountOnly;
+  const igAccountOnly = PLATFORM === "instagram" && source === "account_works";
+  const twAccountOnly = PLATFORM === "twitter" && source === "account_works";
+  const fbAccountOnly = PLATFORM === "facebook" && source === "account_works";
+  const accountWorksOnly = channelsAccountOnly || biliAccountOnly || igAccountOnly || twAccountOnly || fbAccountOnly;
   const favorite = ["favorite_all", "favorite_board"].includes(source);
   const alternate = source !== "keyword";
   if ($("col-keywords-wrap")) $("col-keywords-wrap").style.display = alternate ? "none" : "";
@@ -6477,19 +9489,25 @@ function applyCollectionForm() {
       ? "新建视频号本账号作品采集"
       : biliAccountOnly
       ? "新建哔哩哔哩本账号作品采集"
+      : igAccountOnly
+      ? "新建 Instagram 本账号作品采集"
+      : twAccountOnly
+      ? "新建 Twitter 本账号作品采集"
+      : fbAccountOnly
+      ? "新建 Facebook 本账号作品采集"
       : favorite
       ? `新建${platformName}收藏采集`
       : source === "creator"
         ? `新建${platformName}创作者采集`
         : `新建${platformName}关键词采集`;
   }
-  if ($("collection-create-sub")) $("collection-create-sub").textContent = channelsAccountOnly ? "同步当前登录账号的视频与图文，并按需采集评论与解密媒体" : biliAccountOnly ? "同步当前登录账号的投稿稿件，并按需采集评论与下载视频" : channels ? "通过微信原生 Finder 协议采集作品、解密视频并拉取全量评论线程" : favorite ? "导入收藏笔记并继续抓取详情与评论" : source === "creator" ? "导入创作者公开作品并抓取评论" : xhs ? "批量搜索笔记并抓取评论" : tiktok ? "通过离线签名 API 批量搜索 TikTok 视频并抓取评论" : PLATFORM === "bilibili" ? "通过离线 WBI 签名接口批量搜索视频并抓取评论" : "批量搜索视频并抓取评论";
+  if ($("collection-create-sub")) $("collection-create-sub").textContent = channelsAccountOnly ? "同步当前登录账号的视频与图文，并按需采集评论与解密媒体" : biliAccountOnly ? "同步当前登录账号的投稿稿件，并按需采集评论与下载视频" : igAccountOnly ? "同步当前登录账号的帖子与 Reels，并按需采集评论与下载原图/视频" : twAccountOnly ? "同步当前登录账号的推文与媒体，并按需采集回复与下载高清原图/视频" : fbAccountOnly ? "同步当前登录账号的 Facebook 动态与媒体，并按需采集评论与下载图片/视频" : channels ? "通过微信原生 Finder 协议采集作品、解密视频并拉取全量评论线程" : favorite ? "导入收藏笔记并继续抓取详情与评论" : source === "creator" ? "导入创作者公开作品并抓取评论" : xhs ? "批量搜索笔记并抓取评论" : tiktok ? "通过离线签名 API 批量搜索 TikTok 视频并抓取评论" : PLATFORM === "bilibili" ? "通过离线 WBI 签名接口批量搜索视频并抓取评论" : PLATFORM === "instagram" ? "通过 Instagram 双栈协议接口批量搜索话题/帖子并抓取评论" : PLATFORM === "twitter" ? "通过 Twitter 混合协议搜索推文并采集回复线程" : PLATFORM === "facebook" ? "通过 Facebook 隔离浏览器拦截 GraphQL 搜索帖子、群组或主页并采集评论" : "批量搜索视频并抓取评论";
   if ($("nav-collections-label")) $("nav-collections-label").textContent = channels ? "作品批量采集" : "关键词采集";
   if ($("col-content-limit-label")) $("col-content-limit-label").textContent = accountWorksOnly ? "作品上限" : "每词作品上限";
   if ($("col-page-limit-label")) $("col-page-limit-label").innerHTML = accountWorksOnly ? '作品页采集深度 <span class="field-scope">1–40 页</span>' : '每词采集深度 <span class="field-scope">1–40 页</span>';
   if ($("col-sort-wrap")) $("col-sort-wrap").style.display = (accountWorksOnly || source === "creator") ? "none" : "";
-  if ($("col-page-help")) $("col-page-help").textContent = channelsAccountOnly ? "依次读取视频与图文管理页(或复用微信原生 Finder 主页协议)。" : biliAccountOnly ? "依次读取创作中心稿件列表接口分页。" : channels ? "一页对应一次微信原生 Finder 搜索或主页翻页请求。" : xhs ? "一页对应一次搜索结果下滑或接口翻页。" : PLATFORM === "bilibili" ? "一页对应一次 WBI 搜索或 UP 主空间投稿接口翻页。" : "一页对应一次搜索结果下滑。";
-  if ($("col-source-ref")) $("col-source-ref").placeholder = PLATFORM === "douyin" ? "抖音 sec_uid" : PLATFORM === "xhs" ? "小红书 user_id" : PLATFORM === "shipinhao" ? "视频号 v2_...@finder / sph 标识 / 主页链接" : PLATFORM === "bilibili" ? "哔哩哔哩 UP 主 mid / space 主页链接 / 视频分享文案" : "快手 user_id / 主页链接 / 短链 / 分享文案";
+  if ($("col-page-help")) $("col-page-help").textContent = channelsAccountOnly ? "依次读取视频与图文管理页(或复用微信原生 Finder 主页协议)。" : biliAccountOnly ? "依次读取创作中心稿件列表接口分页。" : igAccountOnly ? "依次读取 Instagram 用户时间线 feed/user 分页。" : twAccountOnly ? "依次读取当前账号时间线 UserTweets 分页。" : fbAccountOnly ? "依次读取当前 Facebook 账号主页时间线滚动分页。" : channels ? "一页对应一次微信原生 Finder 搜索或主页翻页请求。" : (xhs || PLATFORM === "rednote") ? "一页对应一次搜索结果下滑或接口翻页。" : PLATFORM === "bilibili" ? "一页对应一次 WBI 搜索或 UP 主空间投稿接口翻页。" : PLATFORM === "instagram" ? "一页对应一次 tags/sections 或 feed/user 接口翻页。" : PLATFORM === "twitter" ? "一页对应一次 SearchTimeline 或 UserTweets 时间线翻页。" : PLATFORM === "facebook" ? "一页对应一次 Facebook 搜索或主页/群组时间线滚动拦截。" : "一页对应一次搜索结果下滑。";
+  if ($("col-source-ref")) $("col-source-ref").placeholder = PLATFORM === "douyin" ? "抖音 sec_uid" : PLATFORM === "xhs" ? "小红书 user_id" : PLATFORM === "rednote" ? "海外小红书 user_id / www.rednote.com 主页链接" : PLATFORM === "shipinhao" ? "视频号 v2_...@finder / sph 标识 / 主页链接" : PLATFORM === "bilibili" ? "哔哩哔哩 UP 主 mid / space 主页链接 / 视频分享文案" : PLATFORM === "instagram" ? "Instagram @username / 主页链接 / 数字 UID" : PLATFORM === "twitter" ? "Twitter @username / x.com 主页链接 / 数字 UID" : PLATFORM === "facebook" ? "Facebook 个人主页 / 公共主页 / 群组链接或数字 ID" : "快手 user_id / 主页链接 / 短链 / 分享文案";
   resetCollectionCreatorState();
   if ($("col-replies-help")) $("col-replies-help").textContent = `采集${platformName}当前可返回的回复`;
   if ($("collection-callout-title")) $("collection-callout-title").textContent = channelsAccountOnly ? "支持创作者助手本账号同步与微信原生 Finder 协议增强" : channels ? "连接本机已登录微信即可搜索、采主页、抓全量评论与解密下载（无需网页账号）" : "作品上限、采集深度和停止条件任一满足即结束";
@@ -6499,6 +9517,12 @@ function applyCollectionForm() {
     ? "TikTok 当前默认 native：关键词、评论和二级回复均由离线签名 API 直连，全程不打开浏览器；只有在设置中手动选择 auto/browser 才会使用页面。直播不在采集范围；视频发布请使用独立发布入口。"
     : PLATFORM === "bilibili"
     ? "哔哩哔哩默认使用离线 WBI 签名 API 直连搜索视频、读取 UP 主空间与本账号稿件、抓取主评论与楼中楼回复，并携带 Referer 下载渐进式 MP4 媒体；仅在普通接口兼容失败时按设置回退浏览器。"
+    : PLATFORM === "instagram"
+    ? "Instagram 默认使用 Mobile v1 / Web API 直连搜索标签与关键词、读取创作者主页与 Reels、通过 stream_comments 抓取评论与回复，并按序号保存单帖或混合轮播原图/视频；普通兼容失败时自动回退独立浏览器。"
+    : PLATFORM === "twitter"
+    ? "Twitter 默认结合轻量 Syndication/REST 与独立浏览器拦截 GraphQL 时间线，支持关键词搜索、创作者主页、本账号推文及回复线程采集，并自动选取最高码率 MP4 与 ?name=orig 原图下载。"
+    : PLATFORM === "facebook"
+    ? "Facebook 采用独立隔离浏览器拦截原生 GraphQL 与 DOM 双层提取，支持关键词帖子搜索、个人/公共主页、公开或已加入群组及本账号动态采集与评论抓取；纯文字帖子将自动标记跳过媒体下载。"
     : xhs
     ? "小红书采集复用所选账号的可见浏览器或显式 API 读取模式；最新、类型、时间和数据门槛会在入库前复核；任务串行执行，可随时取消，已入库结果会保留。"
     : PLATFORM === "kuaishou"
@@ -6610,9 +9634,129 @@ function collectionProgress(job) {
   const currentFraction = itemTotal && processedKeywords < totalKeywords ? itemIndex / itemTotal : 0;
   return Math.min(100, Math.round((processedKeywords + currentFraction) * 100 / totalKeywords));
 }
+function openCollectionVerifyBrowser(jobId) {
+  const job = COLLECTION_JOBS.find(item => item.id === Number(jobId));
+  if (!job || !job.account_id) return;
+  let targetUrl = "";
+  if (job.platform === "douyin" && job.source_type === "keyword") {
+    const kw = String(job.current_keyword || (job.keywords && job.keywords[0]) || "").trim();
+    if (kw) targetUrl = "https://www.douyin.com/search/" + encodeURIComponent(kw);
+  }
+  openAccountBrowser(job.account_id, targetUrl);
+}
+let COLLECTION_RENDERED_JOB_ID = 0;
+let COLLECTION_RENDERED_SIG = "";
+function collectionJobResultSig(job, page = COLLECTION_PAGE) {
+  if (!job) return "";
+  return [
+    job.id,
+    Math.max(1, Number(page) || 1),
+    job.status,
+    Number(job.content_count || 0),
+    Number(job.comment_count || 0),
+    Number(job.error_count || 0),
+    Number(job.current_item_index || 0),
+  ].join(":");
+}
+const selCollection = new Set();
+function collectionSelectableCheckboxes() {
+  return [...document.querySelectorAll('#collection-job-table .collection-task:not([hidden]) input[type="checkbox"][data-id]:not(:disabled)')];
+}
+function collectionToggleOne(id, on) {
+  const numId = Number(id);
+  if (!numId) return;
+  on ? selCollection.add(numId) : selCollection.delete(numId);
+  const card = document.querySelector(`#collection-job-table .collection-task[data-job-id="${numId}"]`);
+  if (card) card.classList.toggle("is-selected", !!on);
+  updateCollectionSelBar();
+}
+function collectionToggleAll(on) {
+  collectionSelectableCheckboxes().forEach(cb => {
+    const id = Number(cb.dataset.id);
+    if (!id) return;
+    cb.checked = !!on;
+    on ? selCollection.add(id) : selCollection.delete(id);
+    cb.closest(".collection-task")?.classList.toggle("is-selected", !!on);
+  });
+  updateCollectionSelBar();
+}
+function collectionSelAllToggle() {
+  const ids = collectionSelectableCheckboxes().map(cb => Number(cb.dataset.id)).filter(Boolean);
+  const allSel = ids.length > 0 && ids.every(id => selCollection.has(id));
+  collectionToggleAll(!allSel);
+}
+function collectionSelClear() {
+  selCollection.clear();
+  document.querySelectorAll('#collection-job-table input[type="checkbox"][data-id]').forEach(cb => {
+    cb.checked = false;
+    cb.closest(".collection-task")?.classList.remove("is-selected");
+  });
+  updateCollectionSelBar();
+}
+function updateCollectionSelBar() {
+  const n = selCollection.size;
+  const ids = collectionSelectableCheckboxes().map(cb => Number(cb.dataset.id)).filter(Boolean);
+  const selectedInView = ids.filter(id => selCollection.has(id)).length;
+  const allSel = ids.length > 0 && selectedInView === ids.length;
+  const countEl = $("collection-selcount"), bar = $("collection-selbar");
+  if (countEl) {
+    countEl.textContent = (n && selectedInView !== n)
+      ? `已选 ${n} 项（当前视图 ${selectedInView} 项）`
+      : `已选 ${n} 项`;
+  }
+  if (bar) bar.style.display = n ? "inline-flex" : "none";
+  const barWrap = $("collection-bulk-bar") || bar?.closest?.(".wb-bulk-bar");
+  if (barWrap) barWrap.hidden = !n;
+  const btn = $("collection-selall-btn");
+  if (btn) {
+    btn.textContent = allSel ? "取消全选" : "全选";
+    btn.disabled = ids.length === 0;
+  }
+}
+async function collectionBatchDelete() {
+  if (!selCollection.size) return;
+  const ids = [...selCollection];
+  const btn = evtBtn();
+  if (!await uiConfirm({
+    title: "批量删除采集任务",
+    message: `确认删除选中的 ${ids.length} 个采集任务及其作品、评论记录吗？本地已下载文件不会被删除。`,
+    okText: "删除",
+    danger: true,
+  })) return;
+  await withBusy(btn, "删除中", async () => {
+    try {
+      const r = await api("/api/collections/batch-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      const deletedIds = new Set(Array.isArray(r.deleted_ids) ? r.deleted_ids.map(Number) : ids);
+      const skipped = Array.isArray(r.skipped_running) ? r.skipped_running.length : 0;
+      const deleted = Number(r.deleted || 0);
+      selCollection.clear();
+      if (COLLECTION_RENDERED_JOB_ID && deletedIds.has(Number(COLLECTION_RENDERED_JOB_ID))) {
+        COLLECTION_RENDERED_JOB_ID = 0;
+        COLLECTION_RENDERED_SIG = "";
+      }
+      if (COLLECTION_JOB_ID && deletedIds.has(Number(COLLECTION_JOB_ID))) {
+        closeCollectionResults();
+      }
+      if (deleted > 0 && skipped > 0) {
+        toast(`已删除 ${deleted} 个采集任务，另有 ${skipped} 个正在执行中已跳过（请先取消）`, "info", 6000);
+      } else if (deleted === 0 && skipped > 0) {
+        toast(`所选 ${skipped} 个任务正在执行中，请先取消后再删除`, "err", 5000);
+      } else {
+        toast(`已删除 ${deleted} 个采集任务，本地文件已保留`, "ok");
+      }
+      await refreshCollections();
+    } catch (e) {
+      toast("批量删除失败：" + e.message, "err");
+    }
+  });
+}
 function renderCollectionJobs() {
   const body = $("collection-job-table"); if (!body) return;
-  body.innerHTML = COLLECTION_JOBS.map(job => {
+  const html = COLLECTION_JOBS.map(job => {
     const status = collectionStatus(job.status);
     const percent = collectionProgress(job);
     const sourceLabel = job.source_type === "keyword" ? "关键词" : "来源";
@@ -6624,20 +9768,24 @@ function renderCollectionJobs() {
       (sourceValues.length > 5 ? `<span class="meta-chip more">+${sourceValues.length - 5}</span>` : "");
     const canCancel = ["pending", "running"].includes(job.status);
     const canRetry = ["done", "partial", "failed", "canceled"].includes(job.status);
-    const canEdit = canRetry && ["douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"].includes(job.platform);
+    const canEdit = canRetry && ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(job.platform);
+    const isRunning = job.status === "running";
+    const isSelected = !isRunning && selCollection.has(job.id);
+    const needsManualClear = !!(job.manual_review_required && Number(job.account_id) > 0);
     const errorText = collectionLastError(job);
     const sortLabel = { general: "综合", latest: "最新", most_liked: "最多点赞" }[job.search_sort] || "综合";
     const timeLabel = { all: "不限时间", day: "一天内", week: "一周内", half_year: "半年内" }[job.publish_time] || "不限时间";
     const typeLabel = { all: "全部类型", video: "视频", images: "图文" }[job.content_type] || "全部类型";
     const threshold = [Number(job.min_likes) > 0 ? `≥${fmtNum(job.min_likes)} 赞` : "", Number(job.min_comments) > 0 ? `≥${fmtNum(job.min_comments)} 评` : ""].filter(Boolean).join(" · ");
-    return `<article class="collection-task" role="listitem" aria-label="任务 ${job.id}，${status.label}">
-      <div class="collection-task-meta"><div><span class="collection-task-label">任务状态</span><span class="pill ${status.cls}">${status.label}</span></div><time class="collection-task-created" datetime="${esc(job.created_at || "")}">${collectionDate(job.created_at)}</time></div>
+    return `<article class="collection-task${isSelected ? " is-selected" : ""}" role="listitem" data-job-id="${job.id}" aria-label="任务 ${job.id}，${status.label}">
+      <div class="collection-task-meta"><div class="collection-task-meta-head"><label class="collection-task-check${isRunning ? " is-disabled" : ""}" title="${isRunning ? "正在执行中的任务需先取消后再删除" : `选择采集任务 #${job.id}`}"><input type="checkbox" data-id="${job.id}" aria-label="选择采集任务 #${job.id}" onchange="collectionToggleOne(${job.id}, this.checked)"${isSelected ? " checked" : ""}${isRunning ? " disabled" : ""}></label><div><span class="collection-task-label">任务状态</span><span class="pill ${status.cls}">${status.label}</span></div></div><time class="collection-task-created" datetime="${esc(job.created_at || "")}">${collectionDate(job.created_at)}</time></div>
       <div class="collection-task-keywords"><span class="collection-task-label">${sourceLabel}</span><div class="keyword-stack">${keywords}</div>${job.current_keyword ? `<div class="collection-step">当前：${esc(job.current_keyword)}</div>` : ""}</div>
       <div class="collection-task-config"><span class="collection-task-label">采集配置</span><div class="collection-task-config-main">${job.max_contents_per_keyword} 作品/${job.source_type === "keyword" ? "词" : "来源"} · ${job.max_pages_per_keyword || 12} 深度页${job.source_type === "keyword" ? ` · ${sortLabel}` : ""}</div><div class="collection-task-config-sub">${timeLabel} · ${typeLabel}${threshold ? ` · ${threshold}` : ""} · ${job.max_comments_per_content} 评论/作品<br>${job.include_replies ? "含二级评论 · " : ""}${job.download_media ? "下载媒体" : "仅采数据"} · 连续 ${job.stagnant_pages || 3} 页无新增停止</div></div>
       <div class="collection-task-progress"><span class="collection-task-label">执行进度</span><div class="job-progress"><div class="job-progress-head"><span>${esc(job.current_step || "等待执行")}</span><b>${percent}%</b></div><div class="progress-track" role="progressbar" aria-label="任务 ${job.id} 进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><div class="progress-fill" style="width:${percent}%"></div></div><div class="collection-step">${keywordProgress}${itemProgress} · 已采 ${fmtNum(job.content_count)} 作品 / ${fmtNum(job.comment_count)} 评论</div></div></div>
       ${job.error_count ? `<button type="button" class="collection-task-error" onclick="openCollectionResults(${job.id})" title="${esc(errorText)}">${ic("i-info")}<span class="collection-task-error-text">${job.error_count} 条异常 · ${esc(errorText)}</span><span class="collection-task-error-link">查看详情</span></button>` : ""}
       <div class="collection-task-actions" aria-label="任务 ${job.id} 操作">
         <button type="button" class="sm collection-task-primary" onclick="openCollectionResults(${job.id})">${ic("i-eye")}查看结果</button>
+        ${needsManualClear ? `<button type="button" class="ghost sm" onclick="openCollectionVerifyBrowser(${job.id})" title="直接打开对应搜索/站点页面检查并完成验证">打开验证页</button><button type="button" class="ghost sm" onclick="clearRiskAccount(${job.account_id})" title="确认验证已完成或无需验证后，解除风控并立即恢复任务">解除风控继续</button>` : ""}
         ${canEdit ? `<button type="button" class="ghost sm" onclick="editCollection(${job.id})">${ic("i-settings")}编辑</button>` : ""}
         <button type="button" class="ghost sm" onclick="exportCollection(${job.id})"${job.content_count ? "" : " disabled"}>${ic("i-download")}导出</button>
         ${canCancel ? `<button type="button" class="ghost sm" onclick="cancelCollection(${job.id})">${ic("i-x")}取消任务</button>` : ""}
@@ -6646,10 +9794,12 @@ function renderCollectionJobs() {
       </div>
     </article>`;
   }).join("") || collectionTaskEmpty();
+  setHtmlIfChanged(body, html);
+  updateCollectionSelBar();
 }
 async function refreshCollections() {
   const isCurrent = beginViewRequest("collections");
-  if (!$("collection-job-table") || !["douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili"].includes(PLATFORM)) return;
+  if (!$("collection-job-table") || !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM)) return;
   try {
     const requestedPlatform = PLATFORM;
     const jobs = await api("/api/collections?platform=" + encodeURIComponent(requestedPlatform));
@@ -6657,6 +9807,7 @@ async function refreshCollections() {
     // Keep platform data isolated even if an older backend ignores the filter.
     COLLECTION_JOBS = (Array.isArray(jobs) ? jobs : [])
       .filter(job => job.platform === requestedPlatform);
+    pruneSel(selCollection, COLLECTION_JOBS.filter(j => j.status !== "running").map(j => j.id));
     const active = COLLECTION_JOBS.filter(j => ["pending", "running"].includes(j.status)).length;
     if ($("tb-col")) $("tb-col").textContent = active || COLLECTION_JOBS.length;
     renderCollectionJobs();
@@ -6664,7 +9815,10 @@ async function refreshCollections() {
       const job = COLLECTION_JOBS.find(j => j.id === COLLECTION_JOB_ID);
       if (job) {
         updateCollectionResultStats(job);
-        if (CURRENT_TAB === "collections") await loadCollectionContents(COLLECTION_PAGE, true);
+        const nextSig = collectionJobResultSig(job, COLLECTION_PAGE);
+        if (CURRENT_TAB === "collections" && nextSig !== COLLECTION_RENDERED_SIG) {
+          await loadCollectionContents(COLLECTION_PAGE, true);
+        }
       }
       else closeCollectionResults();
     }
@@ -6791,14 +9945,24 @@ function updateCollectionResultStats(job) {
 }
 async function openCollectionResults(jobId) {
   const btn = evtBtn();
-  COLLECTION_JOB_ID = Number(jobId); COLLECTION_PAGE = 1;
+  const nextJobId = Number(jobId);
+  const sameRenderedJob = COLLECTION_RENDERED_JOB_ID === nextJobId;
+  COLLECTION_JOB_ID = nextJobId; COLLECTION_PAGE = 1;
   window.dispatchEvent(new Event("creatorhub:agent-context"));
   const job = COLLECTION_JOBS.find(j => j.id === COLLECTION_JOB_ID);
   if (job) updateCollectionResultStats(job);
   $("collection-results-card").style.display = "";
   globalThis.CreatorHubWorkbench?.collectionDetail?.(true);
+  const targetSig = collectionJobResultSig(job, 1);
+  const hasCachedDom = sameRenderedJob && targetSig && targetSig === COLLECTION_RENDERED_SIG
+    && Boolean($("collection-content-list")?.querySelector(".collection-result-item"));
+  if (hasCachedDom) {
+    const reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    $("collection-results-card").scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
+    return;
+  }
   await withBusy(btn, "加载中", async () => {
-    await loadCollectionContents(1);
+    await loadCollectionContents(1, sameRenderedJob);
     const reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     $("collection-results-card").scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
   });
@@ -6830,19 +9994,20 @@ function collectionFileDisplay(item) {
 function collectionResultCard(item) {
   const title = item.desc || item.aweme_id || "未命名作品";
   const isGallery = item.media_type === "images";
-  const typeLabel = isGallery ? `图集${item.media_count > 1 ? ` · ${item.media_count} 张` : ""}` : "视频";
+  const isTextOnly = (item.platform === "twitter" || item.platform === "facebook") && !item.media_count && !item.cover_url && item.media_type !== "video";
+  const typeLabel = isTextOnly ? "纯文本" : (isGallery ? `图集${item.media_count > 1 ? ` · ${item.media_count} 张` : ""}` : "视频");
   const canPreview = Boolean(item.preview_available);
   const file = collectionFileDisplay(item);
   const fileExists = Boolean(item.local_exists);
-  const downloadClass = fileExists ? "done" : item.download_status === "failed" ? "failed" : "skipped";
-  const downloadLabel = fileExists ? "已下载" : item.download_status === "failed" ? "下载失败" : item.download_status === "done" ? "文件缺失" : "未下载";
+  const downloadClass = fileExists ? "done" : (!isTextOnly && item.download_status === "failed") ? "failed" : "skipped";
+  const downloadLabel = fileExists ? "已下载" : isTextOnly ? "纯文字帖" : item.download_status === "failed" ? "下载失败" : item.download_status === "done" ? "文件缺失" : "未下载";
   const byline = [item.author_name || "未知作者", item.create_time ? fmtTime(item.create_time) : "", item.aweme_id || ""].filter(Boolean);
   const authorId = String(item.author_id || "").trim();
   const authorRow = authorId
     ? `<div class="collection-author-row"><button type="button" class="collection-author-chip" data-author-id="${esc(authorId)}" onclick="copyCollectionAuthorId(this)" title="点击复制创作者 ID：${esc(authorId)}" aria-label="复制创作者 ID：${esc(authorId)}"><span>创作者 ID: ${esc(authorId)}</span>${ic("i-copy")}</button></div>`
     : "";
   const cover = item.cover_url
-    ? `<img src="${esc(item.cover_url)}" alt="${esc(title.slice(0, 60))}封面" loading="lazy" referrerpolicy="no-referrer">`
+    ? `<img src="${esc(safeMediaUrl(item.cover_url))}" alt="${esc(title.slice(0, 60))}封面" loading="lazy" referrerpolicy="no-referrer">`
     : `<span class="collection-cover-empty">${ic(isGallery ? "i-image" : "i-film")}</span>`;
   const filePanel = fileExists ? `<div class="collection-file-panel" title="${esc(file.path)}">
     <div class="collection-file-main">${ic("i-folder")}<div class="collection-file-info">
@@ -6853,7 +10018,7 @@ function collectionResultCard(item) {
       <button type="button" class="ghost collection-icon-action" onclick="revealCollectionFile(${item.job_id},${item.id},this)" data-tip="在文件夹中显示" aria-label="在文件夹中显示">${ic("i-folder")}</button>
       <button type="button" class="ghost collection-icon-action" data-path="${esc(file.path)}" onclick="copyCollectionPath(this)" data-tip="复制本地路径" aria-label="复制本地路径">${ic("i-copy")}</button>
     </div>
-  </div>` : `<div class="collection-download-note${item.download_status === "failed" ? " failed" : ""}">${item.error ? esc(item.error) : "本地文件尚不可用，可先预览平台媒体或打开原作品"}</div>`;
+  </div>` : `<div class="collection-download-note${(!isTextOnly && item.download_status === "failed") ? " failed" : ""}">${isTextOnly ? "纯文字推文（无图片/视频附件），已完整采集正文与评论" : (item.error ? esc(item.error) : "本地文件尚不可用，可先预览平台媒体或打开原作品")}</div>`;
   return `<article class="collection-result-item">
     <button type="button" class="collection-result-cover" onclick="openCollectionPreview(${item.job_id},${item.id})" aria-label="预览：${esc(title.slice(0, 80))}"${canPreview ? "" : " disabled"}>
       ${cover}<span class="collection-cover-type">${esc(typeLabel)}</span>
@@ -6914,22 +10079,28 @@ function copyCollectionPath(button) {
 }
 async function loadCollectionContents(page = COLLECTION_PAGE, quiet = false) {
   if (!COLLECTION_JOB_ID) return;
+  const targetJobId = COLLECTION_JOB_ID;
   COLLECTION_PAGE = Math.max(1, Number(page) || 1);
   const isCurrent = beginViewRequest("collection-contents", () => `${COLLECTION_JOB_ID}:${COLLECTION_PAGE}`);
   const body = $("collection-content-list");
-  if (!quiet) body.innerHTML = collectionResultSkeleton(4);
+  if (!quiet) setHtmlIfChanged(body, collectionResultSkeleton(4));
   try {
-    const result = await api(`/api/collections/${COLLECTION_JOB_ID}/contents?page=${COLLECTION_PAGE}&page_size=20`);
+    const result = await api(`/api/collections/${targetJobId}/contents?page=${COLLECTION_PAGE}&page_size=20`);
     if (!isCurrent()) return;
     COLLECTION_PAGE = result.page;
-    body.innerHTML = (result.items || []).map(collectionResultCard).join("") || collectionEmpty("任务暂时没有作品结果", "采集中可稍后刷新；失败任务可查看错误并续跑");
+    const html = (result.items || []).map(collectionResultCard).join("") || collectionEmpty("任务暂时没有作品结果", "采集中可稍后刷新；失败任务可查看错误并续跑");
+    setHtmlIfChanged(body, html);
+    const job = COLLECTION_JOBS.find(j => j.id === targetJobId);
+    COLLECTION_RENDERED_JOB_ID = targetJobId;
+    COLLECTION_RENDERED_SIG = collectionJobResultSig(job, COLLECTION_PAGE);
     $("collection-result-count").textContent = `共 ${fmtNum(result.total)} 个作品`;
     const pager = $("collection-pager");
-    pager.innerHTML = `<button class="ghost sm" onclick="loadCollectionContents(${result.page - 1})"${result.page <= 1 ? " disabled" : ""}>${ic("i-prev")}上一页</button><span class="mut">第 ${result.page} / ${result.pages} 页 · 共 ${fmtNum(result.total)} 条</span><button class="ghost sm" onclick="loadCollectionContents(${result.page + 1})"${result.page >= result.pages ? " disabled" : ""}>下一页${ic("i-next")}</button>`;
+    setHtmlIfChanged(pager, `<button class="ghost sm" onclick="loadCollectionContents(${result.page - 1})"${result.page <= 1 ? " disabled" : ""}>${ic("i-prev")}上一页</button><span class="mut">第 ${result.page} / ${result.pages} 页 · 共 ${fmtNum(result.total)} 条</span><button class="ghost sm" onclick="loadCollectionContents(${result.page + 1})"${result.page >= result.pages ? " disabled" : ""}>下一页${ic("i-next")}</button>`);
     pager.hidden = result.pages <= 1;
   } catch (e) {
     if (!isCurrent()) return;
-    body.innerHTML = collectionEmpty("结果加载失败", e.message);
+    COLLECTION_RENDERED_SIG = "";
+    setHtmlIfChanged(body, collectionEmpty("结果加载失败", e.message));
     $("collection-result-count").textContent = "";
   }
 }
@@ -7048,7 +10219,7 @@ async function deleteCollection(jobId) {
   const btn = evtBtn();
   if (!await uiConfirm({ title: "删除采集任务", message: "将删除任务及其作品、评论记录；本地已下载文件不会被删除。", okText: "删除", danger: true })) return;
   await withBusy(btn, "删除中", async () => {
-    try { await api(`/api/collections/${jobId}`, { method: "DELETE" }); if (COLLECTION_JOB_ID === jobId) closeCollectionResults(); toast("任务记录已删除，本地文件已保留", "ok"); await refreshCollections(); }
+    try { await api(`/api/collections/${jobId}`, { method: "DELETE" }); selCollection.delete(Number(jobId)); if (COLLECTION_RENDERED_JOB_ID === Number(jobId)) { COLLECTION_RENDERED_JOB_ID = 0; COLLECTION_RENDERED_SIG = ""; } if (COLLECTION_JOB_ID === jobId) closeCollectionResults(); toast("任务记录已删除，本地文件已保留", "ok"); await refreshCollections(); }
     catch (e) { toast("删除失败：" + e.message, "err"); }
   });
 }
@@ -7059,18 +10230,19 @@ function exportCollection(jobId) {
   document.body.appendChild(link); link.click(); link.remove();
 }
 
+// 13-monitors-contents.js — 作品监控目标管理、已捕获内容库检索、批量操作与本地文件定位。
 async function addMonitor() {
   const btn = evtBtn() || document.querySelector('button[onclick="addMonitor()"]');
   if (btn?.disabled) return;
   await withBusy(btn, "识别中", async () => {
-  const target_kind = (PLATFORM === "xhs" && $("t-kind")) ? $("t-kind").value : "creator";
+  const target_kind = (["xhs", "rednote"].includes(PLATFORM) && $("t-kind")) ? $("t-kind").value : "creator";
   const normalizedTarget = target_kind === "keyword"
     ? $("t-url").value.trim()
     : await normalizeMonitorTarget(null, { quiet: true });
   if (normalizedTarget === null) return;
   const url_or_secuid = $("t-url").value.trim();
   if (!url_or_secuid) { toast(target_kind === "keyword" ? "请输入搜索关键词" : "请输入主页链接 / 短链 / id", "err"); return; }
-  if (["xhs", "douyin", "tiktok"].includes(PLATFORM) && !$("t-acc").value) {
+  if (["xhs", "rednote", "douyin", "tiktok"].includes(PLATFORM) && !$("t-acc").value) {
     const platformName = PF_NAME[PLATFORM] || "当前平台";
     const available = PLATFORM === "tiktok"
       ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
@@ -7088,10 +10260,10 @@ async function addMonitor() {
           url_or_secuid, platform: PLATFORM, target_kind,
           account_id: PLATFORM === "shipinhao" ? null : ($("t-acc").value ? +$("t-acc").value : null),
           interval_seconds: monitorIntervalSeconds("t-interval"),
-          initial_backfill_count: PLATFORM !== "xhs"
+          initial_backfill_count: !["xhs", "rednote"].includes(PLATFORM)
             ? ($("t-backfill").value === "" ? null : +$("t-backfill").value) : 0,
           download_dir: $("t-dir").value.trim(),
-          video_quality: PLATFORM === "xhs" ? "" : $("t-quality").value,
+          video_quality: ["xhs", "rednote"].includes(PLATFORM) ? "" : $("t-quality").value,
           download_enabled: downloadMode !== "none",
           media_filter: downloadMode === "none" ? "all" : downloadMode,
           max_scrolls: +$("t-max-scrolls").value,
@@ -7327,9 +10499,83 @@ function monitorStrategySummary(t) {
   if ((t.include_keywords || []).length) filters.push(`含 ${t.include_keywords.join("/")}`);
   if ((t.exclude_keywords || []).length) filters.push(`排除 ${t.exclude_keywords.join("/")}`);
   const filterLabel = filters.length ? filters.join(" · ") : "无入库筛选";
-  return `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px" title="${esc(filterLabel)}"><span class="pill q bare">深度 ${depth}</span><span class="pill q bare">上限 ${limit || "不限"}</span>${filters.length ? `<span class="pill q bare">${esc(filterLabel)}</span>` : ""}</div>`;
+  return `<span class="pill q bare" title="${esc(filterLabel)}">深度 ${depth}</span><span class="pill q bare" title="${esc(filterLabel)}">上限 ${limit || "不限"}</span>${filters.length ? `<span class="pill q bare" title="${esc(filterLabel)}">${esc(filterLabel)}</span>` : ""}`;
+}
+const selMon = new Set();
+const MON_CBS = '#mon-table input[type="checkbox"][data-id]';
+function monToggleOne(id, on) {
+  on ? selMon.add(id) : selMon.delete(id);
+  const cb = document.querySelector(`#mon-table input[type="checkbox"][data-id="${id}"]`);
+  cb?.closest("tr")?.classList.toggle("is-selected", !!on);
+  updateMonSelBar();
+}
+function monToggleAll(on) {
+  document.querySelectorAll(MON_CBS).forEach(cb => {
+    const id = +cb.dataset.id; if (!id) return;
+    cb.checked = !!on;
+    on ? selMon.add(id) : selMon.delete(id);
+    cb.closest("tr")?.classList.toggle("is-selected", !!on);
+  });
+  updateMonSelBar();
+}
+function monSelAllToggle() {
+  const ids = [...document.querySelectorAll(MON_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
+  const allSel = ids.length > 0 && ids.every(id => selMon.has(id));
+  monToggleAll(!allSel);
+}
+function monSelClear() {
+  selMon.clear();
+  document.querySelectorAll(MON_CBS).forEach(cb => {
+    cb.checked = false;
+    cb.closest("tr")?.classList.remove("is-selected");
+  });
+  updateMonSelBar();
+}
+function updateMonSelBar() {
+  const n = selMon.size;
+  const ids = [...document.querySelectorAll(MON_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
+  const selectedInView = ids.filter(id => selMon.has(id)).length;
+  const allSel = ids.length > 0 && selectedInView === ids.length;
+  const countEl = $("mon-selcount"), bar = $("mon-selbar");
+  if (countEl) {
+    countEl.textContent = (n && selectedInView !== n)
+      ? `已选 ${n} 项（当前视图 ${selectedInView} 项）`
+      : `已选 ${n} 项`;
+  }
+  if (bar) bar.style.display = n ? "inline-flex" : "none";
+  const barWrap = bar?.closest?.(".wb-bulk-bar");
+  if (barWrap) barWrap.hidden = !n;
+  const btn = $("mon-selall-btn");
+  if (btn) { btn.textContent = allSel ? "取消全选" : "全选"; btn.disabled = ids.length === 0; }
+  const sa = $("mon-selall");
+  if (sa) { sa.checked = allSel; sa.indeterminate = selectedInView > 0 && !allSel; sa.disabled = ids.length === 0; }
+}
+async function monBatchDelete() {
+  if (!selMon.size) return;
+  const ids = [...selMon];
+  const btn = evtBtn();
+  if (!await uiConfirm({
+    title: "批量删除作品监控",
+    message: `确认删除选中的 ${ids.length} 个作品监控任务吗？已抓取的作品记录与本地文件会保留。`,
+    okText: "删除",
+    danger: true,
+  })) return;
+  await withBusy(btn, "删除中", async () => {
+    try {
+      const r = await api("/api/monitors/batch-delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      toast(`已删除 ${r.deleted || 0} 个作品监控`, "ok");
+      selMon.clear();
+      await refreshMonitors();
+      refreshContents();
+    } catch (e) { toast("批量删除失败:" + e.message, "err"); }
+  });
 }
 function monRow(t) {
+  const plainLabel = t.target_kind === "keyword"
+    ? `#${t.keyword || ""}` : (t.nickname || (t.sec_uid || "").slice(0, 12));
   const label = t.target_kind === "keyword"
     ? `<span class="ic-text">${ic("i-hash")}${esc(t.keyword)}</span>` : esc(t.nickname || (t.sec_uid || "").slice(0, 12));
   const acc = ACCOUNTS.find(a => a.id === t.account_id);
@@ -7341,16 +10587,16 @@ function monRow(t) {
     : `<div class="ic-text" style="font-size:11px;margin-top:2px;color:var(--danger)">${ic("i-info")}未绑定账号</div>`;
   const downloadLabel = t.download_enabled === false ? "仅记录"
     : ({ all: "全部下载", video: "仅视频", images: "仅图集" }[t.media_filter] || "全部下载");
-  return `<tr>
-    <td><div class="user-cell">${t.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(t.avatar))}" alt="" referrerpolicy="no-referrer">` : ""}<div><span>${label}</span>${t.alias ? `<div class="alias-line">${esc(t.alias)}</div>` : ""}${accTag}</div></div></td>
+  const selected = selMon.has(t.id);
+  return `<tr${selected ? ' class="is-selected"' : ""}>
+    <td class="task-check-cell"><label class="task-selection" title="选择此作品监控"><input type="checkbox" data-id="${t.id}" aria-label="选择作品监控 ${esc(plainLabel)}" onchange="monToggleOne(${t.id}, this.checked)"${selected ? " checked" : ""}></label></td>
+    <td><div class="user-cell">${t.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(t.avatar))}" alt="" referrerpolicy="no-referrer">` : `<span class="wb-avatar-fallback" style="width:30px;height:30px;flex:0 0 30px;font-size:13px;border-radius:50%" aria-hidden="true">${esc((plainLabel || "监").replace(/^#/, "").slice(0, 1))}</span>`}<div><span title="${esc(plainLabel)}">${label}</span>${t.alias ? `<div class="alias-line" title="${esc(t.alias)}">${esc(t.alias)}</div>` : ""}${accTag}</div></div></td>
     <td>${metaChips(t)}</td>
     <td class="num"><button type="button" class="ghost sm monitor-record-link" data-monitor-records="${t.id}" onclick="showMonitorRecords(${t.id})">查看记录 <span>${t.content_count || 0}</span></button></td>
     <td class="num">${monitorIntervalText(t.interval_seconds)}</td>
-    <td class="wrap" style="max-width:230px">
-      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px"><span class="pill q bare">${downloadLabel}</span></div>
-      ${monitorStrategySummary(t)}
-      ${t.platform === "xhs" ? "" : `<span class="pill q bare">${QMAP[t.video_quality] || "默认画质"}</span> `}
-      <span class="mut" title="${esc(t.download_dir || "默认目录")}" style="display:inline-block;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle">${esc(t.download_dir || "默认")}</span></td>
+    <td class="wrap" style="max-width:240px">
+      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="pill q bare">${downloadLabel}</span>${(t.platform === "xhs" || t.platform === "rednote") ? "" : `<span class="pill q bare">${QMAP[t.video_quality] || "默认画质"}</span>`}${monitorStrategySummary(t)}</div>
+      ${t.download_dir ? `<div class="mut" title="${esc(t.download_dir)}" style="font-size:11px;margin-top:3px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">目录：${esc(t.download_dir)}</div>` : ""}</td>
     <td class="mut">${t.last_scan_at ? new Date(t.last_scan_at + "Z").toLocaleString() : "—"}${t.last_error ? ` <span class="warn-ic" title="${esc(t.last_error)}">${ic("i-info")}</span>` : ""}${autoRunHint(t.next_auto_run_at)}</td>
     <td><span class="pill ${t.enabled ? "active" : "paused"}">${t.enabled ? "监控中" : "已暂停"}</span></td>
     <td class="acttd">
@@ -7363,27 +10609,32 @@ function monRow(t) {
 function renderMonitorRows() {
   const groupName = $("mon-group") ? $("mon-group").value : "";
   const tag = $("mon-tag") ? $("mon-tag").value : "";
+  const status = $("mon-status") ? $("mon-status").value : "";
   const query = (($("mon-search") && $("mon-search").value) || "").trim().toLocaleLowerCase();
   const rows = MONITORS.filter(t => {
     if (!matchesMeta(t, groupName, tag)) return false;
+    if (status === "enabled" && !t.enabled) return false;
+    if (status === "paused" && t.enabled) return false;
+    if (status === "error" && !t.last_error) return false;
     if (!query) return true;
     return [monitorBaseName(t), t.alias, t.group_name, ...itemTags(t)]
       .join(" ").toLocaleLowerCase().includes(query);
   });
   if ($("mon-filter-count")) $("mon-filter-count").textContent = `显示 ${rows.length} / ${MONITORS.length}`;
   $("mon-table").innerHTML = rows.map(monRow).join("")
-    || empty(8, "没有匹配的监控", "i-target", MONITORS.length ? "调整分组、标签或搜索条件" : "添加目标后，在这里查看采集进度。", MONITORS.length ? "" : "monitors");
+    || empty(9, "没有匹配的监控", "i-target", MONITORS.length ? "调整分组、标签或搜索条件" : "添加目标后，在这里查看采集进度。", MONITORS.length ? "" : "monitors");
+  updateMonSelBar();
 }
 async function refreshMonitors() {
   const isCurrent = beginViewRequest("monitors");
   let ts;
   try { ts = await api("/api/monitors?platform=" + PLATFORM); }
   catch (e) {
-    if (isCurrent() && !MONITORS.length) $("mon-table").innerHTML = empty(8, "监控暂未加载", "i-info", "请检查连接并重新加载。");
+    if (isCurrent() && !MONITORS.length) $("mon-table").innerHTML = empty(9, "监控暂未加载", "i-info", "请检查连接并重新加载。");
     return;
   }
   if (!isCurrent()) return;
-  MONITORS = ts; populateMonitorFacets(); populateContentSrc();
+  MONITORS = ts; pruneSel(selMon, ts.map(t => t.id)); populateMonitorFacets(); populateContentSrc();
   $("stat-mon").textContent = ts.filter(t => t.enabled).length;
   if ($("tb-mon")) $("tb-mon").textContent = ts.length;
   renderMonitorRows();
@@ -7407,7 +10658,7 @@ async function runNow(id) {
   refreshMonitors(); refreshContents();
 }
 async function toggleMon(id) { try { await api("/api/monitors/" + id + "/toggle", { method: "POST" }); refreshMonitors(); } catch (e) { toast("操作失败:" + e.message, "err"); } }
-async function delMon(id) { if (await uiConfirm({ title: "删除监控", message: "删除该监控?", okText: "删除", danger: true })) { try { await api("/api/monitors/" + id, { method: "DELETE" }); toast("监控已删除", "ok"); refreshMonitors(); } catch (e) { toast("删除失败:" + e.message, "err"); } } }
+async function delMon(id) { if (await uiConfirm({ title: "删除监控", message: "删除该监控?", okText: "删除", danger: true })) { try { await api("/api/monitors/" + id, { method: "DELETE" }); selMon.delete(id); toast("监控已删除", "ok"); refreshMonitors(); } catch (e) { toast("删除失败:" + e.message, "err"); } } }
 
 // ─── 内容 ───
 function fmtTime(unix) { return unix ? new Date(unix * 1000).toLocaleString() : "—"; }
@@ -7441,13 +10692,13 @@ function contentPathMeta(r) {
 }
 function contentPathCell(r) {
   const p = contentPathMeta(r);
-  if (!p) return `<span class="local-path-empty">—</span>`;
-  return `<div class="local-path">
+  if (!p) return "";
+  const rawPath = String(r.local_path || "").trim();
+  return `<div class="local-path" title="${esc(rawPath)}">
     <div class="local-path-info">
-      <div class="local-path-file"><span class="local-path-name">${esc(p.name)}</span>${p.ext ? `<span class="local-path-ext">${esc(p.ext)}</span>` : ""}</div>
-      <div class="local-path-dir">${esc(p.dir || "当前目录")}</div>
+      <div class="local-path-file"><span class="local-path-name" title="${esc(rawPath)}">${esc(p.name)}</span>${p.ext ? `<span class="local-path-ext">${esc(p.ext)}</span>` : ""}</div>
+      <div class="local-path-dir" title="${esc(p.dir || "当前目录")}">${esc(p.dir || "当前目录")}</div>
     </div>
-    <button type="button" class="ghost local-path-action reveal" onclick="revealContentPath(${r.id},this)" data-tip="在文件夹中显示" aria-label="在文件夹中显示">${ic("i-folder")}</button>
   </div>`;
 }
 async function revealContentPath(id, btn) {
@@ -7479,8 +10730,10 @@ function contentSelAllToggle() {
 function contentSelClear() { selContent.clear(); const sa = $("content-selall"); if (sa) sa.checked = false; refreshContents(); }
 function updateContentSelBar() {
   const n = selContent.size;
-  $("content-selcount").textContent = "已选 " + n;
+  $("content-selcount").textContent = "已选 " + n + " 项";
   $("content-selbar").style.display = n ? "inline-flex" : "none";
+  const barWrap = $("content-selbar")?.closest?.(".wb-bulk-bar");
+  if (barWrap) barWrap.hidden = !n;
   const ids = [...document.querySelectorAll(CONTENT_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
   const allSel = ids.length > 0 && ids.every(id => selContent.has(id));
   const selectedOnPage = ids.filter(id => selContent.has(id)).length;
@@ -7503,8 +10756,11 @@ function commentSelAllToggle() {
 }
 function commentSelClear() { selComment.clear(); const sa = $("comment-selall"); if (sa) sa.checked = false; refreshComments(); }
 function updateCommentSelBar() {
-  const n = selComment.size; const c = $("comment-selcount"), b = $("comment-batchbtn");
-  c.textContent = "已选 " + n; c.style.display = n ? "inline" : "none"; b.style.display = n ? "inline-flex" : "none";
+  const n = selComment.size; const c = $("comment-selcount"), bar = $("comment-selbar");
+  if (c) c.textContent = "已选 " + n + " 项";
+  if (bar) bar.style.display = n ? "inline-flex" : "none";
+  const barWrap = bar?.closest?.(".wb-bulk-bar");
+  if (barWrap) barWrap.hidden = !n;
   const ids = [...document.querySelectorAll(COMMENT_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
   const allSel = ids.length > 0 && ids.every(id => selComment.has(id));
   const selectedOnPage = ids.filter(id => selComment.has(id)).length;
@@ -7521,29 +10777,46 @@ async function commentBatchDelete() {
 function srcOf(r) {
   return contentSourceMarkup(r);
 }
+let CONTENT_VIEW_MODE = (() => {
+  try { return localStorage.getItem("dym-content-view") || "auto"; } catch (e) { return "auto"; }
+})();
+function effectiveContentViewMode() {
+  if (CONTENT_VIEW_MODE === "cards" || CONTENT_VIEW_MODE === "table") return CONTENT_VIEW_MODE;
+  return PLATFORM === "xhs" ? "cards" : "cards";
+}
+function setContentViewMode(mode) {
+  CONTENT_VIEW_MODE = mode === "table" ? "table" : "cards";
+  try { localStorage.setItem("dym-content-view", CONTENT_VIEW_MODE); } catch (e) {}
+  refreshContents(false);
+}
 function noteCard(r) {
   const typeIc = r.media_type === "images" ? "i-image" : "i-play";
-  const typeLabel = r.media_type === "images" ? "图文" : "视频";
+  const durText = r.duration ? (typeof fmtDur === "function" ? " " + fmtDur(r.duration) : "") : "";
+  const typeLabel = (r.media_type === "images" ? "图文" : "视频") + durText;
   const cover = r.cover_url
-    ? `<img class="ncard-cover" src="${esc(safeMediaUrl(r.cover_url))}" alt="${esc((r.desc || "笔记").slice(0, 20))}" referrerpolicy="no-referrer" loading="lazy" onclick="openPreview(${r.id})">`
-    : `<div class="ncard-cover ph" onclick="openPreview(${r.id})">${ic("i-image")}</div>`;
+    ? `<img class="ncard-cover" src="${esc(safeMediaUrl(r.cover_url))}" alt="${esc((r.desc || "作品").slice(0, 20))}" referrerpolicy="no-referrer" loading="lazy" onclick="openPreview(${r.id})">`
+    : `<div class="ncard-cover ph" onclick="openPreview(${r.id})">${ic(r.media_type === "images" ? "i-image" : "i-film")}</div>`;
+  const hasLocal = Boolean(String(r.local_path || "").trim());
+  const canPickRepost = ["douyin", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && r.download_status === "done";
   return `<div class="ncard">
     ${cover}
-    <span class="ncard-type">${ic(typeIc)}${typeLabel}</span>
-    <label class="ncard-selection" title="选择这条笔记"><input type="checkbox" class="ncard-sel" data-id="${r.id}" aria-label="选择这条笔记" onchange="contentToggleOne(${r.id}, this.checked)" ${selContent.has(r.id) ? "checked" : ""}></label>
+    <span class="ncard-type">${ic(typeIc)}${esc(typeLabel)}</span>
+    <label class="ncard-selection" title="选择这条作品"><input type="checkbox" class="ncard-sel" data-id="${r.id}" aria-label="选择这条作品" onchange="contentToggleOne(${r.id}, this.checked)" ${selContent.has(r.id) ? "checked" : ""}></label>
     <div class="ncard-body">
-      <p class="ncard-title">${esc(r.desc || "(无标题)")}</p>
+      <p class="ncard-title" style="cursor:pointer" onclick="openPreview(${r.id})">${esc(r.desc || "(无标题)")}</p>
       ${srcOf(r)}
       <div class="ncard-captured"><span class="content-origin-label">抓取入库</span>${contentCapturedTime(r.captured_at)}</div>
       <div class="ncard-foot">
-        <span>发布 · ${fmtTime(r.create_time)}</span>
-        <span class="like">${ic("i-heart")}${fmtNum(r.like_count)}</span>
+        <span>${fmtTime(r.create_time)}</span>
+        <span class="like">${ic("i-heart")}${fmtNum(r.like_count)} · 💬${fmtNum(r.comment_count)}</span>
       </div>
       <div class="ncard-actions">
         <span class="pill ${r.download_status}" style="flex:1;justify-content:center" title="${esc(r.error || "")}">${contentStatusLabel(r.download_status)}${r.error ? " ⓘ" : ""}</span>
+        ${hasLocal ? `<button class="ghost sm" style="flex:0 0 auto" onclick="revealContentPath(${r.id},this)" title="打开文件夹">${ic("i-folder")}</button>` : ""}
         ${["failed", "skipped"].includes(r.download_status) ? `<button class="ghost sm" onclick="retryDl(${r.id})">${r.download_status === "skipped" ? "下载" : "重试"}</button>` : ""}
+        ${canPickRepost ? `<button class="ghost sm" onclick="pickRepostTarget(${r.id})">转发</button>` : ""}
         ${(PLATFORM === "xhs" && r.download_status === "done") ? `<button class="ghost sm" onclick="repostDouyin(${r.id})">发抖音</button>` : ""}
-        <button class="ghost sm danger" onclick="delContent(${r.id})">${ic("i-trash")}删除</button>
+        <button class="ghost sm danger" style="flex:0 0 auto" onclick="delContent(${r.id})" aria-label="删除">${ic("i-trash")}</button>
       </div>
     </div>
   </div>`;
@@ -7683,39 +10956,51 @@ async function refreshContents(resetPage = false) {
   if ($("content-filter-count")) $("content-filter-count").textContent =
     `显示 ${rows.length} / ${Number(meta.total || rows.length)}`;
   const xhs = PLATFORM === "xhs";
+  const useCards = effectiveContentViewMode() === "cards";
   $("content-title").textContent = xhs ? "笔记记录" : "作品记录";
-  $("content-table-wrap").style.display = xhs ? "none" : "";
-  $("content-cards").style.display = xhs ? "" : "none";
-  if (xhs) {
-    $("content-cards").innerHTML = rows.map(noteCard).join("")
-      || `<div class="empty" style="columns:1">${ic("i-image")}<div class="empty-t">暂无笔记</div></div>`;
+  if ($("content-view-cards")) $("content-view-cards").classList.toggle("active", useCards);
+  if ($("content-view-table")) $("content-view-table").classList.toggle("active", !useCards);
+  $("content-table-wrap").style.display = useCards ? "none" : "";
+  $("content-cards").style.display = useCards ? "" : "none";
+  if (useCards) {
+    setHtmlIfChanged($("content-cards"), rows.map(noteCard).join("")
+      || `<div class="empty" style="columns:1">${ic("i-image")}<div class="empty-t">暂无作品记录</div></div>`);
     updateContentSelBar(); renderContentPager(meta);
     return;
   }
-  $("content-table").innerHTML = rows.map(r => {
+  const tableHtml = rows.map(r => {
     const description = esc(r.desc || "（未填写作品文案）");
+    const durText = r.duration ? (typeof fmtDur === "function" ? fmtDur(r.duration) : String(r.duration)) : "";
+    const durBadge = durText ? `<span class="thumb-dur">${esc(durText)}</span>` : "";
+    const specSub = [r.quality, durText].filter(Boolean).join(" · ");
+    const hasLocal = Boolean(String(r.local_path || "").trim());
     return `<tr>
       <td class="content-check-cell"><label class="content-selection" title="选择这条作品"><input type="checkbox" data-id="${r.id}" aria-label="选择这条作品" onchange="contentToggleOne(${r.id}, this.checked)" ${selContent.has(r.id) ? "checked" : ""}></label></td>
-      <td class="content-cover-cell">${r.cover_url ? `<img class="thumb" src="${esc(safeMediaUrl(r.cover_url))}" alt="封面" referrerpolicy="no-referrer" onclick="openPreview(${r.id})">` : `<span class="content-cover-empty">${ic(r.media_type === "images" ? "i-image" : "i-film")}</span>`}</td>
+      <td class="content-cover-cell"><span class="content-cover-box" onclick="openPreview(${r.id})" title="点击站内预览">${r.cover_url ? `<img class="thumb" src="${esc(safeMediaUrl(r.cover_url))}" alt="封面" loading="lazy" referrerpolicy="no-referrer">` : `<span class="content-cover-empty">${ic(r.media_type === "images" ? "i-image" : "i-film")}</span>`}${durBadge}</span></td>
       <td class="content-desc-cell">
-        <div class="content-desc-text" title="${description}">${description}</div>
+        <div class="content-desc-text clickable" title="${description}" onclick="openPreview(${r.id})">${description}</div>
         ${contentSourceMarkup(r)}
       </td>
-      <td class="content-type-cell"><span class="content-kind">${r.media_type === "images" ? "图集" : "视频"}</span>${r.quality ? `<span class="content-quality">${esc(r.quality)}</span>` : ""}</td>
+      <td class="content-type-cell"><span class="content-kind">${((PLATFORM === "twitter" || PLATFORM === "facebook") && r.media_type === "images" && !r.cover_url && !hasLocal && !r.quality) ? "纯文本" : (r.media_type === "images" ? "图集" : "视频")}</span>${specSub ? `<span class="content-quality">${esc(specSub)}</span>` : ""}</td>
       <td class="content-record-time"><span class="content-origin-label">抓取入库</span>${contentCapturedTime(r.captured_at)}<div class="content-published-time">发布 · ${fmtTime(r.create_time)}</div></td>
-      <td class="content-metrics num"><span class="metric like">${ic("i-heart")}${fmtNum(r.like_count)}</span><span class="metric">${ic("i-msg")}${fmtNum(r.comment_count)}</span>${r.duration ? `<span class="metric">${ic("i-clock")}${fmtDur(r.duration)}</span>` : ""}</td>
-      <td class="content-action-cell">
-        <div class="content-status-row"><span class="pill ${r.download_status}">${contentStatusLabel(r.download_status)}</span>${r.error ? `<span class="warn-ic" data-tip="${esc(r.error)}">${ic("i-info")}</span>` : ""}</div>
+      <td class="content-metrics num"><span class="metric like">${ic("i-heart")}${fmtNum(r.like_count)}</span><span class="metric">${ic("i-msg")}${fmtNum(r.comment_count)}</span></td>
+      <td class="content-status-cell">
+        <div class="content-status-row"><span class="pill ${r.download_status}">${contentStatusLabel(r.download_status)}</span>${r.error ? `<span class="warn-ic" data-tip="${esc(r.error)}" title="${esc(r.error)}">${ic("i-info")}</span>` : ""}</div>
+        ${contentPathCell(r)}
+      </td>
+      <td class="content-action-cell acttd">
         <div class="content-action-buttons">
-          ${["failed", "skipped"].includes(r.download_status) ? `<button class="ghost sm" onclick="retryDl(${r.id})">${r.download_status === "skipped" ? "下载" : "重试"}</button>` : ""}
-          ${(["douyin", "bilibili"].includes(PLATFORM) && r.download_status === "done") ? `<button class="ghost sm content-action-primary" onclick="pickRepostTarget(${r.id})">${ic("i-send")}转发</button>` : ""}
+          <button type="button" class="ghost sm content-icon-btn" onclick="openPreview(${r.id})" data-tip="站内预览" title="站内预览" aria-label="预览作品">${ic("i-eye")}</button>
+          ${hasLocal ? `<button type="button" class="ghost sm content-icon-btn local-path-action reveal" onclick="revealContentPath(${r.id},this)" data-tip="在文件夹中显示" title="在文件夹中显示" aria-label="在文件夹中显示">${ic("i-folder")}</button>` : ""}
+          ${["failed", "skipped"].includes(r.download_status) ? `<button type="button" class="ghost sm" onclick="retryDl(${r.id})">${r.download_status === "skipped" ? "下载" : "重试"}</button>` : ""}
+          ${(["douyin", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && r.download_status === "done") ? `<button type="button" class="ghost sm content-action-primary" onclick="pickRepostTarget(${r.id})">${ic("i-send")}转发</button>` : ""}
           ${(PLATFORM === "xhs" && r.download_status === "done") ? `<button class="ghost sm content-action-primary" onclick="repostDouyin(${r.id})">${ic("i-send")}发抖音</button>` : ""}
-          <button class="ghost sm content-action-delete danger" onclick="delContent(${r.id})" data-tip="删除作品" aria-label="删除作品">${ic("i-trash")}</button>
+          <button type="button" class="ghost sm content-action-delete danger" onclick="delContent(${r.id})" data-tip="删除作品" title="删除作品" aria-label="删除作品">${ic("i-trash")}</button>
         </div>
       </td>
-      <td class="local-path-cell">${contentPathCell(r)}</td>
     </tr>`;
   }).join("") || empty(8, "暂无作品", "i-film", "监控目标有新作品时会自动抓取并下载,显示在这里");
+  setHtmlIfChanged($("content-table"), tableHtml);
   updateContentSelBar(); renderContentPager(meta);
 }
 async function retryDl(id) {
@@ -7735,6 +11020,7 @@ async function delContent(id) {
   catch (e) { toast("删除失败:" + e.message, "err"); }
 }
 
+// 14-watches-lightbox.js — 独立弹幕监控、独立评论监控及作品图集/视频预览灯箱。
 // ─── 短视频弹幕监控(独立) ───
 function danmakuWatchBaseName(w) {
   return w.title || w.aweme_id || (w.sec_uid || "").slice(0, 12);
@@ -7744,13 +11030,85 @@ function populateDanmakuFacets() {
   setFacetOptions("danmaku-watch-tag", "全部标签", DANMAKU_WATCHES.flatMap(itemTags));
   populateWatchRecordSource("danmaku");
 }
+const selDanmakuWatch = new Set();
+const DANMAKU_WATCH_CBS = '#danmaku-watch-table input[type="checkbox"][data-id]';
+function danmakuWatchToggleOne(id, on) {
+  on ? selDanmakuWatch.add(id) : selDanmakuWatch.delete(id);
+  const cb = document.querySelector(`#danmaku-watch-table input[type="checkbox"][data-id="${id}"]`);
+  cb?.closest("tr")?.classList.toggle("is-selected", !!on);
+  updateDanmakuWatchSelBar();
+}
+function danmakuWatchToggleAll(on) {
+  document.querySelectorAll(DANMAKU_WATCH_CBS).forEach(cb => {
+    const id = +cb.dataset.id; if (!id) return;
+    cb.checked = !!on;
+    on ? selDanmakuWatch.add(id) : selDanmakuWatch.delete(id);
+    cb.closest("tr")?.classList.toggle("is-selected", !!on);
+  });
+  updateDanmakuWatchSelBar();
+}
+function danmakuWatchSelAllToggle() {
+  const ids = [...document.querySelectorAll(DANMAKU_WATCH_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
+  const allSel = ids.length > 0 && ids.every(id => selDanmakuWatch.has(id));
+  danmakuWatchToggleAll(!allSel);
+}
+function danmakuWatchSelClear() {
+  selDanmakuWatch.clear();
+  document.querySelectorAll(DANMAKU_WATCH_CBS).forEach(cb => {
+    cb.checked = false;
+    cb.closest("tr")?.classList.remove("is-selected");
+  });
+  updateDanmakuWatchSelBar();
+}
+function updateDanmakuWatchSelBar() {
+  const n = selDanmakuWatch.size;
+  const ids = [...document.querySelectorAll(DANMAKU_WATCH_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
+  const selectedInView = ids.filter(id => selDanmakuWatch.has(id)).length;
+  const allSel = ids.length > 0 && selectedInView === ids.length;
+  const countEl = $("danmaku-watch-selcount"), bar = $("danmaku-watch-selbar");
+  if (countEl) {
+    countEl.textContent = (n && selectedInView !== n)
+      ? `已选 ${n} 项（当前视图 ${selectedInView} 项）`
+      : `已选 ${n} 项`;
+  }
+  if (bar) bar.style.display = n ? "inline-flex" : "none";
+  const barWrap = bar?.closest?.(".wb-bulk-bar");
+  if (barWrap) barWrap.hidden = !n;
+  const btn = $("danmaku-watch-selall-btn");
+  if (btn) { btn.textContent = allSel ? "取消全选" : "全选"; btn.disabled = ids.length === 0; }
+  const sa = $("danmaku-watch-selall");
+  if (sa) { sa.checked = allSel; sa.indeterminate = selectedInView > 0 && !allSel; sa.disabled = ids.length === 0; }
+}
+async function danmakuWatchBatchDelete() {
+  if (!selDanmakuWatch.size) return;
+  const ids = [...selDanmakuWatch];
+  const btn = evtBtn();
+  if (!await uiConfirm({
+    title: "批量删除弹幕监控",
+    message: `确认删除选中的 ${ids.length} 个弹幕监控配置吗？已抓取的弹幕记录会保留，并标注原任务已删除。`,
+    okText: "删除",
+    danger: true,
+  })) return;
+  await withBusy(btn, "删除中", async () => {
+    try {
+      const r = await api("/api/danmaku-watches/batch-delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids, with_records: false }),
+      });
+      toast(`已删除 ${r.deleted || 0} 个弹幕监控，弹幕记录已保留`, "ok");
+      selDanmakuWatch.clear();
+      await refreshDanmakuWatches();
+      await refreshDanmaku(true);
+    } catch (e) { toast("批量删除失败:" + e.message, "err"); }
+  });
+}
 function danmakuWatchRow(w) {
   const base = esc(danmakuWatchBaseName(w));
   const source = w.mode === "creator" ? "创作中心" : "公开视频";
   const error = w.last_error
     ? ' <span class="warn-ic" title="' + esc(w.last_error) + '">' + ic("i-info") + "</span>" : "";
   const avatar = w.avatar
-    ? '<img class="avatar" src="' + esc(w.avatar) + '" referrerpolicy="no-referrer">' : "";
+    ? '<img class="avatar" src="' + esc(safeMediaUrl(w.avatar)) + '" referrerpolicy="no-referrer">' : "";
   const alias = w.alias ? '<div class="alias-line">' + esc(w.alias) + "</div>" : "";
   const interval = w.interval_seconds
     ? monitorIntervalText(w.interval_seconds)
@@ -7760,18 +11118,20 @@ function danmakuWatchRow(w) {
       (w.recent_works ? "近 " + w.recent_works + " 个" : "全局 " + (w.effective_recent_works || "") + " 个") +
       " · " + (w.recent_days ? "近 " + w.recent_days + " 天" : "全局 " + (w.effective_recent_days || "") + " 天") +
       "</div>" : "";
-  return '<tr>' +
-    '<td><div class="user-cell">' + avatar + '<div><span>' + base + "</span>" + alias + scope + "</div></div></td>" +
-    "<td>" + (w.kind === "video" ? "单条视频" : "账号作品") + "</td>" +
-    "<td>" + source + "</td>" +
+  const selected = selDanmakuWatch.has(w.id);
+  return '<tr' + (selected ? ' class="is-selected"' : '') + '>' +
+    '<td class="task-check-cell"><label class="task-selection" title="选择此弹幕监控"><input type="checkbox" data-id="' + w.id + '" aria-label="选择弹幕监控 ' + base + '" onchange="danmakuWatchToggleOne(' + w.id + ', this.checked)"' + (selected ? ' checked' : '') + '></label></td>' +
+    '<td><div class="user-cell">' + avatar + '<div><span title="' + base + '">' + base + "</span>" + alias + scope + "</div></div></td>" +
+    "<td>" + metaChips(w) + "</td>" +
+    "<td>" + (w.kind === "video" ? "单条视频" : "账号作品") + ' · <span class="mut">' + source + "</span></td>" +
     `<td class="num"><button type="button" class="ghost sm monitor-record-link" data-danmaku-records="${w.id}" onclick="showWatchRecords('danmaku',${w.id})">查看记录 <span>${fmtNum(w.danmaku_count || 0)}</span></button></td>` +
     '<td class="num">' + interval + "</td>" +
     '<td class="mut">' + (w.last_scan_at ? new Date(w.last_scan_at + "Z").toLocaleString() : "—") + error + autoRunHint(w.next_auto_run_at) + "</td>" +
     '<td><span class="pill ' + (w.enabled ? "active" : "paused") + '">' +
       (w.enabled ? "监控中" : "已暂停") + "</span></td>" +
     '<td class="acttd">' +
-      '<button class="ghost sm" onclick="editDanmakuWatch(' + w.id + ')">编辑</button>' +
       '<button class="ghost sm" onclick="scanDanmakuWatch(' + w.id + ')">立即抓取</button>' +
+      '<button class="ghost sm" onclick="editDanmakuWatch(' + w.id + ')">编辑</button>' +
       '<button class="ghost sm" onclick="toggleDanmakuWatch(' + w.id + ", " + (!w.enabled) + ')">' +
         (w.enabled ? "暂停" : "启用") + "</button>" +
       '<button class="ghost sm danger" onclick="delDanmakuWatch(' + w.id + ')">' +
@@ -7780,9 +11140,13 @@ function danmakuWatchRow(w) {
 function renderDanmakuWatchRows() {
   const group = $("danmaku-watch-group") ? $("danmaku-watch-group").value : "";
   const tag = $("danmaku-watch-tag") ? $("danmaku-watch-tag").value : "";
+  const status = $("danmaku-watch-status") ? $("danmaku-watch-status").value : "";
   const query = (($("danmaku-watch-search") && $("danmaku-watch-search").value) || "").trim().toLocaleLowerCase();
   const rows = DANMAKU_WATCHES.filter(w => {
     if (!matchesMeta(w, group, tag)) return false;
+    if (status === "enabled" && !w.enabled) return false;
+    if (status === "paused" && w.enabled) return false;
+    if (status === "error" && !w.last_error) return false;
     if (!query) return true;
     return [danmakuWatchBaseName(w), w.alias, w.group_name, ...itemTags(w)]
       .join(" ").toLocaleLowerCase().includes(query);
@@ -7792,8 +11156,9 @@ function renderDanmakuWatchRows() {
       "显示 " + rows.length + " / " + DANMAKU_WATCHES.length;
   }
   $("danmaku-watch-table").innerHTML = rows.map(danmakuWatchRow).join("") ||
-    empty(8, "没有匹配的弹幕监控", "i-msg",
+    empty(9, "没有匹配的弹幕监控", "i-msg",
           DANMAKU_WATCHES.length ? "调整筛选条件" : "添加目标后，在这里查看弹幕监控状态。", DANMAKU_WATCHES.length ? "" : "danmaku");
+  updateDanmakuWatchSelBar();
 }
 async function addDanmakuWatch() {
   const btn = evtBtn() || document.querySelector('button[onclick="addDanmakuWatch()"]');
@@ -7853,6 +11218,7 @@ async function refreshDanmakuWatches() {
   const rows = await api("/api/danmaku-watches?platform=" + encodeURIComponent(PLATFORM));
   if (!isCurrent()) return;
   DANMAKU_WATCHES = rows;
+  pruneSel(selDanmakuWatch, rows.map(w => w.id));
   populateDanmakuFacets();
   if ($("tb-danmaku")) $("tb-danmaku").textContent = rows.length;
   renderDanmakuWatchRows();
@@ -7972,6 +11338,7 @@ async function delDanmakuWatch(id) {
                          okText: "删除", danger: true })) return;
   try {
     await api("/api/danmaku-watches/" + id + "?with_records=false", { method: "DELETE" });
+    selDanmakuWatch.delete(id);
     toast("监控已删除，弹幕记录已保留", "ok"); await refreshDanmakuWatches(); await refreshDanmaku(true);
   } catch (e) { toast("删除失败:" + e.message, "err"); }
 }
@@ -8093,7 +11460,8 @@ function setDanmakuPageSize() {
   refreshDanmaku();
 }
 async function deleteDanmaku(id) {
-  try { await api("/api/danmaku/" + id, { method: "DELETE" }); refreshDanmaku(); }
+  if (!await uiConfirm({ title: "删除弹幕记录", message: "确认删除这条弹幕记录吗？", okText: "删除", danger: true })) return;
+  try { await api("/api/danmaku/" + id, { method: "DELETE" }); toast("弹幕记录已删除", "ok"); refreshDanmaku(); }
   catch (e) { toast("删除失败:" + e.message, "err"); }
 }
 async function clearDanmaku() {
@@ -8151,13 +11519,89 @@ async function addWatch() {
   refreshWatches();
   });
 }
+const selWatch = new Set();
+const WATCH_CBS = '#watch-table input[type="checkbox"][data-id]';
+function watchToggleOne(id, on) {
+  on ? selWatch.add(id) : selWatch.delete(id);
+  const cb = document.querySelector(`#watch-table input[type="checkbox"][data-id="${id}"]`);
+  cb?.closest("tr")?.classList.toggle("is-selected", !!on);
+  updateWatchSelBar();
+}
+function watchToggleAll(on) {
+  document.querySelectorAll(WATCH_CBS).forEach(cb => {
+    const id = +cb.dataset.id; if (!id) return;
+    cb.checked = !!on;
+    on ? selWatch.add(id) : selWatch.delete(id);
+    cb.closest("tr")?.classList.toggle("is-selected", !!on);
+  });
+  updateWatchSelBar();
+}
+function watchSelAllToggle() {
+  const ids = [...document.querySelectorAll(WATCH_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
+  const allSel = ids.length > 0 && ids.every(id => selWatch.has(id));
+  watchToggleAll(!allSel);
+}
+function watchSelClear() {
+  selWatch.clear();
+  document.querySelectorAll(WATCH_CBS).forEach(cb => {
+    cb.checked = false;
+    cb.closest("tr")?.classList.remove("is-selected");
+  });
+  updateWatchSelBar();
+}
+function updateWatchSelBar() {
+  const n = selWatch.size;
+  const ids = [...document.querySelectorAll(WATCH_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
+  const selectedInView = ids.filter(id => selWatch.has(id)).length;
+  const allSel = ids.length > 0 && selectedInView === ids.length;
+  const countEl = $("watch-selcount"), bar = $("watch-selbar");
+  if (countEl) {
+    countEl.textContent = (n && selectedInView !== n)
+      ? `已选 ${n} 项（当前视图 ${selectedInView} 项）`
+      : `已选 ${n} 项`;
+  }
+  if (bar) bar.style.display = n ? "inline-flex" : "none";
+  const barWrap = bar?.closest?.(".wb-bulk-bar");
+  if (barWrap) barWrap.hidden = !n;
+  const btn = $("watch-selall-btn");
+  if (btn) { btn.textContent = allSel ? "取消全选" : "全选"; btn.disabled = ids.length === 0; }
+  const sa = $("watch-selall");
+  if (sa) { sa.checked = allSel; sa.indeterminate = selectedInView > 0 && !allSel; sa.disabled = ids.length === 0; }
+}
+async function watchBatchDelete() {
+  if (!selWatch.size) return;
+  const ids = [...selWatch];
+  const btn = evtBtn();
+  if (!await uiConfirm({
+    title: "批量删除评论监控",
+    message: `确认删除选中的 ${ids.length} 个评论监控配置吗？已抓取的评论记录会保留，并标注原任务已删除。`,
+    okText: "删除",
+    danger: true,
+  })) return;
+  await withBusy(btn, "删除中", async () => {
+    try {
+      const r = await api("/api/comment-watches/batch-delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids, with_comments: false }),
+      });
+      toast(`已删除 ${r.deleted || 0} 个评论监控，评论记录已保留`, "ok");
+      selWatch.clear();
+      await refreshWatches();
+      await refreshComments(true);
+    } catch (e) { toast("批量删除失败:" + e.message, "err"); }
+  });
+}
 function watchRow(w) {
   const base = esc(watchBaseName(w));
-  return `<tr>
-    <td><div class="user-cell">${w.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(w.avatar))}" referrerpolicy="no-referrer">` : ""}<div><span>${base}</span>${w.alias ? `<div class="alias-line">${esc(w.alias)}</div>` : ""}</div></div></td>
+  const isNotePlatform = w.platform === "xhs" || w.platform === "rednote";
+  const kindLabel = w.kind === "video" ? (isNotePlatform ? "笔记" : "视频") : (isNotePlatform ? "创作者" : "账号");
+  const srcLabel = isNotePlatform ? "公开" : (SRC[w.mode] || w.mode);
+  const selected = selWatch.has(w.id);
+  return `<tr${selected ? ' class="is-selected"' : ""}>
+    <td class="task-check-cell"><label class="task-selection" title="选择此评论监控"><input type="checkbox" data-id="${w.id}" aria-label="选择评论监控 ${base}" onchange="watchToggleOne(${w.id}, this.checked)"${selected ? " checked" : ""}></label></td>
+    <td><div class="user-cell">${w.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(w.avatar))}" referrerpolicy="no-referrer">` : `<span class="wb-avatar-fallback" style="width:30px;height:30px;flex:0 0 30px;font-size:13px;border-radius:50%" aria-hidden="true">${esc((watchBaseName(w) || "评").slice(0, 1))}</span>`}<div><span title="${base}">${base}</span>${w.alias ? `<div class="alias-line" title="${esc(w.alias)}">${esc(w.alias)}</div>` : ""}</div></div></td>
     <td>${metaChips(w)}</td>
-    <td>${w.kind === "video" ? (w.platform === "xhs" ? "笔记" : "视频") : (w.platform === "xhs" ? "创作者" : "账号")}</td>
-    <td>${w.platform === "xhs" ? "公开" : (SRC[w.mode] || w.mode)}</td>
+    <td>${kindLabel} · <span class="mut">${srcLabel}</span></td>
     <td class="num"><button type="button" class="ghost sm monitor-record-link" data-comment-records="${w.id}" onclick="showWatchRecords('comment',${w.id})">查看记录 <span>${fmtNum(w.comment_count || 0)}</span></button></td>
     <td class="num">${monitorIntervalText(w.interval_seconds)}
       ${w.kind === "user" && (w.recent_works || w.recent_days) ? `<div class="mut" style="font-size:11px">${w.recent_works ? `近 ${w.recent_works} 个` : "全局作品数"} · ${w.recent_days ? `${w.recent_days} 天` : "全局天数"}</div>` : ""}</td>
@@ -8173,9 +11617,13 @@ function watchRow(w) {
 function renderWatchRows() {
   const groupName = $("watch-group") ? $("watch-group").value : "";
   const tag = $("watch-tag") ? $("watch-tag").value : "";
+  const status = $("watch-status") ? $("watch-status").value : "";
   const query = (($("watch-search") && $("watch-search").value) || "").trim().toLocaleLowerCase();
   const rows = WATCHES.filter(w => {
     if (!matchesMeta(w, groupName, tag)) return false;
+    if (status === "enabled" && !w.enabled) return false;
+    if (status === "paused" && w.enabled) return false;
+    if (status === "error" && !w.last_error) return false;
     if (!query) return true;
     return [watchBaseName(w), w.alias, w.group_name, ...itemTags(w)]
       .join(" ").toLocaleLowerCase().includes(query);
@@ -8183,12 +11631,13 @@ function renderWatchRows() {
   if ($("watch-filter-count")) $("watch-filter-count").textContent = `显示 ${rows.length} / ${WATCHES.length}`;
   $("watch-table").innerHTML = rows.map(watchRow).join("")
     || empty(9, "没有匹配的评论监控", "i-msg", WATCHES.length ? "调整分组、标签或搜索条件" : "添加作品或账号，开始收集新评论。", WATCHES.length ? "" : "comments");
+  updateWatchSelBar();
 }
 async function refreshWatches() {
   const isCurrent = beginViewRequest("watches");
   const ws = await api("/api/comment-watches?platform=" + PLATFORM);
   if (!isCurrent()) return;
-  WATCHES = ws; populateWatchFacets(); populateCommentSrc();
+  WATCHES = ws; pruneSel(selWatch, ws.map(w => w.id)); populateWatchFacets(); populateCommentSrc();
   if ($("tb-watch")) $("tb-watch").textContent = ws.length;
   renderWatchRows();
 }
@@ -8290,6 +11739,7 @@ async function delWatch(id) {
   if (!await uiConfirm({ title: "删除评论监控", message: "仅删除该监控配置，已抓取的评论记录会保留，并标注原任务已删除。", okText: "删除", danger: true })) return;
   try {
     await api("/api/comment-watches/" + id + "?with_comments=false", { method: "DELETE" });
+    selWatch.delete(id);
     toast("监控已删除，评论记录已保留", "ok"); await refreshWatches(); await refreshComments(true);
   } catch (e) { toast("删除失败:" + e.message, "err"); }
 }
@@ -8393,7 +11843,8 @@ async function refreshComments(resetPage = false) {
   updateCommentSelBar(); renderCommentPager(meta);
 }
 async function delComment(id) {
-  try { await api("/api/comments/" + id, { method: "DELETE" }); refreshComments(); }
+  if (!await uiConfirm({ title: "删除评论记录", message: "确认删除这条评论记录吗？", okText: "删除", danger: true })) return;
+  try { await api("/api/comments/" + id, { method: "DELETE" }); toast("评论记录已删除", "ok"); selComment.delete(id); refreshComments(); }
   catch (e) { toast("删除失败:" + e.message, "err"); }
 }
 async function clearComments() {
@@ -8409,7 +11860,7 @@ function _pvRender(d) {
   const vid = (d.medias || []).find(m => m.kind === "video");
   if (d.media_type === "video" && (d.local_url || vid)) {
     const videoUrl = d.local_url || vid.url;
-    box.innerHTML = `<video src="${esc(videoUrl)}" controls autoplay playsinline preload="metadata" poster="${esc(d.cover_url || "")}" referrerpolicy="no-referrer"></video>`;
+    box.innerHTML = `<video src="${esc(videoUrl)}" controls autoplay playsinline preload="metadata" poster="${esc(safeMediaUrl(d.cover_url || ""))}" referrerpolicy="no-referrer"></video>`;
     const video = box.querySelector("video");
     let triedRemote = !d.local_url || !vid || !vid.url;
     video.addEventListener("error", () => {
@@ -8545,6 +11996,7 @@ document.addEventListener("keydown", e => {
   else if (modal === $("preview") && e.key === "ArrowRight") pvNav(1);
 });
 
+// 15-publish-repost.js — 多平台图文/视频发布编辑器、已发布作品管理与跨平台转发。
 // ─── 多平台发布 ───
 const BILI_PARTITION_CACHE = new Map();
 function onBiliCopyrightChange() {
@@ -8589,7 +12041,12 @@ function populatePubAcc() {
     : (PLATFORM === "kuaishou" ? "请先完成「快手扫码登录」"
       : PLATFORM === "douyin" ? "请先完成「抖音扫码/创作者登录」"
       : PLATFORM === "tiktok" ? "请先完成「TikTok 登录」"
-      : PLATFORM === "bilibili" ? "请先完成「哔哩哔哩扫码登录」" : "请先完成「小红书创作者登录」");
+      : PLATFORM === "bilibili" ? "请先完成「哔哩哔哩扫码登录」"
+      : PLATFORM === "instagram" ? "请先完成「Instagram 登录」"
+      : PLATFORM === "twitter" ? "请先完成「Twitter 登录」"
+      : PLATFORM === "facebook" ? "请先完成「Facebook 登录」"
+      : PLATFORM === "rednote" ? "请先完成「海外小红书创作者登录」"
+      : "请先完成「小红书创作者登录」");
   sel.innerHTML = accOptions(list, ph);
   if (list.length) sel.value = String(list[0].id);
   if (!sel._biliBound) {
@@ -8602,18 +12059,28 @@ let pubFilesDT = new DataTransfer();
 function onPubType() {
   const v = $("pub-type").value, inp = $("pub-files"), lbl = $("pub-files-label");
   if (!inp) return;
-  if (v === "video") { inp.accept = "video/*"; inp.multiple = false; lbl.textContent = "选择视频文件(单个)"; }
-  else { inp.accept = "image/*"; inp.multiple = true; lbl.textContent = "选择图片(可多选,最多 18 张)"; }
+  const ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook";
+  if (v === "video") {
+    inp.accept = ig ? "video/*,image/*" : "video/*";
+    inp.multiple = ig;
+    lbl.textContent = ig ? "选择视频文件（单个 Reels/Story，或多选最多 10 项混合轮播）" : tw ? "选择视频或 GIF（单个，留空可发纯文本推文）" : fb ? "选择视频文件（单个，留空可发纯文本帖子）" : "选择视频文件(单个)";
+  } else {
+    inp.accept = ig ? "image/*,video/*" : "image/*";
+    inp.multiple = true;
+    lbl.textContent = ig ? "选择图片/视频（可多选，最多 10 项轮播）" : tw ? "选择图片（可多选，最多 4 张；留空可发纯文本推文）" : fb ? "选择图片（可多选，最多 20 张；留空可发纯文本帖子）" : "选择图片(可多选,最多 18 张)";
+  }
   pubFilesClear();
 }
 function pubFilesClear() { pubFilesDT = new DataTransfer(); _pubSync(); }
 function _pubSync() { const inp = $("pub-files"); if (inp) inp.files = pubFilesDT.files; renderPubFiles(); }
 function pubAddFiles(files) {
   const isVideo = $("pub-type").value === "video";
+  const ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook";
+  const maxItems = tw ? 4 : ig ? 10 : fb ? 20 : 18;
   for (const f of files) {
-    if (isVideo) { pubFilesDT = new DataTransfer(); pubFilesDT.items.add(f); break; }
+    if (isVideo && !ig) { pubFilesDT = new DataTransfer(); pubFilesDT.items.add(f); break; }
     if ([...pubFilesDT.files].some(x => x.name === f.name && x.size === f.size)) continue;
-    if (pubFilesDT.files.length >= 18) break;
+    if (pubFilesDT.files.length >= maxItems) break;
     pubFilesDT.items.add(f);
   }
   _pubSync();
@@ -8647,9 +12114,9 @@ function bindPubFilePicker() {
 }
 let PUB_SUBMITTING = false, PUB_UPLOAD_CACHE = null;
 function publishFormPayload() {
-  const tiktok = PLATFORM === "tiktok", bili = PLATFORM === "bilibili";
+  const tiktok = PLATFORM === "tiktok", bili = PLATFORM === "bilibili", ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook";
   const mediaType = $("pub-type").value;
-  let biliOptions;
+  let biliOptions, igOptions, twOptions, fbOptions;
   if (bili) {
     const copyright = +($("pub-bili-copyright")?.value || 1);
     const source = ($("pub-bili-source")?.value || "").trim();
@@ -8670,23 +12137,55 @@ function publishFormPayload() {
       is_only_self: $("pub-bili-visibility")?.value === "private" ? 1 : 0,
     };
   }
+  if (tw) {
+    twOptions = {
+      reply_permission: $("pub-tw-reply-perm")?.value || "everyone",
+      long_text: $("pub-tw-long")?.value === "1",
+      first_comment: ($("pub-tw-first-comment")?.value || "").trim(),
+    };
+  }
+  if (fb) {
+    const targetType = $("pub-fb-target")?.value || "profile";
+    const groupUrl = ($("pub-fb-group-url")?.value || "").trim();
+    const pageId = ($("pub-fb-page-id")?.value || "").trim();
+    if (targetType === "group" && !groupUrl) {
+      throw new Error("发布到 Facebook 群组时请填写目标群组链接或群组 ID");
+    }
+    fbOptions = {
+      target_type: targetType,
+      page_id: pageId,
+      group_url: groupUrl,
+      privacy: $("pub-fb-privacy")?.value || "public",
+      first_comment: ($("pub-fb-first-comment")?.value || "").trim(),
+    };
+  }
+  if (ig) {
+    igOptions = {
+      post_kind: $("pub-ig-kind")?.value || "auto",
+      share_to_feed: $("pub-ig-share-feed")?.value !== "0",
+    };
+  }
   return { account_id: +$("pub-acc").value, media_type: mediaType,
     title: $("pub-title").value.trim(), desc: $("pub-desc").value,
     topics: $("pub-topics").value.trim(), scheduled_at: scheduleToApi($("pub-when").value || null),
     location: $("pub-location") ? $("pub-location").value.trim() : "",
-    visibility: bili ? ($("pub-bili-visibility")?.value || "public") : (tiktok ? $("pub-tk-visibility").value : $("pub-visibility") ? $("pub-visibility").value : "public"),
+    visibility: fb ? (($("pub-fb-privacy")?.value || "public") === "only_me" ? "private" : ($("pub-fb-privacy")?.value || "public")) : bili ? ($("pub-bili-visibility")?.value || "public") : (tiktok ? $("pub-tk-visibility").value : $("pub-visibility") ? $("pub-visibility").value : "public"),
     allow_save: $("pub-allowsave") ? $("pub-allowsave").value !== "0" : true,
-    allow_comment: bili ? ($("pub-bili-close-reply")?.value !== "1") : (tiktok ? $("pub-tk-comment").value !== "0" : true),
+    allow_comment: bili ? ($("pub-bili-close-reply")?.value !== "1") : ig ? ($("pub-ig-comment")?.value !== "0") : tw ? (($("pub-tw-reply-perm")?.value || "everyone") !== "mentioned") : (tiktok ? $("pub-tk-comment").value !== "0" : true),
     allow_duet: tiktok ? $("pub-tk-duet").value !== "0" : true,
     allow_stitch: tiktok ? $("pub-tk-stitch").value !== "0" : true,
-    ...(bili ? { bili_options: biliOptions } : {}) };
+    ...(bili ? { bili_options: biliOptions } : {}),
+    ...(ig ? { ig_options: igOptions } : {}),
+    ...(tw ? { tw_options: twOptions } : {}),
+    ...(fb ? { fb_options: fbOptions } : {}) };
 }
 async function addPublish() {
   if (PUB_SUBMITTING) return;
   const acc = $("pub-acc").value;
   if (!acc) { toast("请选择" + (PF_NAME[PLATFORM] || "发布") + "账号", "err"); return; }
   const files = Array.from($("pub-files").files);
-  if (!files.length) { toast("请先选择要发布的文件", "err"); return; }
+  if (!files.length && PLATFORM !== "twitter" && PLATFORM !== "facebook") { toast("请先选择要发布的文件", "err"); return; }
+  if (!files.length && (PLATFORM === "twitter" || PLATFORM === "facebook") && !($("pub-title").value.trim() || $("pub-desc").value.trim() || $("pub-topics").value.trim())) { toast(PLATFORM === "facebook" ? "请填写帖子文案或选择媒体文件" : "请填写推文文案或选择媒体文件", "err"); return; }
   let body;
   try { body = publishFormPayload(); }
   catch (e) { $("pub-msg").textContent = e.message; toast(e.message, "err"); return; }
@@ -8695,7 +12194,9 @@ async function addPublish() {
   $("pub-msg").textContent = "上传中…";
   try { await withBusy(btn, "提交中", async () => {
     try {
-      if (!PUB_UPLOAD_CACHE || PUB_UPLOAD_CACHE.files.length !== files.length ||
+      if (!files.length) {
+        PUB_UPLOAD_CACHE = { files: [], paths: [] };
+      } else if (!PUB_UPLOAD_CACHE || PUB_UPLOAD_CACHE.files.length !== files.length ||
           !PUB_UPLOAD_CACHE.files.every((file, index) => file === files[index])) {
         const fd = new FormData(); for (const f of files) fd.append("files", f);
         const up = await api("/api/publish/upload", { method: "POST", body: fd });
@@ -8712,7 +12213,7 @@ async function addPublish() {
           Array.from($("pub-files").files).length === files.length &&
           Array.from($("pub-files").files).every((file, index) => file === files[index]); } catch (_) {}
       if (unchanged) {
-        pubFilesClear(); $("pub-title").value = ""; $("pub-desc").value = ""; $("pub-topics").value = ""; $("pub-when").value = ""; if ($("pub-location")) $("pub-location").value = ""; dtSyncAll();
+        pubFilesClear(); $("pub-title").value = ""; $("pub-desc").value = ""; $("pub-topics").value = ""; $("pub-when").value = ""; if ($("pub-location")) $("pub-location").value = ""; if ($("pub-tw-first-comment")) $("pub-tw-first-comment").value = ""; if ($("pub-fb-first-comment")) $("pub-fb-first-comment").value = ""; dtSyncAll();
         PUB_UPLOAD_CACHE = null;
       }
       $("pub-msg").textContent = body.scheduled_at ? "已加入定时队列 ✓" : "已加入发布队列 ✓";
@@ -8725,7 +12226,7 @@ const PUB_ST = { draft: "待确认预约", pending: "排队中", publishing: "�
 const PUB_PILL = { draft: "pending", pending: "pending", publishing: "downloading", uncertain: "downloading", done: "done", failed: "failed", canceled: "invalid" };
 async function editPublish(id) {
   const task = PUBLISH_TASKS.find(x => x.id === id); if (!task) return;
-  const accounts = ACCOUNTS.filter(a => a.platform === task.platform);
+  const accounts = (ALL_ACCOUNTS.length ? ALL_ACCOUNTS : ACCOUNTS).filter(a => a.platform === task.platform);
   const accountOptions = accounts.map(a =>
     `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`
   ).join("");
@@ -8754,8 +12255,8 @@ async function editPublish(id) {
         },
       } : {}),
     });
-    const editCap = task.platform === "bilibili" ? 80 : task.platform === "douyin" ? 30 : task.platform === "shipinhao" ? 16 : 20;
-    const showVisOpts = ["douyin", "xhs", "kuaishou"].includes(task.platform);
+    const editCap = task.platform === "facebook" ? 5000 : task.platform === "twitter" ? (task.tw_options?.long_text ? 4000 : 280) : task.platform === "instagram" ? 2200 : task.platform === "bilibili" ? 80 : task.platform === "rednote" ? 40 : task.platform === "douyin" ? 30 : task.platform === "shipinhao" ? 16 : 20;
+    const showVisOpts = ["douyin", "xhs", "rednote", "kuaishou"].includes(task.platform);
     $("ui-body").innerHTML = `
       <div><label class="field" for="ep-account">发布账号</label>
         <select id="ep-account">${accountOptions}</select></div>
@@ -8825,26 +12326,34 @@ async function editPublish(id) {
 async function refreshPublish() {
   const isCurrent = beginViewRequest("publish");
   if (!$("pub-table")) return;
-  const rows = await api("/api/publish?platform=" + (pfHasPublish(PLATFORM) ? PLATFORM : "xhs"));
+  const rows = await api("/api/publish" + (GLOBAL_MODE ? "" : "?platform=" + (pfHasPublish(PLATFORM) ? PLATFORM : "xhs")));
   if (!isCurrent()) return;
   PUBLISH_TASKS = rows;
   if ($("tb-pub")) $("tb-pub").textContent = rows.length;
-  $("pub-table").innerHTML = rows.map(t => `<tr>
-    <td class="wrap" style="max-width:220px">${esc(t.title || "(无标题)")}</td>
-    <td>${t.media_type === "video" ? "视频" : "图文"}</td>
-    <td class="num">${t.media_count}</td>
-    <td>${t.source_platform ? esc(t.source_platform) + " 转发" : "手动"}</td>
+  $("pub-table").innerHTML = rows.map(t => {
+    const accObj = (typeof findAnyAccount === "function" && findAnyAccount(t.account_id)) || ACCOUNTS.find(a => a.id === t.account_id);
+    const pubAcc = accObj ? (accObj.alias || accObj.nickname || `账号 #${t.account_id}`) : (t.account_id ? `账号 #${t.account_id}` : "—");
+    const pfBadge = GLOBAL_MODE ? `<span class="mx-mini-pf inline" style="margin-right:6px">${esc(PF_NAME[t.platform] || t.platform)}</span>` : "";
+    return `<tr>
+    <td class="wrap" style="max-width:240px"><b>${esc(t.title || "(无标题)")}</b></td>
+    <td>${pfBadge}${esc(pubAcc)}</td>
+    <td>${(t.platform === "twitter" || t.platform === "facebook") && !(t.media_count || 0) ? "纯文本" : `${t.media_type === "video" ? "视频" : "图文"} · <span class="mut num">${t.media_count || 0}</span>`}</td>
+    <td>${t.source_platform ? esc(PF_NAME[t.source_platform] || t.source_platform) + " 转发" : "手动"}</td>
     <td class="mut num">${t.scheduled_at ? new Date(t.scheduled_at).toLocaleString() : "尽快"}${t.next_allowed_at ? `<div class="mut" title="预约保持不变，同时等待风控间隔结束">风控最早 ${esc(riskTime(t.next_allowed_at))}</div>` : ""}</td>
-    <td><span class="pill ${PUB_PILL[t.status] || "pending"}">${PUB_ST[t.status] || t.status}</span>${t.error ? ` <span class="warn-ic" title="${esc(t.error)}">${ic("i-info")}</span>` : ""}${t.result_url ? ((["kuaishou", "shipinhao", "tiktok"].includes(t.platform) || (t.platform === "bilibili" && String(t.result_url).includes("member.bilibili.com"))) ? ` <a href="javascript:void(0)" onclick="openPubInBrowser(${Number(t.account_id)}, ${jsArg(t.result_url)}, ${jsArg(t.platform)})">查看</a>` : ` <a href="${esc(safeMediaUrl(t.result_url))}" target="_blank" rel="noopener noreferrer">查看</a>`) : ""}</td>
+    <td><span class="pill ${PUB_PILL[t.status] || "pending"}">${PUB_ST[t.status] || t.status}</span>${t.error ? ` <span class="warn-ic" title="${esc(t.error)}">${ic("i-info")}</span>` : ""}${t.result_url ? ((["kuaishou", "shipinhao", "tiktok"].includes(t.platform) || (t.platform === "bilibili" && String(t.result_url).includes("member.bilibili.com"))) ? ` <a href="javascript:void(0)" onclick="openPubInBrowser(${Number(t.account_id)}, ${jsArg(t.result_url)}, ${jsArg(t.platform)})">查看</a>` : ` <a href="${esc(safeHttpUrl(t.result_url))}" target="_blank" rel="noopener noreferrer">查看</a>`) : ""}${t.status === "publishing" ? `<div class="mut" id="pub-stage-${t.id}" style="margin-top:4px;white-space:normal;max-width:200px">${esc(t.live_stage || "执行中，请等待结果")}</div>` : ""}</td>
     <td class="acttd">
-      ${["draft", "pending", "failed", "canceled"].includes(t.status) ? `<button class="ghost sm" onclick="editPublish(${t.id})">${t.schedule_needs_confirmation ? "确认预约时间" : "编辑"}</button>` : ""}
       ${["pending", "failed"].includes(t.status) ? `<button class="ghost sm" onclick="runPublish(${t.id})">立即发布</button>` : ""}
-      ${t.status === "uncertain" ? `<button class="ghost sm" onclick="resolveTaskResult('publishes',${t.id})">核对结果</button>` : t.status === "publishing" ? `<span class="mut" id="pub-stage-${t.id}">${esc(t.live_stage || "执行中，请等待结果")}</span>` : `<button class="ghost sm danger" onclick="delPublish(${t.id})">${ic("i-trash")}删除</button>`}
-    </td></tr>`).join("") || empty(7, "暂无发布任务", "i-send",
+      ${["draft", "pending", "failed", "canceled"].includes(t.status) ? `<button class="ghost sm" onclick="editPublish(${t.id})">${t.schedule_needs_confirmation ? "确认预约时间" : "编辑"}</button>` : ""}
+      ${t.status === "uncertain" ? `<button class="ghost sm" onclick="resolveTaskResult('publishes',${t.id})">核对结果</button>` : t.status === "publishing" ? "" : `<button class="ghost sm danger" onclick="delPublish(${t.id})">${ic("i-trash")}删除</button>`}
+    </td></tr>`;
+  }).join("") || empty(7, "暂无发布任务", "i-send",
       PLATFORM === "kuaishou" ? "上传图集/视频加入队列(发布到快手创作平台)"
       : PLATFORM === "douyin" ? "上传图集/视频加入队列(发布到抖音创作平台)"
       : PLATFORM === "tiktok" ? "上传单个视频加入队列(发布到 TikTok Studio)"
       : PLATFORM === "bilibili" ? "上传视频稿件或图文动态加入队列(发布到哔哩哔哩创作中心)"
+      : PLATFORM === "instagram" ? "上传单图 / 轮播 / Reels / Story 加入队列(发布到 Instagram)"
+      : PLATFORM === "twitter" ? "编写纯文本推文，或上传最多 4 图 / 单个视频加入队列(发布到 X / Twitter)"
+      : PLATFORM === "facebook" ? "编写纯文本帖子，或上传最多 20 图 / 单个视频加入队列(发布到 Facebook 主页/公共主页/群组/Story)"
       : "上传图集/视频加入队列,或在抖音作品上点「发小红书」转发过来");
 }
 // 创作平台管理页必须复用账号自己的登录态，不能交给系统浏览器。
@@ -8897,7 +12406,7 @@ async function delPublish(id) {
 let PUB_NOTES = [], PUB_ACC = "", PUB_GOOD = false;
 async function loadPublished() {
   const acc = $("pub-acc").value;
-  if (!acc) { toast("请先选择小红书账号", "err"); return; }
+  if (!acc) { toast("请先选择" + (PF_NAME[PLATFORM] || "小红书") + "账号", "err"); return; }
   PUB_ACC = acc;
   const btn = evtBtn();
   $("published-msg").textContent = "拉取中…(走创作平台,可能需几秒)";
@@ -8942,14 +12451,22 @@ const repostChannels = (id) => openRepost(id, "shipinhao");
 const repostKuaishou = (id) => openRepost(id, "kuaishou");
 const repostTiktok = (id) => openRepost(id, "tiktok");
 const repostBilibili = (id) => openRepost(id, "bilibili");
+const repostRednote = (id) => openRepost(id, "rednote");
+const repostInstagram = (id) => openRepost(id, "instagram");
+const repostTwitter = (id) => openRepost(id, "twitter");
+const repostFacebook = (id) => openRepost(id, "facebook");
 async function pickRepostTarget(id) {
   const rec = CONTENTS.find(r => r.id === id);
   const options = [
     { value: "xhs", label: "小红书" },
+    { value: "rednote", label: "海外小红书" },
     { value: "douyin", label: "抖音" },
     { value: "kuaishou", label: "快手" },
     { value: "shipinhao", label: "视频号" },
     { value: "bilibili", label: "哔哩哔哩" },
+    { value: "instagram", label: "Instagram" },
+    { value: "twitter", label: "Twitter" },
+    { value: "facebook", label: "Facebook" },
   ];
   if (!rec || rec.media_type === "video") options.push({ value: "tiktok", label: "TikTok" });
   const target = await uiSelect({
@@ -8971,7 +12488,9 @@ async function openRepost(id, target) {
   if (!accs.length) {
     const loginHint = target === "xhs"
       ? "请先在小红书账号页完成「创作者登录」(发布用)"
-      : target === "shipinhao"
+      : target === "rednote"
+        ? "请先在海外小红书账号页完成登录"
+        : target === "shipinhao"
         ? "请先在视频号账号页完成「视频号登录」"
         : target === "kuaishou"
           ? "请先在快手账号页完成登录"
@@ -8979,7 +12498,14 @@ async function openRepost(id, target) {
             ? "请先在 TikTok 账号页完成登录"
             : target === "bilibili"
               ? "请先在哔哩哔哩账号页完成登录"
-              : "请先在抖音账号页完成登录(扫码/创作者/Cookie)";
+
+
+              : target === "instagram" ? "请先在 Instagram 账号页完成登录"
+                : target === "twitter"
+                  ? "请先在 Twitter 账号页完成登录"
+                  : target === "facebook"
+                    ? "请先在 Facebook 账号页完成登录"
+                : "请先在抖音账号页完成登录(扫码/创作者/Cookie)";
     toast(loginHint, "err");
     return;
   }
@@ -8989,8 +12515,12 @@ async function openRepost(id, target) {
   const isKs = target === "kuaishou";
   const isTk = target === "tiktok";
   const isBili = target === "bilibili";
-  const cap = isBili ? 80 : isDy ? 30 : isChannels ? 16 : 20;
-  const pname = isDy ? "抖音" : isChannels ? "视频号" : isKs ? "快手" : isTk ? "TikTok" : isBili ? "哔哩哔哩" : "小红书";
+  const isRn = target === "rednote";
+  const isIg = target === "instagram";
+  const isTw = target === "twitter";
+  const isFb = target === "facebook";
+  const cap = isFb ? 5000 : isTw ? 280 : isIg ? 2200 : isBili ? 80 : isRn ? 40 : isDy ? 30 : isChannels ? 16 : 20;
+  const pname = isDy ? "抖音" : isChannels ? "视频号" : isKs ? "快手" : isTk ? "TikTok" : isBili ? "哔哩哔哩" : isIg ? "Instagram" : isTw ? "Twitter" : isFb ? "Facebook" : isRn ? "海外小红书" : "小红书";
   $("rp-head").textContent = "发" + pname + " · 编辑后推送";
   $("rp-title-label").textContent = `标题(≤${cap} 字)`;
   $("rp-title").maxLength = cap;
@@ -9047,7 +12577,7 @@ function rpDrawThumbs() {
     <div class="rp-th" draggable="true" data-pos="${pos}"
          ondragstart="rpDragStart(${pos},event)" ondragover="rpDragOver(${pos},event)"
          ondragleave="rpDragLeave(event)" ondrop="rpDrop(${pos},event)" ondragend="rpDragEnd()">
-      <img src="${esc(m.url)}" referrerpolicy="no-referrer" draggable="false" alt="" title="点击看大图" onclick="openPreview(${REPOST_ID},${m.idx})">
+      <img src="${esc(safeMediaUrl(m.url))}" referrerpolicy="no-referrer" draggable="false" alt="" title="点击看大图" onclick="openPreview(${REPOST_ID},${m.idx})">
       <span class="rp-th-badge${pos === 0 ? " cover" : ""}">${pos === 0 ? "封面" : pos + 1}</span>
       <button type="button" class="rp-th-x" title="移除这张" aria-label="移除这张" onclick="rpImgRemove(${pos})">${ic("i-x")}</button>
       <div class="rp-th-mv">
@@ -9127,7 +12657,11 @@ async function submitRepost() {
     : REPOST_TARGET === "shipinhao" ? "视频号"
     : REPOST_TARGET === "kuaishou" ? "快手"
     : REPOST_TARGET === "tiktok" ? "TikTok"
-    : REPOST_TARGET === "bilibili" ? "哔哩哔哩" : "小红书";
+    : REPOST_TARGET === "bilibili" ? "哔哩哔哩"
+    : REPOST_TARGET === "instagram" ? "Instagram"
+    : REPOST_TARGET === "twitter" ? "Twitter"
+    : REPOST_TARGET === "facebook" ? "Facebook"
+    : REPOST_TARGET === "rednote" ? "海外小红书" : "小红书";
   try {
     body.scheduled_at = scheduleToApi(body.scheduled_at);
     const r = await withBusy(btn, "提交中", () => api("/api/contents/" + REPOST_ID + "/repost-" + REPOST_TARGET, {
@@ -9145,105 +12679,313 @@ async function submitRepost() {
   }
   if (success) { hideRepost(); if (typeof refreshPublish === "function") refreshPublish(); }
 }
+
+// 16-autocomment-queue-boot.js — 自动评论规则、试跑预览、审核重写、统一任务队列、轮询主循环及 CreatorHubBridge。
 // ─── 自动评论 ───
 let AC_RULES = [];
+let AC_TASKS = [];
+let AC_POLICY_META = null;
+const AC_SELECTED_TASKS = new Set();
+
 const AC_MODE_T = { auto_reply: "自动回复", auto_comment: "自动评论" };
 const AC_KIND_T = { self: "自己近期作品", work: "指定作品", creator: "指定博主", keyword: "关键词" };
+const AC_COMPOSE_T = {
+  template_only: "本地模板",
+  ai_with_fallback: "AI 优先",
+  ai_only_draft: "纯 AI (草稿兜底)",
+  ai_only_skip: "纯 AI (失败跳过)",
+};
+const AC_SCOPE_T = { all: "全部评论", top_only: "仅一级评论", reply_only: "仅二级回复" };
+const AC_SRC_META = {
+  ai: ["AI 生成", "ai"],
+  template: ["本地模板", ""],
+  ai_fallback: ["AI 失败回退模板", "fallback"],
+  ai_empty_draft: ["AI 失败待填", "empty"],
+  manual: ["人工编辑", ""],
+};
 const AC_TASK_ST = { draft: "草稿待审", pending: "排队中", doing: "发送中", uncertain: "结果待确认", done: "已发送", failed: "失败", canceled: "已取消" };
 const AC_TASK_PILL = { draft: "downloading", pending: "pending", doing: "downloading", uncertain: "downloading", done: "done", failed: "failed", canceled: "invalid" };
-let AC_TASKS = [];
+const AC_KEYWORD_PLATFORMS = ["xhs", "bilibili", "instagram", "twitter", "facebook"];
 
-function acKindOptions() {
-  if ($("ac-mode").value === "auto_comment") {
+function acKindOptionsFor(platform, mode) {
+  if (mode === "auto_comment") {
     let html = '<option value="creator">指定博主</option>';
-    if (PLATFORM === "xhs") html += '<option value="keyword">搜索关键词</option>';
+    if (AC_KEYWORD_PLATFORMS.includes(platform)) html += '<option value="keyword">搜索关键词</option>';
     return html;
   }
   return '<option value="self">自己近期作品</option><option value="work">指定作品</option>';
 }
+function acTargetMeta(platform, mode, kind) {
+  const xhs = platform === "xhs", bili = platform === "bilibili", ig = platform === "instagram", tw = platform === "twitter", fb = platform === "facebook";
+  if (mode === "auto_reply") {
+    if (kind === "self") return { show: false, label: "目标", ph: "" };
+    return {
+      show: true,
+      label: xhs ? "笔记链接 / id" : tw ? "推文链接 / status_id" : fb ? "帖子 / Reel / Watch 链接" : "作品链接 / id",
+      ph: xhs ? "explore 链接 / xhslink / note_id" : bili ? "视频链接 / BV或av号 / opus链接" : ig ? "instagram.com/p/... 或 /reel/... 链接" : tw ? "x.com/.../status/... 链接或数字推文 ID" : fb ? "facebook.com 帖子/Reel/Watch 链接或 fb.watch 短链" : "作品链接 / 短链 / 数字 id",
+    };
+  }
+  if (kind === "keyword") {
+    return {
+      show: true,
+      label: "搜索关键词",
+      ph: tw ? "例如:AI agent / #buildinpublic" : fb ? "例如:跨境电商 / marketing tips" : ig ? "例如:#travel / skincare" : "例如:露营装备 / 口红试色",
+    };
+  }
+  return {
+    show: true,
+    label: xhs ? "博主主页 / id" : bili ? "UP 主空间主页 / mid" : (ig || tw) ? "创作者主页 / @username" : fb ? "主页 / 公共主页 / 群组链接" : "博主主页 / sec_uid",
+    ph: xhs ? "主页链接 / xhslink / user_id" : bili ? "space.bilibili.com 链接 / mid" : ig ? "instagram.com/<username> 或 @username" : tw ? "x.com/<username> 或 @username" : fb ? "facebook.com/<page>、/groups/<id> 或 profile.php?id=..." : "主页链接 / 短链 / sec_uid",
+  };
+}
+function acParseKwInput(text) {
+  return String(text || "").split(/[,，、;；\r\n]+/).map(s => s.trim()).filter(Boolean);
+}
+function acNeedsTemplates(composeMode) {
+  return composeMode === "template_only" || composeMode === "ai_with_fallback";
+}
+function acUsesAi(composeMode) {
+  return composeMode !== "template_only";
+}
+function acPresetOptionsHtml(selectedId = "") {
+  const presets = AC_POLICY_META?.ai_presets || [];
+  const defId = AC_POLICY_META?.ai_default_preset_id || "natural_cn";
+  const defName = (presets.find(p => p.id === defId) || {}).name || "默认人设";
+  const opts = [`<option value="">跟随全局默认（${esc(defName)}）</option>`];
+  presets.forEach(p => {
+    opts.push(`<option value="${esc(p.id)}"${p.id === selectedId ? " selected" : ""}>${esc(p.name)}${p.builtin ? "" : "（自定义）"}</option>`);
+  });
+  if (selectedId && !presets.some(p => p.id === selectedId)) {
+    opts.push(`<option value="${esc(selectedId)}" selected>${esc(selectedId)}</option>`);
+  }
+  return opts.join("");
+}
+function acChannelOptionsHtml(selectedId = "") {
+  const channels = AC_POLICY_META?.ai_channels?.channels || [];
+  const opts = [`<option value="">跟随「设置 → AI 文案」默认路由</option>`];
+  channels.forEach(c => {
+    opts.push(`<option value="${esc(c.id)}"${c.id === selectedId ? " selected" : ""}>${esc(c.display_name)} · ${esc(c.model || "未选模型")}</option>`);
+  });
+  if (selectedId && !channels.some(c => c.id === selectedId)) {
+    opts.push(`<option value="${esc(selectedId)}" selected>渠道 ${esc(selectedId)}</option>`);
+  }
+  return opts.join("");
+}
+function populateAcAiSelectors() {
+  if ($("ac-ai-preset")) {
+    const prev = $("ac-ai-preset").value;
+    $("ac-ai-preset").innerHTML = acPresetOptionsHtml(prev);
+  }
+  if ($("ac-ai-channel")) {
+    const prev = $("ac-ai-channel").value;
+    $("ac-ai-channel").innerHTML = acChannelOptionsHtml(prev);
+  }
+  csSyncAll();
+}
+function renderAcPolicyBars() {
+  const p = AC_POLICY_META?.policy;
+  if (!p) return;
+  const aiOk = p.ai_enabled && p.ai_route?.ready;
+  const aiTxt = !p.ai_enabled
+    ? "AI 文案总开关未开启"
+    : p.ai_route?.ready
+      ? `AI 已就绪（${p.ai_route.label}）`
+      : `AI 未就绪（${p.ai_route?.reason || "未配置模型"}）`;
+  const capParts = [];
+  if (p.account_daily_cap > 0) capParts.push(`账号每日上限 ${p.account_daily_cap} 条`);
+  if (p.account_hourly_cap > 0) capParts.push(`每小时 ${p.account_hourly_cap} 条`);
+  if (p.risk_comment_min_gap_seconds > 0 || p.legacy_comment_min_gap_seconds > 0) {
+    capParts.push(`全局最小间隔 ${Math.max(p.risk_comment_min_gap_seconds, p.legacy_comment_min_gap_seconds)} 秒`);
+  }
+  const limitTxt = capParts.length ? capParts.join(" · ") : "风控评论限额未开启（仅按规则自身参数）";
+  const reviewTxt = p.xhs_manual_only
+    ? "小红书当前为「仅保存草稿」模式，不会自动发送"
+    : p.xhs_review_forced
+      ? "小红书已开启「全局先审后发」，所有规则生成后均先入草稿"
+      : "审核状态由各规则单独控制";
+
+  const rulesBar = $("ac-rules-policy-bar");
+  if (rulesBar) {
+    rulesBar.dataset.state = (p.ai_enabled && !p.ai_route?.ready) ? "warn" : "ok";
+    if ($("ac-rules-policy-title")) $("ac-rules-policy-title").textContent = `${PF_NAME[PLATFORM] || PLATFORM} 生效策略 · ${aiTxt}`;
+    if ($("ac-rules-policy-desc")) $("ac-rules-policy-desc").textContent = `${limitTxt} · ${reviewTxt}`;
+  }
+  syncAcCreatePolicySummary();
+}
+function syncAcCreatePolicySummary() {
+  const p = AC_POLICY_META?.policy;
+  const banner = $("ac-create-policy-banner");
+  if (!banner || !p) return;
+  const cm = $("ac-compose-mode")?.value || "template_only";
+  const ruleGap = Math.max(1, Number($("ac-gap")?.value) || 90);
+  const ruleCap = Math.max(0, Number($("ac-cap")?.value) || 0);
+  const effGap = Math.max(ruleGap, p.risk_comment_min_gap_seconds || 0, p.legacy_comment_min_gap_seconds || 0);
+  const reviewOn = Boolean($("ac-review")?.checked) || p.xhs_review_forced || p.xhs_manual_only;
+  const warnReasons = [];
+  if (acUsesAi(cm) && !p.ai_enabled) warnReasons.push("当前选了 AI 生成，但「设置 → AI 文案」总开关尚未开启");
+  else if (acUsesAi(cm) && !p.ai_route?.ready) warnReasons.push(`AI 模型未就绪（${p.ai_route?.reason || "请先配置"}）`);
+
+  const accId = Number($("ac-acc")?.value || 0);
+  const acc = ACCOUNTS.find(a => a.id === accId);
+  if ($("ac-mode")?.value === "auto_comment" && acc && String(acc.account_role || "hybrid").toLowerCase() === "publish") {
+    warnReasons.push("所选账号为「发布主号 (publish)」，不允许创建主动评论规则");
+  }
+  if ($("ac-review-help")) {
+    $("ac-review-help").textContent = p.xhs_manual_only
+      ? "当前小红书评论通道为「仅保存草稿」，无论是否勾选均只存草稿。"
+      : p.xhs_review_forced
+        ? "当前「设置 → 采集与运行」开启了小红书全局先审后发，本规则会自动先存草稿。"
+        : "推荐开启：生成后进入「任务与审核」核对原文与拟发文案，通过后再按节流发出。";
+  }
+  banner.dataset.state = warnReasons.length ? "warn" : "ok";
+  if ($("ac-create-policy-title")) {
+    $("ac-create-policy-title").textContent = warnReasons.length
+      ? `配置提醒：${warnReasons[0]}`
+      : `生效预览：最小间隔 ${effGap} 秒 · ${ruleCap === 0 ? "规则日限不单独限制" : `规则日限 ${ruleCap} 条`}${p.account_daily_cap ? `（账号总上限 ${p.account_daily_cap} 条）` : ""} · ${reviewOn ? "先审后发" : "生成即排队"}`;
+  }
+  if ($("ac-create-policy-desc")) {
+    $("ac-create-policy-desc").textContent = warnReasons.length > 1
+      ? warnReasons.join("；")
+      : `AI 路由：${p.ai_enabled ? (p.ai_route?.label || "未配置") : "未启用"} · 扫描范围默认最近 ${p.global_recent_works} 条作品 / ${p.global_recent_days} 天。`;
+  }
+}
+async function refreshAcPolicyMeta() {
+  try {
+    const data = await api("/api/comment-rules/effective-policy?platform=" + encodeURIComponent(PLATFORM));
+    AC_POLICY_META = data;
+    populateAcAiSelectors();
+    renderAcPolicyBars();
+  } catch (e) {}
+}
+function onAcComposeModeChange() {
+  const cm = $("ac-compose-mode")?.value || "template_only";
+  if ($("ac-ai-opts")) $("ac-ai-opts").hidden = !acUsesAi(cm);
+  if ($("ac-tpl-label")) {
+    $("ac-tpl-label").textContent = acNeedsTemplates(cm)
+      ? (cm === "ai_with_fallback" ? "本地回退模板（必填，AI 失败时自动回退）" : "本地文案模板（每行一条，必填）")
+      : "本地文案模板（当前纯 AI 模式可留空）";
+  }
+  syncAcCreatePolicySummary();
+  csSyncAll();
+}
+function previewAcTemplates(textareaId) {
+  const raw = ($(textareaId)?.value || "").split("\n").map(s => s.trim()).filter(Boolean);
+  if (!raw.length) { toast("请先输入至少一条模板再预览", "info"); return; }
+  const picked = raw[Math.floor(Math.random() * raw.length)];
+  const expanded = picked.replace(/\{([^{}|]+(?:\|[^{}|]+)+)\}/g, (_, g) => {
+    const parts = g.split("|"); return parts[Math.floor(Math.random() * parts.length)];
+  }).replaceAll("{nick}", "山风旅人").replaceAll("{kw}", "露营").replaceAll("{author}", "户外达人").replaceAll("{work_title}", "轻量化天幕实测");
+  toast("随机渲染示例：" + expanded, "info", 5500);
+}
 function onAcMode() {
   const k = $("ac-kind"); if (!k) return;
   const prev = k.value;
-  k.innerHTML = acKindOptions();
+  k.innerHTML = acKindOptionsFor(PLATFORM, $("ac-mode").value);
   if ([...k.options].some(o => o.value === prev)) k.value = prev;
   onAcKind();
 }
 function onAcKind() {
-  const mode = $("ac-mode").value, kind = $("ac-kind").value, xhs = PLATFORM === "xhs", bili = PLATFORM === "bilibili";
-  let show = true, label = "目标", ph = "";
-  if (mode === "auto_reply") {
-    if (kind === "self") show = false;
-    else { label = xhs ? "笔记链接 / id" : "作品链接 / id"; ph = xhs ? "explore 链接 / xhslink / note_id" : bili ? "视频链接 / BV或av号 / opus链接" : "作品链接 / 短链 / 数字 id"; }
-  } else {
-    if (kind === "keyword") { label = "搜索关键词"; ph = "例如:露营装备 / 口红试色"; }
-    else { label = xhs ? "博主主页 / id" : bili ? "UP 主空间主页 / mid" : "博主主页 / sec_uid"; ph = xhs ? "主页链接 / xhslink / user_id" : bili ? "space.bilibili.com 链接 / mid" : "主页链接 / 短链 / sec_uid"; }
-  }
-  $("ac-target-wrap").style.display = show ? "" : "none";
-  $("ac-target-label").textContent = label; $("ac-target").placeholder = ph;
-  $("ac-reply-filter").style.display = mode === "auto_reply" ? "" : "none";
+  const mode = $("ac-mode").value, kind = $("ac-kind").value;
+  const meta = acTargetMeta(PLATFORM, mode, kind);
+  $("ac-target-wrap").style.display = meta.show ? "" : "none";
+  $("ac-target-label").textContent = meta.label;
+  $("ac-target").placeholder = meta.ph;
+  if ($("ac-scope-wrap")) $("ac-scope-wrap").style.display = mode === "auto_reply" ? "" : "none";
+  onAcComposeModeChange();
+  syncAcCreatePolicySummary();
   csSyncAll();
 }
 function populateAcAccount() {
   const sel = $("ac-acc"); if (!sel) return;
   sel.innerHTML = accOptions(ACCOUNTS, `请选择${PF_NAME[PLATFORM] || "当前平台"}账号(必选)`);
   if (ACCOUNTS.length) sel.value = String(ACCOUNTS[0].id);
+  syncAcCreatePolicySummary();
   csSyncAll();
 }
 async function addCommentRule() {
   const acc = $("ac-acc").value;
   if (!acc) { toast("请选择账号", "err"); return; }
+  const compose_mode = $("ac-compose-mode")?.value || "template_only";
   const templates = $("ac-templates").value.split("\n").map(s => s.trim()).filter(Boolean);
-  if (!templates.length) { toast("请至少写一条文案模板(AI 失败时回退用)", "err"); return; }
+  if (acNeedsTemplates(compose_mode) && !templates.length) {
+    toast("当前文案模式需至少写一条模板（如只需 AI 可切换为「仅用 AI」）", "err");
+    return;
+  }
+  const inc = acParseKwInput($("ac-include-kw")?.value || "");
+  const exc = acParseKwInput($("ac-skip")?.value || "");
   const body = {
-    platform: PLATFORM, mode: $("ac-mode").value, account_id: +acc,
-    target_kind: $("ac-kind").value, target: $("ac-target").value.trim(),
-    templates, use_ai: $("ac-use-ai").checked, require_review: $("ac-review").checked,
-    reply_filter: $("ac-reply-filter").value.trim(), skip_keywords: $("ac-skip").value.trim(),
-    daily_cap: +$("ac-cap").value || 0, min_gap_seconds: +$("ac-gap").value || 60,
-    max_per_run: +$("ac-max").value || 5, interval_seconds: +$("ac-interval").value || 1800, enabled: false,
+    platform: PLATFORM,
+    name: ($("ac-name")?.value || "").trim(),
+    mode: $("ac-mode").value,
+    account_id: +acc,
+    target_kind: $("ac-kind").value,
+    target: $("ac-target").value.trim(),
+    templates,
+    compose_mode,
+    use_ai: acUsesAi(compose_mode),
+    ai_channel_id: $("ac-ai-channel")?.value || "",
+    ai_model: ($("ac-ai-model")?.value || "").trim(),
+    ai_preset_id: $("ac-ai-preset")?.value || "",
+    ai_prompt: ($("ac-ai-prompt")?.value || "").trim(),
+    ai_max_chars: Math.max(0, Number($("ac-ai-max-chars")?.value) || 0),
+    require_review: $("ac-review").checked,
+    match_mode: $("ac-match-mode")?.value || "any",
+    include_keywords: inc,
+    exclude_keywords: exc,
+    reply_filter: inc.join(", "),
+    skip_keywords: exc.join(", "),
+    comment_scope: $("ac-comment-scope")?.value || "all",
+    min_source_length: Math.max(0, Number($("ac-min-len")?.value) || 0),
+    max_source_age_hours: Math.max(0, Number($("ac-max-age")?.value) || 0),
+    recent_works: Math.max(0, Number($("ac-recent-works")?.value) || 0),
+    recent_days: Math.max(0, Number($("ac-recent-days")?.value) || 0),
+    daily_cap: Math.max(0, Number($("ac-cap").value) || 0),
+    min_gap_seconds: Math.max(1, Number($("ac-gap").value) || 90),
+    max_per_run: Math.max(1, Number($("ac-max").value) || 5),
+    interval_seconds: Math.max(60, Number($("ac-interval").value) || 1800),
+    enabled: false,
   };
   await withBusy(evtBtn(), "创建中", async () => {
-  try {
-    await api("/api/comment-rules", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    $("ac-templates").value = ""; $("ac-target").value = "";
-    $("ac-msg").textContent = "规则已创建(默认关闭),可在下方「试跑」预览文案 ✓";
-    toast("规则已创建", "ok"); refreshCommentRules();
-    globalThis.CreatorHubWorkbench?.completed?.("autocomment");
-  } catch (e) { $("ac-msg").textContent = "失败: " + e.message; toast("创建失败:" + e.message, "err"); }
+    try {
+      await api("/api/comment-rules", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      if ($("ac-name")) $("ac-name").value = "";
+      $("ac-templates").value = ""; $("ac-target").value = "";
+      if ($("ac-ai-prompt")) $("ac-ai-prompt").value = "";
+      if ($("ac-include-kw")) $("ac-include-kw").value = "";
+      if ($("ac-skip")) $("ac-skip").value = "";
+      $("ac-msg").textContent = "规则已创建（默认关闭），点「试跑预览」核对命中与文案后再启用 ✓";
+      toast("规则已创建", "ok"); refreshCommentRules();
+      globalThis.CreatorHubWorkbench?.completed?.("autocomment");
+    } catch (e) { $("ac-msg").textContent = "失败: " + e.message; toast("创建失败:" + e.message, "err"); }
   });
 }
 
-// ─── 编辑规则:独立弹窗(复用 uimodal 壳)───
+// ─── 编辑规则:独立弹窗（与新建完全同源，支持全平台与全部新字段）───
 let EM_PF = "douyin";
-function emKindOptions() {
-  if ($("em-mode").value === "auto_comment") {
-    let h = '<option value="creator">指定博主</option>';
-    if (EM_PF === "xhs") h += '<option value="keyword">搜索关键词</option>';
-    return h;
-  }
-  return '<option value="self">自己近期作品</option><option value="work">指定作品</option>';
-}
 function emOnMode() {
   const k = $("em-kind"); if (!k) return;
   const prev = k.value;
-  k.innerHTML = emKindOptions();
+  k.innerHTML = acKindOptionsFor(EM_PF, $("em-mode").value);
   if ([...k.options].some(o => o.value === prev)) k.value = prev;
   emOnKind();
 }
 function emOnKind() {
-  const mode = $("em-mode").value, kind = $("em-kind").value, xhs = EM_PF === "xhs";
-  let show = true, label = "目标", ph = "";
-  if (mode === "auto_reply") {
-    if (kind === "self") show = false;
-    else { label = xhs ? "笔记链接 / id" : "作品链接 / id"; ph = xhs ? "explore / xhslink / note_id" : "作品链接 / 短链 / 数字 id"; }
-  } else {
-    if (kind === "keyword") { label = "搜索关键词"; ph = "例如:露营装备 / 口红试色"; }
-    else { label = xhs ? "博主主页 / id" : "博主主页 / sec_uid"; ph = xhs ? "主页 / xhslink / user_id" : "主页 / 短链 / sec_uid"; }
+  const mode = $("em-mode").value, kind = $("em-kind").value;
+  const meta = acTargetMeta(EM_PF, mode, kind);
+  $("em-target-wrap").style.display = meta.show ? "" : "none";
+  $("em-target-label").textContent = meta.label;
+  $("em-target").placeholder = meta.ph;
+  if ($("em-scope-wrap")) $("em-scope-wrap").style.display = mode === "auto_reply" ? "" : "none";
+  csSyncAll();
+}
+function emOnComposeMode() {
+  const cm = $("em-compose-mode")?.value || "template_only";
+  if ($("em-ai-opts")) $("em-ai-opts").hidden = !acUsesAi(cm);
+  if ($("em-tpl-label")) {
+    $("em-tpl-label").textContent = acNeedsTemplates(cm)
+      ? (cm === "ai_with_fallback" ? "本地回退模板（必填）" : "本地文案模板（必填）")
+      : "本地文案模板（纯 AI 模式可留空）";
   }
-  $("em-target-wrap").style.display = show ? "" : "none";
-  $("em-target-label").textContent = label; $("em-target").placeholder = ph;
-  $("em-filter-wrap").style.display = mode === "auto_reply" ? "" : "none";
-  $("em-reply-filter").style.display = mode === "auto_reply" ? "" : "none";
   csSyncAll();
 }
 function editRule(id) {
@@ -9252,16 +12994,41 @@ function editRule(id) {
   const accOpts = accOptions(ACCOUNTS.filter(a => a.platform === EM_PF), `请选择${PF_NAME[EM_PF] || "对应平台"}账号`);
   new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
-    _uiGetVal = () => ({
-      name: $("em-name").value.trim(), mode: $("em-mode").value,
-      target_kind: $("em-kind").value, target: $("em-target").value.trim(),
-      account_id: +$("em-acc").value || null,
-      templates: $("em-templates").value.split("\n").map(s => s.trim()).filter(Boolean),
-      use_ai: $("em-use-ai").checked, require_review: $("em-review").checked,
-      reply_filter: $("em-reply-filter").value.trim(), skip_keywords: $("em-skip").value.trim(),
-      daily_cap: +$("em-cap").value || 0, min_gap_seconds: +$("em-gap").value || 60,
-      max_per_run: +$("em-max").value || 5, interval_seconds: +$("em-interval").value || 1800,
-    });
+    _uiGetVal = () => {
+      const compose_mode = $("em-compose-mode").value || "template_only";
+      const inc = acParseKwInput($("em-include-kw").value);
+      const exc = acParseKwInput($("em-skip").value);
+      return {
+        name: $("em-name").value.trim(),
+        mode: $("em-mode").value,
+        target_kind: $("em-kind").value,
+        target: $("em-target").value.trim(),
+        account_id: +$("em-acc").value || null,
+        templates: $("em-templates").value.split("\n").map(s => s.trim()).filter(Boolean),
+        compose_mode,
+        use_ai: acUsesAi(compose_mode),
+        ai_channel_id: $("em-ai-channel").value || "",
+        ai_model: $("em-ai-model").value.trim(),
+        ai_preset_id: $("em-ai-preset").value || "",
+        ai_prompt: $("em-ai-prompt").value.trim(),
+        ai_max_chars: Math.max(0, Number($("em-ai-max-chars").value) || 0),
+        require_review: $("em-review").checked,
+        match_mode: $("em-match-mode").value || "any",
+        include_keywords: inc,
+        exclude_keywords: exc,
+        reply_filter: inc.join(", "),
+        skip_keywords: exc.join(", "),
+        comment_scope: $("em-comment-scope").value || "all",
+        min_source_length: Math.max(0, Number($("em-min-len").value) || 0),
+        max_source_age_hours: Math.max(0, Number($("em-max-age").value) || 0),
+        recent_works: Math.max(0, Number($("em-recent-works").value) || 0),
+        recent_days: Math.max(0, Number($("em-recent-days").value) || 0),
+        daily_cap: Math.max(0, Number($("em-cap").value) || 0),
+        min_gap_seconds: Math.max(1, Number($("em-gap").value) || 90),
+        max_per_run: Math.max(1, Number($("em-max").value) || 5),
+        interval_seconds: Math.max(60, Number($("em-interval").value) || 1800),
+      };
+    };
     $("ui-body").innerHTML = `
       <fieldset class="ui-form-group"><legend>规则与对象</legend>
         <div><label class="field" for="em-name">规则名称</label><input id="em-name" maxlength="100" placeholder="便于识别这条规则"></div>
@@ -9272,25 +13039,53 @@ function editRule(id) {
         <div><label class="field" for="em-acc">使用账号</label><select id="em-acc">${accOpts}</select></div>
         <div id="em-target-wrap"><label class="field" id="em-target-label" for="em-target">目标</label><input id="em-target"></div>
       </fieldset>
-      <fieldset class="ui-form-group"><legend>文案与审核</legend>
-        <div><label class="field" for="em-templates">文案模板</label><textarea id="em-templates" rows="4" aria-describedby="em-templates-hint"></textarea>
-          <p class="field-help" id="em-templates-hint">每行一条，支持 {nick}、{kw} 和随机词组 {好|不错|赞}。</p></div>
-        <label class="ui-toggle"><span><b>AI 生成文案</b><small>生成失败时使用上面的模板</small></span><input type="checkbox" role="switch" id="em-use-ai"></label>
-        <label class="ui-toggle"><span><b>发布前审核</b><small>只生成草稿，由你确认后再发送</small></span><input type="checkbox" role="switch" id="em-review"></label>
-        <div class="form-grid" id="em-filter-wrap">
-          <div><label class="field" for="em-reply-filter">只回复包含关键词的评论</label><input id="em-reply-filter" placeholder="留空不限制"></div>
-          <div><label class="field" for="em-skip">跳过关键词</label><input id="em-skip" placeholder="多个词用逗号分隔"></div>
+      <fieldset class="ui-form-group"><legend>文案与 AI</legend>
+        <div><label class="field" for="em-compose-mode">生成方式</label><select id="em-compose-mode" onchange="emOnComposeMode()">
+          <option value="template_only">仅使用本地模板库</option>
+          <option value="ai_with_fallback">AI 生成优先，失败回退模板</option>
+          <option value="ai_only_draft">仅用 AI，失败存空草稿待人工处理</option>
+          <option value="ai_only_skip">仅用 AI，失败跳过</option>
+        </select></div>
+        <div id="em-ai-opts" class="stack" style="gap:10px" hidden>
+          <div class="form-grid">
+            <div><label class="field" for="em-ai-preset">文案人设预设</label><select id="em-ai-preset">${acPresetOptionsHtml(r.ai_preset_id || "")}</select></div>
+            <div><label class="field" for="em-ai-max-chars">回复字数上限（0=跟随预设）</label><input type="number" id="em-ai-max-chars" min="0" max="300"></div>
+            <div><label class="field" for="em-ai-channel">指定模型渠道</label><select id="em-ai-channel">${acChannelOptionsHtml(r.ai_channel_id || "")}</select></div>
+            <div><label class="field" for="em-ai-model">指定模型 ID（可选）</label><input id="em-ai-model" maxlength="160" placeholder="留空跟随默认"></div>
+          </div>
+          <div><label class="field" for="em-ai-prompt">规则专属 AI 指令</label><textarea id="em-ai-prompt" rows="2" maxlength="2000" placeholder="可选补充指令"></textarea></div>
+        </div>
+        <div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px"><label class="field" id="em-tpl-label" for="em-templates" style="margin:0">文案模板</label><button type="button" class="ghost sm" onclick="previewAcTemplates('em-templates')">随机预览</button></div>
+          <textarea id="em-templates" rows="4" aria-describedby="em-templates-hint"></textarea>
+          <p class="field-help" id="em-templates-hint">每行一条，支持 {nick}、{kw}、{author}、{work_title} 和随机词组 {好|不错|赞}。</p>
         </div>
       </fieldset>
-      <fieldset class="ui-form-group"><legend>执行频率</legend>
+      <fieldset class="ui-form-group"><legend>筛选与发现范围</legend>
         <div class="form-grid">
-          <div><label class="field" for="em-cap">每日上限（条）</label><input type="number" id="em-cap" min="0" inputmode="numeric"></div>
+          <div><label class="field" for="em-match-mode">包含词匹配方式</label><select id="em-match-mode">
+            <option value="any">命中任一包含词</option><option value="all_terms">同时命中全部词</option><option value="regex">正则匹配</option><option value="all">不过滤</option>
+          </select></div>
+          <div id="em-scope-wrap"><label class="field" for="em-comment-scope">评论层级</label><select id="em-comment-scope">
+            <option value="all">全部评论</option><option value="top_only">仅一级顶层评论</option><option value="reply_only">仅二级子评论</option>
+          </select></div>
+          <div><label class="field" for="em-include-kw">包含关键词</label><input id="em-include-kw" placeholder="逗号/中文逗号/换行分隔，留空不限"></div>
+          <div><label class="field" for="em-skip">排除 / 跳过关键词</label><input id="em-skip" placeholder="命中任一即跳过"></div>
+          <div><label class="field" for="em-min-len">最少字数（0=不限）</label><input type="number" id="em-min-len" min="0" max="500"></div>
+          <div><label class="field" for="em-max-age">最近 N 小时内（0=按天）</label><input type="number" id="em-max-age" min="0" max="8760"></div>
+          <div><label class="field" for="em-recent-works">扫描近期作品数（0=全局）</label><input type="number" id="em-recent-works" min="0" max="50"></div>
+          <div><label class="field" for="em-recent-days">扫描近期天数（0=全局）</label><input type="number" id="em-recent-days" min="0" max="365"></div>
+        </div>
+      </fieldset>
+      <fieldset class="ui-form-group"><legend>审核与执行频率</legend>
+        <label class="ui-toggle"><span><b>发布前审核</b><small>先生成草稿，由你核对原文后通过再发送</small></span><input type="checkbox" role="switch" id="em-review"></label>
+        <div class="form-grid">
+          <div><label class="field" for="em-cap">每日上限（0=跟随账号风控）</label><input type="number" id="em-cap" min="0" inputmode="numeric"></div>
           <div><label class="field" for="em-gap">最小间隔（秒）</label><input type="number" id="em-gap" min="1" inputmode="numeric"></div>
-          <div><label class="field" for="em-max">每轮上限（条）</label><input type="number" id="em-max" min="1" inputmode="numeric"></div>
-          <div><label class="field" for="em-interval">检查频率</label><select id="em-interval">${numericSelectOptions(r.interval_seconds || 1800, [[900, "每 15 分钟"], [1800, "每 30 分钟"], [3600, "每小时"]], " 秒")}</select></div>
+          <div><label class="field" for="em-max">每轮上限（条）</label><input type="number" id="em-max" min="1" max="100" inputmode="numeric"></div>
+          <div><label class="field" for="em-interval">检查频率</label><select id="em-interval">${numericSelectOptions(r.interval_seconds || 1800, [[900, "每 15 分钟"], [1800, "每 30 分钟"], [3600, "每小时"], [7200, "每 2 小时"]], " 秒")}</select></div>
         </div>
       </fieldset>`;
-    // 回填值
     $("em-name").value = r.name || "";
     $("em-mode").value = r.mode; emOnMode();
     $("em-kind").value = r.target_kind; emOnKind();
@@ -9298,79 +13093,203 @@ function editRule(id) {
     $("em-target").value = r.mode === "auto_comment"
       ? (r.target_kind === "keyword" ? r.keyword : r.sec_uid)
       : (r.target_kind === "work" ? r.aweme_id : "");
+    $("em-compose-mode").value = r.compose_mode || (r.use_ai ? "ai_with_fallback" : "template_only");
+    $("em-ai-model").value = r.ai_model || "";
+    $("em-ai-prompt").value = r.ai_prompt || "";
+    $("em-ai-max-chars").value = String(r.ai_max_chars || 0);
     $("em-templates").value = (r.templates || []).join("\n");
-    $("em-use-ai").checked = !!r.use_ai;
+    emOnComposeMode();
+    $("em-match-mode").value = r.match_mode || "any";
+    $("em-comment-scope").value = r.comment_scope || "all";
+    $("em-include-kw").value = (r.include_keywords && r.include_keywords.length ? r.include_keywords.join(", ") : r.reply_filter) || "";
+    $("em-skip").value = (r.exclude_keywords && r.exclude_keywords.length ? r.exclude_keywords.join(", ") : r.skip_keywords) || "";
+    $("em-min-len").value = String(r.min_source_length || 0);
+    $("em-max-age").value = String(r.max_source_age_hours || 0);
+    $("em-recent-works").value = String(r.recent_works || 0);
+    $("em-recent-days").value = String(r.recent_days || 0);
     $("em-review").checked = !!r.require_review;
-    $("em-reply-filter").value = r.reply_filter || "";
-    $("em-skip").value = r.skip_keywords || "";
     $("em-cap").value = r.daily_cap; $("em-gap").value = r.min_gap_seconds;
     $("em-max").value = r.max_per_run;
     if ([...$("em-interval").options].some(o => o.value === String(r.interval_seconds))) $("em-interval").value = String(r.interval_seconds);
-    _uiOpen("编辑规则 #" + id, "调整互动对象、文案和执行频率。修改目标或关键词后会重新解析。", {
+    _uiOpen("编辑规则 #" + id, "调整互动对象、AI 策略、筛选条件与执行频率。", {
       okText: "保存修改", wide: true, icon: "i-automation",
       submit: val => {
-        if (!val.templates.length) uiEditorError("请至少写一条文案模板", "em-templates");
+        if (acNeedsTemplates(val.compose_mode) && !val.templates.length) uiEditorError("当前文案模式需至少写一条模板", "em-templates");
         if (!val.account_id) uiEditorError("请选择与规则平台一致的账号", "em-acc");
         return api("/api/comment-rules/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(val) });
       },
     });
-    ["em-mode", "em-kind", "em-acc", "em-interval"].forEach(idd => { const el = $(idd); if (el) enhanceSelect(el); });
+    ["em-mode", "em-kind", "em-acc", "em-compose-mode", "em-ai-preset", "em-ai-channel", "em-match-mode", "em-comment-scope", "em-interval"].forEach(idd => { const el = $(idd); if (el) enhanceSelect(el); });
   }).then(async val => {
-    if (!val) return;   // 取消
+    if (!val) return;
     toast("规则已更新", "ok"); refreshCommentRules();
   });
+}
+async function duplicateRule(id) {
+  const r = AC_RULES.find(x => x.id === id); if (!r) return;
+  const pfAccs = ACCOUNTS.filter(a => a.platform === r.platform);
+  const targetAcc = await uiSelect({
+    title: `复制规则「${r.name}」`,
+    hint: "选择新规则绑定的账号（支持快速复制到同平台其他账号，新规则默认关闭）。",
+    value: String(r.account_id || (pfAccs[0]?.id || "")),
+    options: pfAccs.map(a => ({ value: String(a.id), label: `${a.nickname || `账号 #${a.id}`}${a.id === r.account_id ? "（当前账号）" : ""}` })),
+  });
+  if (!targetAcc) return;
+  try {
+    await api(`/api/comment-rules/${id}/duplicate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: Number(targetAcc) }),
+    });
+    toast("规则已复制（默认关闭）✓", "ok");
+    refreshCommentRules();
+  } catch (e) { toast("复制失败：" + e.message, "err"); }
 }
 async function refreshCommentRules() {
   const isCurrent = beginViewRequest("comment-rules");
   if (!$("ac-rule-table")) return;
+  refreshAcPolicyMeta();
   const rows = await api("/api/comment-rules?platform=" + PLATFORM);
   if (!isCurrent()) return;
   if ($("tb-ac")) $("tb-ac").textContent = rows.length;
   AC_RULES = rows;
+  const presets = AC_POLICY_META?.ai_presets || [];
   $("ac-rule-table").innerHTML = rows.map(r => {
     const tgt = r.mode === "auto_comment"
       ? (r.target_kind === "keyword" ? "#" + esc(r.keyword) : esc((r.sec_uid || "").slice(0, 14)))
-      : (r.target_kind === "work" ? esc(r.aweme_id) : "自己近期作品");
+      : (r.target_kind === "work" ? esc(r.aweme_id) : "");
     const acc = (ACCOUNTS.find(a => a.id === r.account_id) || {}).nickname || ("#" + r.account_id);
-    const tags = [r.use_ai ? "AI文案" : "", r.require_review ? "草稿审核" : ""].filter(Boolean)
-      .map(x => `<span class="pill downloading" style="margin-left:4px;font-size:10px">${x}</span>`).join("");
+    const cm = r.compose_mode || (r.use_ai ? "ai_with_fallback" : "template_only");
+    const presetName = r.ai_preset_id ? (presets.find(p => p.id === r.ai_preset_id)?.name || r.ai_preset_id) : "";
+    const badges = [
+      `<span class="pill ${acUsesAi(cm) ? "downloading" : "skipped"} bare" style="font-size:10px">${esc(AC_COMPOSE_T[cm] || cm)}</span>`,
+      presetName ? `<span class="pill bare" style="font-size:10px">${esc(presetName)}</span>` : "",
+      r.require_review ? `<span class="pill pending bare" style="font-size:10px">草稿审核</span>` : "",
+      (r.include_keywords?.length) ? `<span class="pill bare" style="font-size:10px">含 ${r.include_keywords.length} 词</span>` : "",
+      (r.comment_scope && r.comment_scope !== "all" && r.mode === "auto_reply") ? `<span class="pill bare" style="font-size:10px">${esc(AC_SCOPE_T[r.comment_scope] || r.comment_scope)}</span>` : "",
+    ].filter(Boolean).join("");
+    const capTxt = r.daily_cap > 0 ? `${r.daily_cap}/日` : "不限(随风控)";
     return `<tr>
-      <td>${esc(r.name)}${tags}</td>
+      <td><b>${esc(r.name)}</b><div class="ac-rule-meta">${badges}</div></td>
       <td>${AC_MODE_T[r.mode] || r.mode}</td>
-      <td class="wrap" style="max-width:160px">${AC_KIND_T[r.target_kind] || r.target_kind}<br><span class="mut">${tgt}</span></td>
+      <td class="wrap" style="max-width:180px">${AC_KIND_T[r.target_kind] || r.target_kind}${tgt ? `<div class="mut">${tgt}</div>` : ""}</td>
       <td>${esc(acc)}</td>
-      <td class="mut num">${r.daily_cap}/日 · ${Math.round(r.interval_seconds / 60)}分</td>
+      <td class="mut num">${esc(capTxt)} · ${Math.round(r.interval_seconds / 60)}分<div class="mut">单轮≤${r.max_per_run} · ≥${r.min_gap_seconds}s</div></td>
       <td class="mut num">${r.last_run_at ? new Date(r.last_run_at + "Z").toLocaleString() : "—"}${r.last_error ? ` <span class="warn-ic" title="${esc(r.last_error)}">${ic("i-info")}</span>` : ""}${autoRunHint(r.next_auto_run_at)}</td>
       <td><span class="pill ${r.enabled ? "done" : "paused"}">${r.enabled ? "运行中" : "已停用"}</span></td>
       <td class="acttd">
-        <button class="ghost sm" onclick="toggleRule(${r.id}, ${r.enabled ? "false" : "true"})">${r.enabled ? "停用" : "启用"}</button>
+        <button class="ghost sm" onclick="previewRule(${r.id})">试跑预览</button>
         <button class="ghost sm" onclick="editRule(${r.id})">编辑</button>
-        <button class="ghost sm" onclick="runRule(${r.id})">试跑</button>
+        <button class="ghost sm" onclick="duplicateRule(${r.id})">复制</button>
+        <button class="ghost sm" onclick="toggleRule(${r.id}, ${r.enabled ? "false" : "true"})">${r.enabled ? "停用" : "启用"}</button>
         <button class="ghost sm danger" onclick="delRule(${r.id})">${ic("i-trash")}删除</button>
       </td></tr>`;
-  }).join("") || empty(8, "暂无评论规则", "i-msg", "创建规则后可先试跑，确认内容再启用。", "autocomment");
+  }).join("") || empty(8, "暂无评论规则", "i-msg", "创建规则后可先「试跑预览」核对命中与文案，确认无误再启用。", "autocomment");
 }
 async function toggleRule(id, en) {
   try { await api("/api/comment-rules/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: en }) }); toast(en ? "已启用" : "已停用", "ok"); refreshCommentRules(); }
   catch (e) { toast("操作失败:" + e.message, "err"); }
 }
-async function runRule(id) {
+async function previewRule(id) {
   const btn = evtBtn();
-  toast("试跑中…正在抓取目标评论,可能要十几秒", "info", 8000);
-  await withBusy(btn, "试跑中", async () => {
-    try {
-      const r = await api("/api/comment-rules/" + id + "/run-now", { method: "POST" });
-      if (!r.ok) toast("未生成:" + (r.error || ""), "err", 7000);
-      else if (r.created > 0) toast(`生成 ${r.created} 条${r.manual_only ? "人工发布草稿(未调用评论接口)" : r.review ? "草稿(待人工通过)" : "任务"}(发现 ${r.candidates} 个目标)`, "ok", 6000);
-      else toast(`发现 ${r.candidates} 个目标,生成 0 条` + (r.note ? `:${r.note}` : "(可能都已生成过)"), "info", 9000);
-    } catch (e) { toast("试跑失败:" + e.message, "err"); }
+  const rule = AC_RULES.find(x => x.id === id);
+  toast("正在试跑预览（不会写入队列或发送评论），可能需十余秒…", "info", 8000);
+  let res = null;
+  await withBusy(btn, "预览中", async () => {
+    try { res = await api(`/api/comment-rules/${id}/preview?limit=8`, { method: "POST" }); }
+    catch (e) { toast("预览失败：" + e.message, "err", 7000); }
   });
+  if (!res) return;
+  if (!res.ok) { toast("预览未通过：" + (res.error || "未知原因"), "err", 8000); return; }
+
+  const items = res.items || [];
+  const action = await new Promise(resolve => {
+    _uiResolve = resolve; _uiCancelVal = null; _uiGetVal = () => "draft";
+    $("ui-body").innerHTML = `
+      <div class="stack" style="gap:10px">
+        <div class="ac-policy-strip" data-state="${res.ai_warning ? "warn" : "ok"}">
+          <div class="ac-policy-copy">
+            <b>发现 ${res.candidates || 0} 个候选 · 本次命中 ${items.length} 条（纯预览，未发任何评论）</b>
+            <p>${esc(res.note || "所有候选均已按当前筛选与去重条件过滤。")}${res.ai_warning ? ` ⚠️ ${esc(res.ai_warning)}` : ""}</p>
+          </div>
+        </div>
+        ${items.length ? `<div class="ac-preview-list">${items.map(it => {
+          const [srcLabel, srcCls] = AC_SRC_META[it.content_source] || ["模板", ""];
+          return `<div class="ac-preview-item">
+            <div class="ac-preview-meta">
+              <code>${esc((it.aweme_id || "").slice(0, 20))}</code>
+              ${it.target_nick ? `<span>@${esc(it.target_nick)}</span>` : ""}
+              <span class="ac-src-tag ${srcCls}">${esc(srcLabel)}</span>
+              <span class="pill ${it.would_status === "draft" ? "downloading" : "pending"} bare" style="font-size:10px">${it.would_status === "draft" ? "正式运行将入草稿" : "正式运行将直接排队"}</span>
+            </div>
+            ${it.work_desc ? `<div class="mut" style="font-size:11px">作品：${esc(it.work_desc.slice(0, 90))}</div>` : ""}
+            <div class="ac-task-origin"><b>对方内容：</b>${esc(it.source_text || "（无正文）")}</div>
+            <div class="ac-task-reply${it.content ? "" : " empty-reply"}"><b>拟发文案：</b>${esc(it.content || "（空草稿，需人工补充）")}</div>
+            ${it.ai_error ? `<div class="mut" style="color:var(--warn);font-size:11px">AI 提示：${esc(it.ai_error)}</div>` : ""}
+          </div>`;
+        }).join("")}</div>` : `<div class="empty"><div class="empty-t">本次未命中可生成的目标</div><div class="empty-sub">${esc(res.note || "可检查关键词筛选或近期作品范围")}</div></div>`}
+        ${items.length ? `<div style="display:flex;justify-content:flex-end;gap:8px;padding-top:4px">
+          <button type="button" class="ghost sm" id="ac-prev-run-live">按规则配置正式执行一轮</button>
+        </div>` : ""}
+      </div>`;
+    if ($("ac-prev-run-live")) {
+      $("ac-prev-run-live").onclick = () => { _uiClose("live"); };
+    }
+    _uiOpen(`试跑预览 · ${rule ? rule.name : "#" + id}`, "仅抓取与生成样例，不写入队列也不发送。确认满意后再生成草稿或正式运行。", {
+      okText: items.length ? "生成草稿待审" : "关闭",
+      wide: true,
+      icon: "i-sparkles",
+    });
+  });
+  if (!action || !items.length) return;
+  await runRule(id, action === "draft");
+}
+async function runRule(id, asDraft = false) {
+  toast(asDraft ? "正在生成草稿待审…" : "正在正式执行规则…", "info", 8000);
+  try {
+    const r = await api(`/api/comment-rules/${id}/run-now${asDraft ? "?as_draft=true" : ""}`, { method: "POST" });
+    if (!r.ok) toast("未生成:" + (r.error || ""), "err", 7000);
+    else if (r.created > 0) toast(`已生成 ${r.created} 条${r.manual_only ? "人工发布草稿" : r.review ? "待审草稿" : "待发任务"}（发现 ${r.candidates} 个目标）`, "ok", 6000);
+    else toast(`发现 ${r.candidates} 个目标，生成 0 条` + (r.note ? `：${r.note}` : ""), "info", 9000);
+  } catch (e) { toast("执行失败:" + e.message, "err"); }
   refreshCommentRules(); refreshCommentTasks();
 }
 async function delRule(id) {
   if (!await uiConfirm({ title: "删除规则", message: "删除该规则及其未发送任务?", okText: "删除", danger: true })) return;
   try { await api("/api/comment-rules/" + id, { method: "DELETE" }); toast("已删除", "ok"); refreshCommentRules(); refreshCommentTasks(); }
   catch (e) { toast("删除失败:" + e.message, "err"); }
+}
+function syncAcTaskSelectionBar() {
+  const validIds = new Set(AC_TASKS.map(t => t.id));
+  for (const id of [...AC_SELECTED_TASKS]) { if (!validIds.has(id)) AC_SELECTED_TASKS.delete(id); }
+  const bar = $("ac-sel-bar"), info = $("ac-sel-info");
+  if (bar) bar.hidden = AC_SELECTED_TASKS.size === 0;
+  if (info) {
+    const selectedRows = AC_TASKS.filter(t => AC_SELECTED_TASKS.has(t.id));
+    const draftCnt = selectedRows.filter(t => t.status === "draft").length;
+    info.textContent = `已选择 ${selectedRows.length} 条任务（含 ${draftCnt} 条草稿）`;
+  }
+  const allChk = $("ac-task-check-all");
+  if (allChk) {
+    const selectable = AC_TASKS.filter(t => ["draft", "pending", "failed"].includes(t.status));
+    const chosen = selectable.filter(t => AC_SELECTED_TASKS.has(t.id)).length;
+    allChk.checked = selectable.length > 0 && chosen === selectable.length;
+    allChk.indeterminate = chosen > 0 && chosen < selectable.length;
+  }
+}
+function onAcTaskSelect(id, checked) {
+  if (checked) AC_SELECTED_TASKS.add(Number(id));
+  else AC_SELECTED_TASKS.delete(Number(id));
+  syncAcTaskSelectionBar();
+}
+function toggleSelectAllAcTasks(checked) {
+  AC_TASKS.filter(t => ["draft", "pending", "failed"].includes(t.status)).forEach(t => {
+    if (checked) AC_SELECTED_TASKS.add(t.id); else AC_SELECTED_TASKS.delete(t.id);
+  });
+  renderCommentTaskRows();
+}
+function clearAcTaskSelection() {
+  AC_SELECTED_TASKS.clear();
+  renderCommentTaskRows();
 }
 async function refreshCommentTasks() {
   const isCurrent = beginViewRequest("comment-tasks");
@@ -9380,43 +13299,105 @@ async function refreshCommentTasks() {
   if (!isCurrent()) return;
   AC_TASKS = rows;
   const drafts = rows.filter(t => t.status === "draft");
+  const readyDrafts = drafts.filter(t => (t.content || "").trim());
+  const emptyDrafts = drafts.length - readyDrafts.length;
   if ($("ac-draft-bar")) {
     $("ac-draft-bar").style.display = drafts.length ? "flex" : "none";
-    if (drafts.length) $("ac-draft-count").textContent = `有 ${drafts.length} 条草稿待审核——逐条「通过/编辑」,或一键全部通过后由引擎按节流发出`;
+    if (drafts.length) {
+      $("ac-draft-count").textContent = `有 ${drafts.length} 条草稿待审核（可发送 ${readyDrafts.length} 条${emptyDrafts ? ` · ${emptyDrafts} 条 AI 失败空草稿待编辑/重写` : ""}）`;
+    }
   }
-  $("ac-task-table").innerHTML = rows.map(t => {
+  renderCommentTaskRows();
+}
+function renderCommentTaskRows() {
+  if (!$("ac-task-table")) return;
+  const query = (($("ac-task-search") && $("ac-task-search").value) || "").trim().toLocaleLowerCase();
+  const filtered = AC_TASKS.filter(t => {
+    if (!query) return true;
+    const accName = (ACCOUNTS.find(a => a.id === t.account_id) || {}).nickname || "";
+    return [t.content, t.target_text, t.work_desc, t.aweme_id, t.target_nick, accName].filter(Boolean).join(" ").toLocaleLowerCase().includes(query);
+  });
+  if ($("ac-task-count")) $("ac-task-count").textContent = AC_TASKS.length ? `显示 ${filtered.length} / ${AC_TASKS.length}` : "";
+  $("ac-task-table").innerHTML = filtered.map(t => {
     const isDraft = t.status === "draft", canSend = t.status === "pending" || t.status === "failed";
+    const selectable = isDraft || canSend;
+    const checked = AC_SELECTED_TASKS.has(t.id);
+    const accName = (ACCOUNTS.find(a => a.id === t.account_id) || {}).nickname || (t.account_id ? `账号 #${t.account_id}` : "");
+    const [srcLabel, srcCls] = AC_SRC_META[t.content_source] || (t.content_source ? [t.content_source, ""] : ["", ""]);
+    const hasContent = Boolean((t.content || "").trim());
     return `<tr>
-    <td class="wrap" style="max-width:240px">${esc(t.content)}</td>
-    <td class="mut">${esc((t.aweme_id || "").slice(0, 16))}</td>
+    <td><input type="checkbox" ${selectable ? "" : "disabled"} ${checked ? "checked" : ""} onchange="onAcTaskSelect(${t.id}, this.checked)" aria-label="选择任务 #${t.id}"></td>
+    <td class="wrap"><div class="ac-task-pair">
+      ${(t.target_text || t.work_desc) ? `<div class="ac-task-origin">${t.target_text ? `<b>${t.target_comment_id ? "对方评论：" : "目标作品："}</b>${esc(t.target_text)}` : ""}${t.work_desc && t.work_desc !== t.target_text ? `<div style="margin-top:2px;opacity:.85">作品：${esc(t.work_desc.slice(0, 70))}</div>` : ""}</div>` : ""}
+      <div class="ac-task-reply${hasContent ? "" : " empty-reply"}">${hasContent ? esc(t.content) : "（文案为空，请点击「AI 重写」或「编辑」补充）"}</div>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        ${srcLabel ? `<span class="ac-src-tag ${srcCls}"${t.ai_error ? ` title="${esc(t.ai_error)}"` : ""}>${esc(srcLabel)}</span>` : ""}
+        ${t.ai_error ? `<span class="mut" style="font-size:11px;color:var(--warn)" title="${esc(t.ai_error)}">${esc(t.ai_error.slice(0, 48))}</span>` : ""}
+      </div>
+    </div></td>
+    <td><code title="${esc(t.aweme_id || "")}">${esc((t.aweme_id || "—").slice(0, 18))}</code>${accName ? `<div class="mut">${esc(accName)}</div>` : ""}</td>
     <td>${t.target_comment_id ? "回复 " + esc(t.target_nick || "") : "顶层评论"}</td>
     <td class="mut num">${t.scheduled_at ? new Date(t.scheduled_at + "Z").toLocaleString() : "尽快"}${t.next_allowed_at ? `<div class="mut" title="预约保持不变，同时等待风控间隔结束">风控最早 ${esc(riskTime(t.next_allowed_at))}</div>` : ""}</td>
     <td class="mut">${t.method === "browser" ? "浏览器页面" : t.method === "api" ? "API 兼容模式" : t.method === "manual" ? "人工草稿" : "—"}</td>
     <td><span class="pill ${AC_TASK_PILL[t.status] || "pending"}">${AC_TASK_ST[t.status] || t.status}</span>${t.error ? ` <span class="warn-ic" title="${esc(t.error)}">${ic("i-info")}</span>` : ""}</td>
     <td class="acttd">
-      ${isDraft ? `<button class="sm" onclick="approveTask(${t.id})">通过</button>` : ""}
-      ${(isDraft || canSend) ? `<button class="ghost sm" onclick="editTaskContent(${t.id})">编辑</button>` : ""}
-      ${canSend ? `<button class="ghost sm" onclick="runTask(${t.id})">立即发</button>` : ""}
-      ${(isDraft || canSend) ? `<button class="ghost sm" onclick="cancelTask(${t.id})">${isDraft ? "弃用" : "取消"}</button>` : ""}
+      ${isDraft && hasContent ? `<button class="sm" onclick="approveTask(${t.id})">通过</button>` : ""}
+      ${selectable ? `<button class="ghost sm" onclick="regenerateTask(${t.id})">AI 重写</button>` : ""}
+      ${selectable ? `<button class="ghost sm" onclick="editTaskContent(${t.id})">编辑</button>` : ""}
+      ${canSend && hasContent ? `<button class="ghost sm" onclick="runTask(${t.id})">立即发</button>` : ""}
+      ${selectable ? `<button class="ghost sm" onclick="cancelTask(${t.id})">${isDraft ? "弃用" : "取消"}</button>` : ""}
       ${t.status === "uncertain" ? `<button class="ghost sm" onclick="resolveTaskResult('comments',${t.id})">核对结果</button>` : t.status !== "doing" ? `<button class="ghost sm danger" onclick="delTask(${t.id})">${ic("i-trash")}删除</button>` : ""}
     </td></tr>`;
-  }).join("") || empty(7, "暂无评论任务", "i-msg", "启用规则或点「试跑」后,这里会出现待发评论");
+  }).join("") || empty(8, query ? "没有匹配的评论任务" : "暂无评论任务", "i-msg", query ? "调整搜索词或清除筛选" : "启用规则或点「试跑预览」后，这里会出现待审与待发评论");
+  syncAcTaskSelectionBar();
+}
+async function regenerateTask(id) {
+  const btn = evtBtn();
+  await withBusy(btn, "重写中", async () => {
+    try {
+      await api(`/api/comment-tasks/${id}/regenerate`, { method: "POST" });
+      toast("已用 AI 生成新文案 ✓", "ok");
+      refreshCommentTasks();
+    } catch (e) { toast("AI 重写失败：" + e.message, "err", 7000); }
+  });
 }
 async function approveTask(id) {
   try { await api("/api/comment-tasks/" + id + "/approve", { method: "POST" }); toast("已通过,转入待发队列", "ok"); refreshCommentTasks(); }
   catch (e) { toast("操作失败:" + e.message, "err"); }
 }
+async function approveSelectedDrafts() {
+  const platform = PLATFORM;
+  const ids = AC_TASKS.filter(t => AC_SELECTED_TASKS.has(t.id) && t.status === "draft" && (t.content || "").trim()).map(t => t.id);
+  if (!ids.length) { toast("所选任务中没有可发送的非空草稿", "info"); return; }
+  if (!await uiConfirm({ title: "批量通过所选草稿", message: `通过已选的 ${ids.length} 条草稿？通过后引擎按风控上限与最小间隔陆续发出。`, okText: "确认通过" })) return;
+  try {
+    const r = await api("/api/comment-tasks/batch-approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids, platform }) });
+    ids.forEach(id => AC_SELECTED_TASKS.delete(id));
+    toast(`已通过 ${r.approved} 条`, "ok"); refreshCommentTasks();
+  } catch (e) { toast("操作失败:" + e.message, "err"); }
+}
+async function cancelSelectedTasks() {
+  const ids = AC_TASKS.filter(t => AC_SELECTED_TASKS.has(t.id) && ["draft", "pending", "failed"].includes(t.status)).map(t => t.id);
+  if (!ids.length) return;
+  if (!await uiConfirm({ title: "批量弃用/取消", message: `确认取消已选的 ${ids.length} 条任务？`, okText: "确认取消", danger: true })) return;
+  try {
+    const r = await api("/api/comment-tasks/batch-cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
+    ids.forEach(id => AC_SELECTED_TASKS.delete(id));
+    toast(`已取消 ${r.canceled} 条`, "ok"); refreshCommentTasks();
+  } catch (e) { toast("操作失败:" + e.message, "err"); }
+}
 async function approveAllDrafts() {
   const platform = PLATFORM;
-  const ids = AC_TASKS.filter(t => t.status === "draft").map(t => t.id);
-  if (!ids.length) return;
-  if (!await uiConfirm({ title: "审核当前列表草稿", message: `通过当前列表中 ${PF_NAME[platform] || platform} 的 ${ids.length} 条草稿？通过后引擎按每账号每日上限和最小间隔陆续发出。`, okText: "通过这些草稿" })) return;
+  const ids = AC_TASKS.filter(t => t.status === "draft" && (t.content || "").trim()).map(t => t.id);
+  if (!ids.length) { toast("当前没有可发送的非空草稿（空草稿请先编辑或 AI 重写）", "info"); return; }
+  if (!await uiConfirm({ title: "审核当前列表草稿", message: `通过当前列表中 ${PF_NAME[platform] || platform} 的 ${ids.length} 条可发草稿？通过后引擎按每账号每日上限和最小间隔陆续发出。`, okText: "通过这些草稿" })) return;
   try { const r = await api("/api/comment-tasks/batch-approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids, platform }) }); toast(`已通过 ${r.approved} 条`, "ok"); refreshCommentTasks(); }
   catch (e) { toast("操作失败:" + e.message, "err"); }
 }
 async function editTaskContent(id) {
   const t = AC_TASKS.find(x => x.id === id); if (!t) return;
-  const v = await uiPrompt({ title: "编辑评论文案", hint: "保存只更新文案，不会发送评论。", value: t.content || "", multiline: true, rows: 3,
+  const originHint = t.target_text ? `对方原文：「${t.target_text.slice(0, 120)}」` : "保存只更新文案，不会发送评论。";
+  const v = await uiPrompt({ title: "编辑评论文案", hint: originHint, value: t.content || "", multiline: true, rows: 3,
     submit: value => {
       if (!value.trim()) uiEditorError("文案不能为空", "ui-inp");
       return api("/api/comment-tasks/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: value.trim() }) });
@@ -9435,13 +13416,16 @@ async function runTask(id) {
   refreshCommentTasks();
 }
 async function cancelTask(id) {
-  try { await api("/api/comment-tasks/" + id + "/cancel", { method: "POST" }); toast("已取消", "ok"); refreshCommentTasks(); }
+  try { await api("/api/comment-tasks/" + id + "/cancel", { method: "POST" }); AC_SELECTED_TASKS.delete(id); toast("已取消", "ok"); refreshCommentTasks(); }
   catch (e) { toast("操作失败:" + e.message, "err"); }
 }
 async function delTask(id) {
-  try { await api("/api/comment-tasks/" + id, { method: "DELETE" }); toast("已删除", "ok"); refreshCommentTasks(); }
+  if (!await uiConfirm({ title: "删除评论任务", message: "确认删除这条评论任务或记录吗？", okText: "删除", danger: true })) return;
+  try { await api("/api/comment-tasks/" + id, { method: "DELETE" }); AC_SELECTED_TASKS.delete(id); toast("已删除", "ok"); refreshCommentTasks(); }
   catch (e) { toast("删除失败:" + e.message, "err"); }
 }
+window.addEventListener("creatorhub:ai-config:updated", () => refreshAcPolicyMeta());
+window.addEventListener("creatorhub:ai-channels:updated", () => refreshAcPolicyMeta());
 
 // ─── 统一任务队列 ───
 let TASK_QUEUE_PAGE = 1;
@@ -9590,7 +13574,7 @@ function renderTaskQueuePager(data) {
   $("queue-next").disabled = TASK_QUEUE_PAGE >= TASK_QUEUE_PAGES;
   $("queue-last").disabled = TASK_QUEUE_PAGE >= TASK_QUEUE_PAGES;
   if ($("queue-page-size")) $("queue-page-size").value = String(TASK_QUEUE_PAGE_SIZE);
-  pager.hidden = false;
+  pager.hidden = Number(data.total || 0) <= TASK_QUEUE_PAGE_SIZE && TASK_QUEUE_PAGES <= 1;
 }
 
 function renderTaskQueueSummary(summary = {}) {
@@ -9650,7 +13634,7 @@ async function refreshTaskQueueBadge() {
   const isCurrent = beginViewRequest("task-queue-badge");
   TASK_QUEUE_BADGE_LOADING = true;
   try {
-    const params = new URLSearchParams({ platform: PLATFORM, state: "active", page_size: "1" });
+    const params = new URLSearchParams({ platform: GLOBAL_MODE ? "all" : PLATFORM, state: "active", page_size: "1" });
     const data = await api("/api/task-queue?" + params.toString());
     if (!isCurrent() || CURRENT_TAB === "queue") return;
     globalThis.CreatorHubWorkbench?.queueSummary?.(data.summary || {});
@@ -9744,16 +13728,21 @@ async function loop() {
 $("mon-table").innerHTML = skeleton(8);
 $("content-table").innerHTML = skeleton(8);
 $("sd-history-body").innerHTML = skeleton(8);
-$("watch-table").innerHTML = skeleton(9);
+$("watch-table").innerHTML = skeleton(8);
 $("comment-table").innerHTML = skeleton(6);
 $("danmaku-watch-table").innerHTML = skeleton(8);
 $("danmaku-table").innerHTML = skeleton(6);
 $("collection-job-table").innerHTML = collectionTaskSkeleton(3);
 $("collection-content-list").innerHTML = collectionResultSkeleton(4);
-$("queue-table").innerHTML = skeleton(7);
+$("queue-table").innerHTML = skeleton(8);
+
+// restore last-selected platform & global mode BEFORE restoring tab so global-mode tab guards apply cleanly
+PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "rednote", "douyin", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
+GLOBAL_MODE = (() => { try { const g = localStorage.getItem("dym-global"); return g === null ? true : g === "1"; } catch (e) { return true; } })();
+if ($("queue-platform") && GLOBAL_MODE) $("queue-platform").value = "all";
 
 // restore last-selected section (default: 总览);旧版四个独立页已并入「账号管理」
-const VALID_TABS = ["overview", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "tiktok-tools", "publish", "autocomment", "share-download", "notifications", "settings"];
+const VALID_TABS = ["overview", "media-hub", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "tiktok-tools", "publish", "autocomment", "share-download", "notifications", "settings"];
 const LEGACY_HUB_TABS = ["myworks", "following", "fans", "dm"];
 switchTab((() => {
   try {
@@ -9762,16 +13751,18 @@ switchTab((() => {
       window.CreatorHubOpenAssistant = true;
       return "overview";
     }
-    if (VALID_TABS.includes(hashTab)) return hashTab;
-    const t = localStorage.getItem("dym-tab");
-    if (LEGACY_HUB_TABS.includes(t)) { HUB_TAB = t; return "hub"; }
-    return VALID_TABS.includes(t) ? t : "overview";
+    const candidate = VALID_TABS.includes(hashTab)
+      ? hashTab
+      : (() => {
+          const t = localStorage.getItem("dym-tab");
+          if (LEGACY_HUB_TABS.includes(t)) { HUB_TAB = t; return "hub"; }
+          return VALID_TABS.includes(t) ? t : "overview";
+        })();
+    if (GLOBAL_MODE && SINGLE_PF_ONLY_TABS.includes(candidate)) return "overview";
+    return candidate;
   } catch (e) { return "overview"; }
 })());
 switchHubTab(HUB_TAB);   // 恢复上次停留的子标签(我的作品/关注/粉丝/私信)
-
-// restore last-selected platform (default: 抖音)
-PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "douyin", "kuaishou", "shipinhao", "tiktok", "bilibili"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
 applyPlatformUI();
 updateTaskQueuePlatformLabel();
 
@@ -9830,21 +13821,58 @@ window.addEventListener("scroll", () => {
 }, { passive: true });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) loop(); });
 
+function launchPlatformLogin(pf, mode = "main") {
+  if (pf && pf !== "all" && PLATFORM !== pf) {
+    PLATFORM = pf;
+    ACCOUNTS = ALL_ACCOUNTS.filter(a => a.platform === PLATFORM);
+    applyPlatformUI();
+  }
+  if (mode === "cookie") {
+    toggleCookie();
+    requestAnimationFrame(() => $("ck-val")?.focus());
+    return;
+  }
+  const creator = mode === "creator";
+  if (pf === "xhs") return creator ? startXhsCreatorLogin() : startXhsLogin();
+  if (pf === "rednote") return creator ? startRednoteCreatorLogin() : startRednoteLogin();
+  if (pf === "kuaishou") return creator ? startKsCreatorLogin() : startKsLogin();
+  if (pf === "shipinhao") return startChannelsLogin();
+  if (pf === "tiktok") return startTikTokLogin();
+  if (pf === "bilibili") return startBilibiliLogin();
+  if (pf === "instagram") return startInstagramLogin();
+  if (pf === "twitter") return startTwitterLogin();
+  if (pf === "facebook") return startFacebookLogin();
+  return creator ? startCreatorLogin() : startLogin();
+}
+
 // Narrow bridge for React islands; business mutations remain in their original handlers.
 window.CreatorHubBridge = {
   selectPlatform: switchPlatform,
-  getContext: () => ({ tab: CURRENT_TAB, platform: PLATFORM }),
+  getContext: () => ({ tab: CURRENT_TAB, platform: PLATFORM, scope: GLOBAL_MODE ? "all" : PLATFORM, globalMode: GLOBAL_MODE }),
   getAgentContext() {
     const job = CURRENT_TAB === "collections" && COLLECTION_JOB_ID
       ? COLLECTION_JOBS.find(item => item.id === COLLECTION_JOB_ID && item.platform === PLATFORM) : null;
-    return { tab: CURRENT_TAB, platform: PLATFORM, title: (PAGE_META[CURRENT_TAB] || PAGE_META.overview).title,
+    return { tab: CURRENT_TAB, platform: GLOBAL_MODE ? "all" : PLATFORM, title: (PAGE_META[CURRENT_TAB] || PAGE_META.overview).title,
       task: job ? { task_type: "collections", id: job.id, platform: job.platform, status: job.status } : null };
   },
   navigate: switchTab,
   openAccount: openAccountHub,
-  openQueue(state) {
-    // The overview summary describes this platform, not the user's previous scope.
-    if ($("queue-platform")) { $("queue-platform").value = "current"; $("queue-platform")._csSync?.(); }
+  openAggregatedDm,
+  launchPlatformLogin,
+  accountActions: {
+    openBrowser: id => openAccountBrowser(Number(id)),
+    relogin: (id, scope = "auto") => relogin(Number(id), scope),
+    refreshProfile: id => refreshProfile(Number(id)),
+    setProxy: id => setProxy(Number(id)),
+    testProxy: id => testProxy(Number(id)),
+    setBrowserBackend: id => setBrowserBackend(Number(id)),
+    manageFingerprint: id => manageFingerprint(Number(id)),
+    checkEnvironment: id => checkBrowserEnvironment(Number(id)),
+    delAccount: id => delAccount(Number(id)),
+    refreshAll: () => { refreshAccounts(); refreshProxies(); },
+  },
+  openQueue(state, allPlatforms = GLOBAL_MODE) {
+    if ($("queue-platform")) { $("queue-platform").value = allPlatforms ? "all" : "current"; $("queue-platform")._csSync?.(); }
     $("queue-state").value = state; $("queue-state")._csSync?.();
     $("queue-query").value = ""; $("queue-type").value = ""; $("queue-type")._csSync?.();
     TASK_QUEUE_PAGE = 1;
@@ -9852,14 +13880,15 @@ window.CreatorHubBridge = {
   },
   async retry() {
     const refreshers = {
-      overview: [refreshOverviewSummary, refreshOverviewChart, refreshTaskQueueBadge],
-      accounts: [refreshAccounts, refreshBrowserRuntimes, refreshProxies],
+      overview: [refreshOverviewSummary, refreshOverviewChart, refreshTaskQueueBadge, () => window.dispatchEvent(new Event("creatorhub:matrix:refresh"))],
+      "media-hub": [() => window.dispatchEvent(new Event("creatorhub:matrix:refresh"))],
+      accounts: [refreshAccounts, refreshBrowserRuntimes, refreshProxies, () => window.dispatchEvent(new Event("creatorhub:matrix:refresh"))],
       monitors: [refreshMonitors, refreshContents], comments: [refreshWatches, refreshComments],
       danmaku: [refreshDanmakuWatches, refreshDanmaku], collections: [refreshCollections],
-      queue: [refreshTaskQueue], publish: [refreshPublish],
+      queue: [refreshTaskQueue], publish: [refreshPublish, () => window.dispatchEvent(new Event("creatorhub:matrix:refresh"))],
       autocomment: [refreshCommentRules, refreshCommentTasks],
       notifications: [refreshChannels, refreshWebhooks], settings: [loadSettings],
-      "risk-control": [refreshRiskCenter], hub: [refreshHubSummary, refreshHubPanel],
+      "risk-control": [refreshRiskCenter], hub: [refreshHubSummary, refreshHubPanel, () => window.dispatchEvent(new Event("creatorhub:matrix:refresh"))],
       "share-download": [refreshShareHistory],
     };
     await Promise.allSettled((refreshers[CURRENT_TAB] || []).map(fn => Promise.resolve().then(() => fn())));
