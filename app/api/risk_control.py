@@ -17,6 +17,7 @@ from app.db import get_session
 from app.models import AccountActionTask, AccountRiskState, CommentTask, DouyinAccount, KeywordCollectionJob, PublishTask, RiskAdminAudit, RiskEvent
 from app.risk import RiskCategory, RiskController
 from app.risk_admin import RiskSettingsError, apply_risk_settings, export_risk_settings, save_risk_settings
+from app.services import login_sessions as login_sessions_service
 from app.services import metadata as metadata_service
 from app.services import proxies as proxies_service
 
@@ -169,14 +170,14 @@ def _account_risk_view(account: DouyinAccount, now: datetime, *,
             "douyin": "抖音号", "xhs": "小红书号", "rednote": "Rednote ID",
             "kuaishou": "快手号", "shipinhao": "视频号",
             "bilibili": "B站 UID", "tiktok": "TikTok",
-            "instagram": "Instagram", "twitter": "Twitter @", "facebook": "Facebook",
+            "instagram": "Instagram", "twitter": "Twitter @", "facebook": "Facebook", "youtube": "YouTube @",
         }.get(account.platform, "账号 ID")
     else:
         platform_account_id = account.sec_uid
         platform_account_id_label = {
             "douyin": "sec_uid", "xhs": "user_id", "rednote": "user_id",
             "kuaishou": "user_id", "shipinhao": "finder_id",
-            "bilibili": "UID", "instagram": "pk", "twitter": "screen_name", "facebook": "UID/主页",
+            "bilibili": "UID", "instagram": "pk", "twitter": "screen_name", "facebook": "UID/主页", "youtube": "频道ID",
         }.get(account.platform, "账号 ID")
     return {
         "account_id": account.id,
@@ -504,13 +505,18 @@ async def clear_account_risk(account_id: int, body: metadata_service.RiskClearIn
             "manual_review_required": bool(state and state.manual_review_required),
             "manual_review_reason": state.manual_review_reason if state else "",
         }
+    browser_synced = False
+    if await login_sessions_service.has_active_open_browser(account_id):
+        browser_synced = await login_sessions_service.close_open_browser_for_account(
+            account_id, nudge=False)
     controller = app_runtime.engine.risk if app_runtime.engine else RiskController(app_runtime.cfg)
     controller.clear_account(account_id, reason=reason, actor=actor)
     woken = app_runtime.engine._wake_deferred_tasks(account_id) if app_runtime.engine else 0
     _record_risk_admin_audit(
         "account_risk_cleared", actor=actor, account_id=account_id,
-        detail={"reason": reason, "before": before, "woken_tasks": woken})
-    return {"ok": True, "woken_tasks": woken}
+        detail={"reason": reason, "before": before, "woken_tasks": woken,
+                "browser_synced": browser_synced})
+    return {"ok": True, "woken_tasks": woken, "browser_synced": browser_synced}
 
 
 @router.get("/api/risk-control/audit")

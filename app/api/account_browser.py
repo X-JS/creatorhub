@@ -27,7 +27,7 @@ _PLATFORM_HOST = {"douyin": "douyin.com", "xhs": "xiaohongshu.com",
                   "kuaishou": "kuaishou.com", "shipinhao": "weixin.qq.com",
                   "tiktok": "tiktok.com", "bilibili": "bilibili.com",
                   "instagram": "instagram.com", "twitter": "x.com",
-                  "facebook": "facebook.com"}
+                  "facebook": "facebook.com", "youtube": "youtube.com"}
 
 
 _XHS_USER_ME_API = "/api/sns/web/v2/user/me"
@@ -51,6 +51,11 @@ def _platform_url_allowed(platform: str, value: str) -> bool:
         return any(
             host == d or host.endswith("." + d)
             for d in ("facebook.com", "fb.watch", "fb.me", "fb.com")
+        )
+    if platform == "youtube":
+        return any(
+            host == d or host.endswith("." + d)
+            for d in ("youtube.com", "youtu.be", "studio.youtube.com")
         )
     return bool(host == expected or host.endswith("." + expected))
 
@@ -106,8 +111,21 @@ async def _opened_page_login_state(page, platform: str,
         return "authenticated" if isinstance(user, dict) and (
             user.get("uniqueId") or user.get("uid")) else "unconfirmed"
     if platform == "instagram":
-        if "/accounts/login" in current_url or "/challenge/" in current_url or "/checkpoint/" in current_url:
-            return "verification" if ("/challenge/" in current_url or "/checkpoint/" in current_url) else "logged_out"
+        if any(
+            k in current_url
+            for k in (
+                "/accounts/suspended",
+                "/accounts/disabled",
+                "/suspended",
+                "__coig_ufac",
+                "/challenge/",
+                "/checkpoint/",
+                "/two_factor",
+            )
+        ):
+            return "verification"
+        if "/accounts/login" in current_url:
+            return "logged_out"
         try:
             cookies = await page.context.cookies("https://www.instagram.com")
             if any(c.get("name") == "sessionid" and c.get("value") for c in cookies):
@@ -136,6 +154,21 @@ async def _opened_page_login_state(page, platform: str,
             cookies = await page.context.cookies(["https://www.facebook.com", "https://web.facebook.com"])
             names = {c.get("name"): c.get("value") for c in cookies if c.get("value")}
             if names.get("c_user") and names.get("xs"):
+                return "authenticated"
+        except Exception:
+            pass
+        return "unconfirmed"
+    if platform == "youtube":
+        if any(k in current_url for k in ("accounts.google.com/v3/signin", "accounts.google.com/servicelogin")):
+            return "logged_out"
+        if any(k in current_url for k in ("accounts.google.com/signin/v2/challenge", "/disabled", "/suspended")):
+            return "verification"
+        try:
+            cookies = await page.context.cookies(["https://www.youtube.com", "https://studio.youtube.com"])
+            names = {c.get("name"): c.get("value") for c in cookies if c.get("value")}
+            if (names.get("SAPISID") or names.get("__Secure-3PAPISID")) and (
+                names.get("SID") or names.get("__Secure-3PSID") or names.get("HSID")
+            ):
                 return "authenticated"
         except Exception:
             pass
@@ -233,6 +266,7 @@ async def open_account_browser(
             "instagram": "https://www.instagram.com/",
             "twitter": "https://x.com/home",
             "facebook": "https://www.facebook.com/",
+            "youtube": "https://www.youtube.com/",
             "shipinhao": "https://channels.weixin.qq.com/platform"}.get(
                 platform, "https://www.douyin.com/")
     # 传了 url 且属于本平台域名 -> 停在该地址(否则回首页,防被当跳转开任意站)
@@ -250,7 +284,10 @@ async def open_account_browser(
     # Repeated clicks should raise/navigate the already-owned account window,
     # not tear down and cold-start the same Profile again.
     old = app_runtime.open_browsers.get(account_id)
-    if old is not None and old.active:
+    if old is not None and not login_sessions_service._lease_is_alive(old):
+        await login_sessions_service._release_open_browser(account_id, old)
+        old = None
+    if old is not None and login_sessions_service._lease_is_alive(old):
         old_page = getattr(old, "page", None)
         try:
             if old_page is not None and not old_page.is_closed():
@@ -385,8 +422,20 @@ async def open_account_browser(
                 except Exception as check_exc:
                     check_error = f"{type(check_exc).__name__}: {check_exc}"
                     log.warning("环境检测标签自动打开失败(account=%s): %r", account_id, check_exc)
+            initial_blank_pages = [
+                candidate
+                for candidate in list(getattr(ctx, "pages", ()) or ())
+                if getattr(candidate, "url", "") == "about:blank"
+                and not candidate.is_closed()
+            ]
             page = (await app_runtime.browser.new_page(identity, block_media=False)
                     if platform in {"xhs", "rednote"} else await ctx.new_page())
+            if platform not in {"xhs", "rednote"}:
+                # 关闭 Chromium 启动自带的空白标签页，确保用户关掉业务标签页时整个窗口随之关闭并释放账号锁
+                for candidate in initial_blank_pages:
+                    if candidate is not page and not candidate.is_closed():
+                        with suppress(Exception):
+                            await candidate.close()
             xhs_evidence: dict = {}
             if platform == "xhs" and open_scope == "read":
                 page.on("response", _xhs_open_auth_response_handler(xhs_evidence))
@@ -443,9 +492,17 @@ async def open_account_browser(
     close_callback = lambda: app_runtime.browser.close_context(identity.key)
     lease = login_sessions_service._OpenBrowserLease(
         ctx, guard, close_callback=close_callback, page=page,
-        account_id=account_id, open_scope=open_scope)
+        account_id=account_id, open_scope=open_scope, platform=platform)
     app_runtime.open_browsers[account_id] = lease
+    lease.start_state_sync()
+
+    def _attach_page_sync(target_page) -> None:
+        with suppress(Exception):
+            target_page.on("load", lambda *_: lease.schedule_persist())
+
     try:                       # 用户手动关窗后,从登记表移除
+        _attach_page_sync(page)
+        ctx.on("page", _attach_page_sync)
         ctx.on("close", lambda *_: asyncio.create_task(
             login_sessions_service._release_open_browser(account_id, lease)))
         if platform in {"xhs", "rednote"}:

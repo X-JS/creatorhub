@@ -1,4 +1,4 @@
-"""哔哩哔哩、Instagram、X (Twitter) 与 Facebook 作品监控扫描。"""
+"""哔哩哔哩、Instagram、X (Twitter)、Facebook 与 YouTube 主页作品监控扫描。"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,7 +6,7 @@ import json
 
 from sqlmodel import select
 
-from app.browser import fetch_bili_search, fetch_bili_videos, fetch_facebook_comments, fetch_facebook_search, fetch_facebook_user_posts, fetch_ig_posts, fetch_ig_search, fetch_twitter_comments, fetch_twitter_search, fetch_twitter_user_tweets
+from app.browser import fetch_bili_videos, fetch_facebook_comments, fetch_facebook_search, fetch_facebook_user_posts, fetch_ig_posts, fetch_twitter_comments, fetch_twitter_search, fetch_twitter_user_tweets, fetch_youtube_channel_videos, fetch_youtube_comments, fetch_youtube_search
 from app.db import get_session
 from app.engine.monitor_helpers import _douyin_scan_since, _monitor_content_matches, _monitor_strategy
 from app.models import ContentRecord, DouyinAccount, MonitorTarget
@@ -15,6 +15,7 @@ from app.platforms.douyin.extract import Aweme
 from app.platforms.facebook import FacebookClient, get_slot_operation, parse_facebook_aweme
 from app.platforms.instagram import InstagramClient, parse_ig_aweme
 from app.platforms.twitter import TwitterClient, parse_twitter_aweme
+from app.platforms.youtube import YouTubeClient, cookie_map_from_state as yt_cookie_map, parse_youtube_aweme, video_url as yt_video_url
 from app.risk import RiskCategory, classify_platform_error
 from app.services import thumb_cache
 from app.settings import get_setting
@@ -46,16 +47,14 @@ class SocialTargetScanMixin:
             else:
                 identity, proxy = self._anon_identity_proxy("bilibili", session=s)
             state = (acc.storage_state or acc.cookie or "") if acc is not None else ""
-            ua = (acc.ua if acc and acc.ua else self.cfg.engine.user_agent)
+            ua = self._direct_request_ua(identity if identity is not None else acc)
             known = set(
                 s.exec(select(ContentRecord.aweme_id).where(ContentRecord.target_id == target_id)).all()
             )
             known_create_times = list(
                 s.exec(select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)).all()
             )
-            target_kind = target.target_kind or "creator"
             sec_uid = (target.sec_uid or "").strip()
-            keyword = (target.keyword or "").strip()
             base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
             quality = target.video_quality or get_setting("video_quality", "highest")
             monitor_since = int(target.created_at.timestamp())
@@ -77,16 +76,14 @@ class SocialTargetScanMixin:
 
         async with bcli.session_scope():
             if mode in {"api", "hybrid"}:
+                from app.pacing import PagePacer
                 max_pages = max(1, min(6, strategy["max_scrolls"] or 2))
+                bili_pacer = PagePacer(0.65)
                 for pn in range(1, max_pages + 1):
-                    if target_kind == "keyword":
-                        batch, has_more, err = await bcli.search_videos(
-                            keyword, page=pn, page_size=20, order="pubdate"
-                        )
-                    else:
-                        batch, has_more, err = await bcli.fetch_user_videos(
-                            sec_uid, pn=pn, ps=30, order="pubdate"
-                        )
+                    await bili_pacer.step()
+                    batch, has_more, err = await bcli.fetch_user_videos(
+                        sec_uid, pn=pn, ps=30, order="pubdate"
+                    )
                     if err:
                         error = err
                         break
@@ -95,23 +92,14 @@ class SocialTargetScanMixin:
                         break
 
             if (mode == "browser" or (mode == "hybrid" and not raw_items and error)) and identity is not None:
-                if target_kind == "keyword":
-                    b_items, b_err = await fetch_bili_search(
-                        self.browser, identity, keyword, max_scrolls=max(1, min(4, strategy["max_scrolls"] or 2))
-                    )
-                    if b_items:
-                        raw_items, error = b_items, ""
-                    elif mode == "browser":
-                        error = b_err
-                else:
-                    b_items, b_author, b_err = await fetch_bili_videos(
-                        self.browser, identity, sec_uid, known,
-                        max_scrolls=max(1, min(4, strategy["max_scrolls"] or 2))
-                    )
-                    if b_items:
-                        raw_items, author_name, error = b_items, b_author, ""
-                    elif mode == "browser":
-                        error = b_err
+                b_items, b_author, b_err = await fetch_bili_videos(
+                    self.browser, identity, sec_uid, known,
+                    max_scrolls=max(1, min(4, strategy["max_scrolls"] or 2))
+                )
+                if b_items:
+                    raw_items, author_name, error = b_items, b_author, ""
+                elif mode == "browser":
+                    error = b_err
 
             candidates: list[Aweme] = []
             seen_ids: set[str] = set()
@@ -120,9 +108,9 @@ class SocialTargetScanMixin:
                 if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
                     continue
                 seen_ids.add(aw.aweme_id)
-                if aw.author_name and not author_name and target_kind == "creator":
+                if aw.author_name and not author_name:
                     author_name = aw.author_name
-                if aw.avatar and not author_avatar and target_kind == "creator":
+                if aw.avatar and not author_avatar:
                     author_avatar = aw.avatar
                 candidates.append(aw)
 
@@ -137,6 +125,8 @@ class SocialTargetScanMixin:
 
             new_records = []
             filtered_count = 0
+            from app.pacing import PagePacer as _BiliPlayPacer
+            play_pacer = _BiliPlayPacer(0.45, long_pause_every=(5, 8), long_pause_range=(1.2, 2.5))
             for aw in candidates:
                 if not _monitor_content_matches(aw, strategy):
                     filtered_count += 1
@@ -148,6 +138,7 @@ class SocialTargetScanMixin:
                 )
                 play_err = ""
                 if should_download and not aw.medias:
+                    await play_pacer.step()
                     full_aw, play_err = await bcli.fetch_aweme_by_work(
                         aw.aweme_id, with_play_url=True, quality=quality
                     )
@@ -199,12 +190,11 @@ class SocialTargetScanMixin:
             if t:
                 t.last_scan_at = datetime.utcnow()
                 t.last_error = error
-                if target_kind == "creator":
-                    if author_name and not t.nickname:
-                        t.nickname = author_name
-                    if author_avatar and not t.avatar:
-                        t.avatar = author_avatar
-                target_name = t.nickname or t.keyword or t.sec_uid
+                if author_name and (not t.nickname or t.nickname == t.sec_uid):
+                    t.nickname = author_name
+                if author_avatar and not t.avatar:
+                    t.avatar = author_avatar
+                target_name = t.nickname or t.sec_uid
                 target_avatar = t.avatar or ""
                 s.add(t)
             else:
@@ -260,7 +250,7 @@ class SocialTargetScanMixin:
             first_scan = target.last_scan_at is None
             if not target.account_id:
                 return self._mark_target_skip(
-                    target_id, "Instagram 作品监控必须绑定已登录的 Instagram 账号"
+                    target_id, "Instagram 主页作品监控必须绑定已登录的 Instagram 账号"
                 )
             acc = s.get(DouyinAccount, target.account_id)
             if not acc or acc.platform != "instagram" or acc.status != "active":
@@ -278,7 +268,7 @@ class SocialTargetScanMixin:
             )
             proxy = acc.proxy or ""
             state = acc.storage_state or acc.creator_storage_state or acc.cookie or ""
-            ua = acc.ua or self.cfg.engine.user_agent
+            ua = self._direct_request_ua(identity if identity is not None else acc)
             account_seed = (
                 (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
                 if identity is not None
@@ -295,9 +285,7 @@ class SocialTargetScanMixin:
             known_create_times = list(
                 s.exec(select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)).all()
             )
-            target_kind = target.target_kind or "creator"
             sec_uid = (target.sec_uid or "").strip()
-            keyword = (target.keyword or "").strip()
             base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
             monitor_since = int(target.created_at.timestamp())
             scan_since = _douyin_scan_since(monitor_since, known_create_times)
@@ -324,60 +312,52 @@ class SocialTargetScanMixin:
         async with icli.session_scope():
             if mode in {"api", "hybrid"}:
                 max_pages = max(1, min(6, strategy["max_scrolls"] or 2))
-                if target_kind == "keyword":
-                    raw_items, error = await icli.search_posts(keyword, max_pages=max_pages)
-                else:
-                    cursor = ""
-                    for _ in range(max_pages):
-                        batch, next_cursor, more, err = await icli.fetch_user_feed(
-                            sec_uid, max_id=cursor
-                        )
-                        if err:
-                            error = err
-                            break
-                        raw_items.extend(batch)
-                        if (
-                            not more
-                            or not next_cursor
-                            or next_cursor == cursor
-                            or (
-                                known
-                                and batch
-                                and all(
-                                    (parse_ig_aweme(r, require_media=False) is not None)
-                                    and parse_ig_aweme(r, require_media=False).aweme_id in known  # type: ignore[union-attr]
-                                    for r in batch
-                                )
+                from app.pacing import PagePacer
+                cursor = ""
+                ig_pacer = PagePacer(0.85)
+                for _ in range(max_pages):
+                    await ig_pacer.step()
+                    batch, next_cursor, more, err = await icli.fetch_user_feed(
+                        sec_uid, max_id=cursor
+                    )
+                    if err:
+                        error = err
+                        break
+                    raw_items.extend(batch)
+                    if (
+                        not more
+                        or not next_cursor
+                        or next_cursor == cursor
+                        or (
+                            known
+                            and batch
+                            and all(
+                                (parse_ig_aweme(r, require_media=False) is not None)
+                                and parse_ig_aweme(r, require_media=False).aweme_id in known  # type: ignore[union-attr]
+                                for r in batch
                             )
-                        ):
-                            break
-                        cursor = next_cursor
+                        )
+                    ):
+                        break
+                    cursor = next_cursor
 
-            auth_failed = classify_platform_error(error)[0] == RiskCategory.AUTH
+            err_category = classify_platform_error(error)[0] if error else RiskCategory.BUSINESS
+            hard_block = err_category in {RiskCategory.AUTH, RiskCategory.RISK}
             if (
                 mode == "browser"
-                or (mode == "hybrid" and not raw_items and error and not auth_failed)
+                or (mode == "hybrid" and not raw_items and error and not hard_block)
             ) and identity is not None:
                 scrolls = max(1, min(4, strategy["max_scrolls"] or 2))
-                if target_kind == "keyword":
-                    b_items, b_err = await fetch_ig_search(
-                        self.browser, identity, keyword, max_scrolls=scrolls
-                    )
-                    if b_items:
-                        raw_items, error = b_items, ""
-                    elif mode == "browser":
-                        error = b_err
-                else:
-                    b_items, b_author, b_err = await fetch_ig_posts(
-                        self.browser, identity, sec_uid, known, max_scrolls=scrolls
-                    )
-                    if b_items:
-                        raw_items, error = b_items, ""
-                        if isinstance(b_author, dict):
-                            author_name = str(b_author.get("nickname") or author_name)
-                            author_avatar = str(b_author.get("avatar") or author_avatar)
-                    elif mode == "browser":
-                        error = b_err
+                b_items, b_author, b_err = await fetch_ig_posts(
+                    self.browser, identity, sec_uid, known, max_scrolls=scrolls
+                )
+                if b_items:
+                    raw_items, error = b_items, ""
+                    if isinstance(b_author, dict):
+                        author_name = str(b_author.get("nickname") or author_name)
+                        author_avatar = str(b_author.get("avatar") or author_avatar)
+                elif mode == "browser":
+                    error = b_err
 
             candidates: list[Aweme] = []
             seen_ids: set[str] = set()
@@ -386,9 +366,9 @@ class SocialTargetScanMixin:
                 if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
                     continue
                 seen_ids.add(aw.aweme_id)
-                if aw.author_name and not author_name and target_kind == "creator":
+                if aw.author_name and not author_name:
                     author_name = aw.author_name
-                if aw.avatar and not author_avatar and target_kind == "creator":
+                if aw.avatar and not author_avatar:
                     author_avatar = aw.avatar
                 candidates.append(aw)
 
@@ -458,12 +438,11 @@ class SocialTargetScanMixin:
             if t:
                 t.last_scan_at = datetime.utcnow()
                 t.last_error = error
-                if target_kind == "creator":
-                    if author_name and not t.nickname:
-                        t.nickname = author_name
-                    if author_avatar and not t.avatar:
-                        t.avatar = author_avatar
-                target_name = t.nickname or t.keyword or t.sec_uid
+                if author_name and (not t.nickname or t.nickname == t.sec_uid):
+                    t.nickname = author_name
+                if author_avatar and not t.avatar:
+                    t.avatar = author_avatar
+                target_name = t.nickname or t.sec_uid
                 target_avatar = t.avatar or ""
                 s.add(t)
             else:
@@ -515,7 +494,7 @@ class SocialTargetScanMixin:
             b_states = getattr(identity, "bridge_states", None) or ()
             if b_states:
                 raw_state = b_states[0]
-        eff_ua = ua or (getattr(identity, "ua", "") if identity is not None else "") or self.cfg.engine.user_agent
+        eff_ua = ua or self._direct_request_ua(identity)
         eff_proxy = proxy or (getattr(identity, "proxy", "") if identity is not None else "") or ""
         return TwitterClient(
             raw_state,
@@ -621,7 +600,7 @@ class SocialTargetScanMixin:
             first_scan = target.last_scan_at is None
             if not target.account_id:
                 return self._mark_target_skip(
-                    target_id, "X (Twitter) 作品监控必须绑定已登录的 Twitter 账号"
+                    target_id, "X (Twitter) 主页作品监控必须绑定已登录的 Twitter 账号"
                 )
             acc = s.get(DouyinAccount, target.account_id)
             if not acc or acc.platform != "twitter" or acc.status != "active":
@@ -639,16 +618,14 @@ class SocialTargetScanMixin:
             )
             proxy = acc.proxy or ""
             state = acc.storage_state or acc.creator_storage_state or acc.cookie or ""
-            ua = acc.ua or self.cfg.engine.user_agent
+            ua = self._direct_request_ua(identity if identity is not None else acc)
             known = set(
                 s.exec(select(ContentRecord.aweme_id).where(ContentRecord.target_id == target_id)).all()
             )
             known_create_times = list(
                 s.exec(select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)).all()
             )
-            target_kind = target.target_kind or "creator"
             sec_uid = (target.sec_uid or "").strip()
-            keyword = (target.keyword or "").strip()
             base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
             monitor_since = int(target.created_at.timestamp())
             scan_since = _douyin_scan_since(monitor_since, known_create_times)
@@ -667,43 +644,31 @@ class SocialTargetScanMixin:
         error = ""
         scrolls = max(1, min(6, strategy["max_scrolls"] or 3))
 
-        if target_kind == "keyword":
-            raw_items, error = await self._tw_read_search(
-                identity,
-                keyword,
-                latest=True,
-                content_type=strategy.get("media_type") or "all",
-                max_pages=scrolls,
-                state=state,
-                ua=ua,
-                proxy=proxy,
-            )
-        else:
-            raw_items, b_author, error = await self._tw_read_user_tweets(
-                identity,
-                sec_uid,
-                known,
-                max_pages=scrolls,
-                state=state,
-                ua=ua,
-                proxy=proxy,
-            )
-            if isinstance(b_author, dict):
-                author_name = str(b_author.get("nickname") or author_name)
-                author_avatar = str(b_author.get("avatar") or author_avatar)
+        raw_items, b_author, error = await self._tw_read_user_tweets(
+            identity,
+            sec_uid,
+            known,
+            max_pages=scrolls,
+            state=state,
+            ua=ua,
+            proxy=proxy,
+        )
+        if isinstance(b_author, dict):
+            author_name = str(b_author.get("nickname") or author_name)
+            author_avatar = str(b_author.get("avatar") or author_avatar)
         if error == "empty":
             error = ""
 
         candidates: list[Aweme] = []
         seen_ids: set[str] = set()
         for r in raw_items:
-            aw = parse_twitter_aweme(r, skip_retweets=(target_kind == "creator"))
+            aw = parse_twitter_aweme(r, skip_retweets=True)
             if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
                 continue
             seen_ids.add(aw.aweme_id)
-            if aw.author_name and not author_name and target_kind == "creator":
+            if aw.author_name and not author_name:
                 author_name = aw.author_name
-            if aw.avatar and not author_avatar and target_kind == "creator":
+            if aw.avatar and not author_avatar:
                 author_avatar = aw.avatar
             candidates.append(aw)
 
@@ -781,12 +746,11 @@ class SocialTargetScanMixin:
             if t:
                 t.last_scan_at = datetime.utcnow()
                 t.last_error = error
-                if target_kind == "creator":
-                    if author_name and not t.nickname:
-                        t.nickname = author_name
-                    if author_avatar and not t.avatar:
-                        t.avatar = author_avatar
-                target_name = t.nickname or t.keyword or t.sec_uid
+                if author_name and (not t.nickname or t.nickname == t.sec_uid):
+                    t.nickname = author_name
+                if author_avatar and not t.avatar:
+                    t.avatar = author_avatar
+                target_name = t.nickname or t.sec_uid
                 target_avatar = t.avatar or ""
                 s.add(t)
             else:
@@ -838,7 +802,7 @@ class SocialTargetScanMixin:
             b_states = getattr(identity, "bridge_states", None) or ()
             if b_states:
                 raw_state = b_states[0]
-        eff_ua = ua or (getattr(identity, "ua", "") if identity is not None else "") or self.cfg.engine.user_agent
+        eff_ua = ua or self._direct_request_ua(identity)
         eff_proxy = proxy or (getattr(identity, "proxy", "") if identity is not None else "") or ""
         return FacebookClient(
             raw_state,
@@ -1086,16 +1050,14 @@ class SocialTargetScanMixin:
             )
             proxy = acc.proxy or ""
             state = acc.storage_state or acc.creator_storage_state or acc.cookie or ""
-            ua = acc.ua or self.cfg.engine.user_agent
+            ua = self._direct_request_ua(identity if identity is not None else acc)
             known = set(
                 s.exec(select(ContentRecord.aweme_id).where(ContentRecord.target_id == target_id)).all()
             )
             known_create_times = list(
                 s.exec(select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)).all()
             )
-            target_kind = target.target_kind or "creator"
             sec_uid = (target.sec_uid or "").strip()
-            keyword = (target.keyword or "").strip()
             base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
             monitor_since = int(target.created_at.timestamp())
             scan_since = _douyin_scan_since(monitor_since, known_create_times)
@@ -1115,32 +1077,19 @@ class SocialTargetScanMixin:
         error = ""
         scrolls = max(1, min(6, strategy["max_scrolls"] or 3))
 
-        if target_kind == "keyword":
-            raw_items, error = await self._fb_read_search(
-                identity,
-                keyword,
-                recent=True,
-                content_type=strategy.get("media_type") or "all",
-                max_pages=scrolls,
-                max_items=max(20, int(strategy.get("max_items") or 0) * 2 or 40),
-                state=state,
-                ua=ua,
-                proxy=proxy,
-            )
-        else:
-            raw_items, b_author, error = await self._fb_read_user_posts(
-                identity,
-                sec_uid,
-                known,
-                max_pages=scrolls,
-                max_items=max(20, int(strategy.get("max_items") or 0) * 2 or 40),
-                state=state,
-                ua=ua,
-                proxy=proxy,
-            )
-            if isinstance(b_author, dict):
-                author_name = str(b_author.get("nickname") or author_name)
-                author_avatar = str(b_author.get("avatar") or author_avatar)
+        raw_items, b_author, error = await self._fb_read_user_posts(
+            identity,
+            sec_uid,
+            known,
+            max_pages=scrolls,
+            max_items=max(20, int(strategy.get("max_items") or 0) * 2 or 40),
+            state=state,
+            ua=ua,
+            proxy=proxy,
+        )
+        if isinstance(b_author, dict):
+            author_name = str(b_author.get("nickname") or author_name)
+            author_avatar = str(b_author.get("avatar") or author_avatar)
         if error in {"empty", "api_empty_search", "api_empty_timeline"}:
             error = ""
 
@@ -1151,9 +1100,9 @@ class SocialTargetScanMixin:
             if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
                 continue
             seen_ids.add(aw.aweme_id)
-            if aw.author_name and not author_name and target_kind == "creator":
+            if aw.author_name and not author_name:
                 author_name = aw.author_name
-            if aw.avatar and not author_avatar and target_kind == "creator":
+            if aw.avatar and not author_avatar:
                 author_avatar = aw.avatar
             candidates.append(aw)
 
@@ -1229,12 +1178,11 @@ class SocialTargetScanMixin:
             if t:
                 t.last_scan_at = datetime.utcnow()
                 t.last_error = error
-                if target_kind == "creator":
-                    if author_name and not t.nickname:
-                        t.nickname = author_name
-                    if author_avatar and not t.avatar:
-                        t.avatar = author_avatar
-                target_name = t.nickname or t.keyword or t.sec_uid
+                if author_name and (not t.nickname or t.nickname == t.sec_uid):
+                    t.nickname = author_name
+                if author_avatar and not t.avatar:
+                    t.avatar = author_avatar
+                target_name = t.nickname or t.sec_uid
                 target_avatar = t.avatar or ""
                 s.add(t)
             else:
@@ -1258,6 +1206,377 @@ class SocialTargetScanMixin:
                 self._dl_proxy(proxy),
                 user_agent=ua,
                 referer="https://www.facebook.com/",
+            )
+            with get_session() as s:
+                r = s.get(ContentRecord, rec.id)
+                if r:
+                    r.download_status = "done" if ok else "failed"
+                    r.local_path = path
+                    r.error = dl_err
+                    s.add(r)
+                    s.commit()
+
+        if not first_scan and new_records:
+            await self._notify_new(target_name, [aw for _, aw, _ in new_records])
+        return {
+            "ok": not error,
+            "new": len(new_records),
+            "new_works": len(new_records),
+            "scanned": len(candidates),
+            "filtered": filtered_count,
+            "backfill_count": backfill_count,
+            "error": error,
+        }
+
+    def _make_youtube_client(self, identity=None, state: str = "", ua: str = "", proxy: str = "") -> YouTubeClient:
+        raw_state = state
+        if not raw_state and identity is not None:
+            b_states = getattr(identity, "bridge_states", None) or ()
+            if b_states:
+                raw_state = b_states[0]
+        eff_ua = ua or self._direct_request_ua(identity)
+        eff_proxy = proxy or (getattr(identity, "proxy", "") if identity is not None else "") or ""
+        return YouTubeClient(
+            raw_state,
+            eff_ua,
+            proxy=eff_proxy,
+            timeout=self.cfg.engine.request_timeout_seconds,
+        )
+
+    async def _yt_read_search(
+        self,
+        identity,
+        keyword: str,
+        *,
+        upload_date: str = "",
+        duration: str = "",
+        sort_by: str = "",
+        max_pages: int = 4,
+        max_items: int = 30,
+        state: str = "",
+        ua: str = "",
+        proxy: str = "",
+    ) -> tuple[list[dict], str]:
+        mode = str(getattr(self.cfg.engine, "youtube_read_mode", "hybrid") or "hybrid").lower()
+        ycli = self._make_youtube_client(identity, state=state, ua=ua, proxy=proxy)
+        items: list[dict] = []
+        err = ""
+        if mode in {"api", "hybrid"}:
+            async with ycli.session_scope():
+                items, err = await ycli.search_videos(
+                    keyword,
+                    max_items=max_items,
+                    max_pages=max_pages,
+                    upload_date=upload_date,
+                    duration=duration,
+                    sort_by=sort_by,
+                )
+            if err.startswith(("verification_required:", "rate_limit:")) or (mode == "api" and err.startswith("logged_out:")):
+                return items, err
+        if (mode == "browser" or (mode == "hybrid" and not items)) and identity is not None:
+            b_items, b_err = await fetch_youtube_search(
+                self.browser,
+                identity,
+                keyword,
+                max_scrolls=max_pages,
+                limit=max_items,
+                upload_date=upload_date,
+                duration=duration,
+                sort_by=sort_by,
+                block_media=self.cfg.engine.block_media_resources,
+            )
+            if b_items:
+                return b_items, ""
+            if mode == "browser" or not items:
+                err = b_err or err
+        return items, ("" if items or err == "empty" else err)
+
+    async def _yt_read_channel_videos(
+        self,
+        identity,
+        channel_ref: str,
+        *,
+        max_pages: int = 4,
+        max_items: int = 30,
+        include_shorts: bool = True,
+        state: str = "",
+        ua: str = "",
+        proxy: str = "",
+    ) -> tuple[list[dict], dict, str]:
+        mode = str(getattr(self.cfg.engine, "youtube_read_mode", "hybrid") or "hybrid").lower()
+        ycli = self._make_youtube_client(identity, state=state, ua=ua, proxy=proxy)
+        items: list[dict] = []
+        author: dict = {}
+        err = ""
+        if mode in {"api", "hybrid"}:
+            async with ycli.session_scope():
+                items, author, err = await ycli.fetch_channel_videos(
+                    channel_ref,
+                    tab="videos",
+                    max_items=max_items,
+                    max_pages=max_pages,
+                    include_shorts=include_shorts,
+                )
+            if err.startswith(("verification_required:", "rate_limit:")) or (mode == "api" and err.startswith("logged_out:")):
+                return items, author, err
+        if (mode == "browser" or (mode == "hybrid" and not items)) and identity is not None:
+            b_items, b_author, b_err = await fetch_youtube_channel_videos(
+                self.browser,
+                identity,
+                channel_ref,
+                tab="videos",
+                max_scrolls=max_pages,
+                limit=max_items,
+                include_shorts=include_shorts,
+                block_media=self.cfg.engine.block_media_resources,
+            )
+            if b_items:
+                return b_items, (b_author or author), ""
+            if mode == "browser" or not items:
+                err = b_err or err
+        return items, author, ("" if items or err == "empty" else err)
+
+    async def _yt_read_comments(
+        self,
+        identity,
+        target_url: str,
+        *,
+        max_pages: int = 5,
+        max_count: int = 100,
+        include_replies: bool = True,
+        state: str = "",
+        ua: str = "",
+        proxy: str = "",
+    ) -> tuple[list[dict], str, str]:
+        mode = str(getattr(self.cfg.engine, "youtube_read_mode", "hybrid") or "hybrid").lower()
+        ycli = self._make_youtube_client(identity, state=state, ua=ua, proxy=proxy)
+        rows: list[dict] = []
+        err = ""
+        source = "api"
+        if mode in {"api", "hybrid"}:
+            async with ycli.session_scope():
+                rows, err = await ycli.fetch_video_comments(
+                    target_url,
+                    max_items=max_count,
+                    max_pages=max_pages,
+                )
+            if err.startswith(("verification_required:", "rate_limit:")) or (mode == "api" and err.startswith("logged_out:")):
+                if not include_replies:
+                    rows = [c for c in rows if not c.get("reply_to")]
+                return rows[:max_count], err, source
+        if (mode == "browser" or (mode == "hybrid" and not rows)) and identity is not None:
+            b_rows, b_err = await fetch_youtube_comments(
+                self.browser,
+                identity,
+                target_url,
+                max_scrolls=max_pages,
+                limit=max_count,
+                block_media=self.cfg.engine.block_media_resources,
+            )
+            if b_rows:
+                rows = b_rows
+                err = ""
+                source = "browser"
+            elif mode == "browser":
+                err = b_err or err
+                source = "browser"
+        if not include_replies:
+            rows = [c for c in rows if not c.get("reply_to")]
+        return rows[:max_count], ("" if rows or err == "empty" else err), source
+
+    async def _scan_youtube_target_locked(self, target_id: int) -> dict:
+        """扫描单个 YouTube 频道主页监控目标（支持 Videos & Shorts 与 yt-dlp 无损下载）。"""
+        with get_session() as s:
+            target = s.get(MonitorTarget, target_id)
+            if not target:
+                return {"ok": False, "error": "目标不存在"}
+            first_scan = target.last_scan_at is None
+            acc = s.get(DouyinAccount, target.account_id) if target.account_id else None
+            if acc and (acc.platform != "youtube" or acc.status != "active"):
+                return self._mark_target_skip(
+                    target_id, "绑定的 YouTube 账号状态异常或已失效，请重新登录"
+                )
+            if acc and self._proxy_bad(acc):
+                return self._mark_target_skip(
+                    target_id, f"账号 {acc.nickname or acc.id} 绑定的代理当前不可用"
+                )
+            identity = self.browser.identity_for(acc) if (acc and self.browser is not None) else None
+            state = (acc.storage_state or acc.creator_storage_state or acc.cookie or "") if acc else ""
+            ua = self._direct_request_ua(identity if identity is not None else acc)
+            proxy = (acc.proxy or "") if acc else ""
+            sec_uid = target.sec_uid or ""
+            base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
+            quality = target.video_quality or get_setting("video_quality", "highest")
+            auto_download = bool(target.download_enabled)
+            media_filter = target.media_filter or "all"
+            backfill_count = int(target.initial_backfill_count) if target.initial_backfill_count is not None else 0
+            known = set(
+                s.exec(
+                    select(ContentRecord.aweme_id).where(ContentRecord.target_id == target_id)
+                ).all()
+            )
+            known_create_times = list(
+                s.exec(
+                    select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)
+                ).all()
+            )
+            should_backfill = first_scan or (backfill_count != 0 and not known)
+            monitor_since = int(target.created_at.timestamp()) if target.created_at else 0
+            scan_since = _douyin_scan_since(monitor_since, known_create_times)
+            strategy = _monitor_strategy(target, default_scrolls=4, default_items=0)
+
+        yt_mode = str(getattr(self.cfg.engine, "youtube_read_mode", "hybrid") or "hybrid").lower()
+        if identity is None and yt_mode == "browser":
+            return self._mark_target_skip(target_id, "YouTube 浏览器模式需要绑定有效的 YouTube 账号")
+
+        raw_items: list[dict] = []
+        author_name = ""
+        author_avatar = ""
+        error = ""
+        raw_items, prof, error = await self._yt_read_channel_videos(
+            identity,
+            sec_uid,
+            max_pages=max(1, min(8, int(strategy["max_scrolls"] or 4))),
+            max_items=max(30, int(strategy["max_items"] or 30)),
+            include_shorts=True,
+            state=state,
+            ua=ua,
+            proxy=proxy,
+        )
+        if isinstance(prof, dict):
+            author_name = str(prof.get("nickname") or "")
+            author_avatar = str(prof.get("avatar") or "")
+
+        if error and not raw_items:
+            with get_session() as s:
+                t = s.get(MonitorTarget, target_id)
+                if t:
+                    t.last_scan_at = datetime.utcnow()
+                    t.last_error = error
+                    s.add(t)
+                    s.commit()
+            return {"ok": False, "new": 0, "error": error}
+
+        candidates: list[Aweme] = []
+        seen_ids: set[str] = set()
+        for r in raw_items:
+            aw = parse_youtube_aweme(r, quality=quality)
+            if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
+                continue
+            seen_ids.add(aw.aweme_id)
+            if not author_name and aw.author_name:
+                author_name = aw.author_name
+            if not author_avatar and aw.avatar:
+                author_avatar = aw.avatar
+            candidates.append(aw)
+
+        candidates.sort(key=lambda a: int(a.create_time or 0), reverse=True)
+        if should_backfill:
+            if backfill_count == 0:
+                candidates = [a for a in candidates if not a.create_time or a.create_time >= monitor_since]
+            elif backfill_count > 0:
+                candidates = candidates[:backfill_count]
+        else:
+            candidates = [a for a in candidates if not a.create_time or a.create_time >= scan_since]
+
+        new_records = []
+        filtered_count = 0
+        matched_awemes: list[Aweme] = []
+        for aw in candidates:
+            if not _monitor_content_matches(aw, strategy):
+                filtered_count += 1
+                continue
+            if strategy["max_items"] and len(matched_awemes) >= strategy["max_items"]:
+                break
+            matched_awemes.append(aw)
+
+        # YouTube 搜索/频道列表页不返回点赞数与总评论数，对本次命中的新视频补查详情页元数据
+        need_enrich = [aw for aw in matched_awemes if aw.like_count == 0 or aw.comment_count == 0]
+        if need_enrich:
+            enrich_cli = self._make_youtube_client(identity, state=state, ua=ua, proxy=proxy)
+            try:
+                async with enrich_cli.session_scope():
+                    for aw in need_enrich[:20]:
+                        try:
+                            full_aw, _det, _err = await enrich_cli.fetch_video_detail(
+                                aw.source_url or aw.aweme_id,
+                                quality=quality or "highest",
+                            )
+                            if full_aw is not None:
+                                aw.like_count = max(aw.like_count, full_aw.like_count)
+                                aw.comment_count = max(aw.comment_count, full_aw.comment_count)
+                                if not aw.duration and full_aw.duration:
+                                    aw.duration = full_aw.duration
+                                if not aw.create_time and full_aw.create_time:
+                                    aw.create_time = full_aw.create_time
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        for aw in matched_awemes:
+            should_download = auto_download and (media_filter == "all" or aw.media_type == media_filter)
+            media_json = json.dumps([
+                {"url": m.url, "kind": m.kind, "ext": m.ext, "index": m.index}
+                for m in aw.medias
+            ])
+            dl_status = "pending" if (should_download and aw.medias) else "skipped"
+            rec = ContentRecord(
+                platform="youtube",
+                target_id=target_id,
+                aweme_id=aw.aweme_id,
+                desc=aw.desc,
+                media_type=aw.media_type,
+                quality=quality or aw.quality_label,
+                create_time=aw.create_time,
+                cover_url=aw.cover or "",
+                like_count=aw.like_count,
+                comment_count=aw.comment_count,
+                duration=aw.duration,
+                media_json=media_json,
+                download_status=dl_status,
+                error="",
+            )
+            new_records.append((rec, aw, bool(should_download and aw.medias)))
+
+        target_name = ""
+        target_avatar = ""
+        with get_session() as s:
+            for rec, _, _ in new_records:
+                s.add(rec)
+            t = s.get(MonitorTarget, target_id)
+            if t:
+                t.last_scan_at = datetime.utcnow()
+                t.last_error = error
+                if author_name and (not t.nickname or t.nickname == t.sec_uid):
+                    t.nickname = author_name
+                if author_avatar and not t.avatar:
+                    t.avatar = author_avatar
+                target_name = t.nickname or t.sec_uid
+                target_avatar = t.avatar or ""
+                s.add(t)
+            s.commit()
+            for rec, _, _ in new_records:
+                s.refresh(rec)
+
+        thumb_cache.schedule_thumb_prewarm(
+            [target_avatar, *(aw.cover for _, aw, dl in new_records if aw.cover and not dl)],
+            platform="youtube",
+            proxy=proxy,
+        )
+
+        yt_cookies = yt_cookie_map(state) if state else None
+        for rec, aw, should_download in new_records:
+            if not should_download:
+                continue
+            aw.quality_label = quality or aw.quality_label
+            ok, path, dl_err = await self.downloader.download_aweme(
+                aw,
+                base_dir,
+                self._dl_proxy(proxy),
+                user_agent=ua,
+                cookies=yt_cookies,
+                referer="https://www.youtube.com/",
             )
             with get_session() as s:
                 r = s.get(ContentRecord, rec.id)

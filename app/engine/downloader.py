@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
+import time
 from pathlib import Path
-from typing import Any, List, Mapping, Tuple
+from typing import Any, Callable, List, Mapping, Tuple
 from weakref import WeakValueDictionary
 
 from curl_cffi.requests import AsyncSession
 
 from ..netfp import impersonate_for_ua
 from ..platforms.douyin.extract import Aweme, safe_title
+from ..progress_hub import run_in_media_pool
 
 
 class Downloader:
@@ -51,8 +54,9 @@ class Downloader:
                              proxy: str = "", *,
                              user_agent: str = "",
                              cookies: Mapping[str, str] | None = None,
-                             referer: str = "") -> Tuple[bool, str, str]:
-        """下载一条作品的全部媒体(并发)。返回 (ok, local_path, error)。"""
+                             referer: str = "",
+                             on_progress: Callable[[dict[str, Any]], None] | None = None) -> Tuple[bool, str, str]:
+        """下载一条作品的全部媒体(并发)，可选通过 on_progress 回传字节/速率/合流/解密实时进度。"""
         from ..netfp import curl_proxy_url
         norm_proxy = curl_proxy_url(proxy) or None
         out_dir = self._target_dir(aweme.author_name, base_dir)
@@ -69,6 +73,7 @@ class Downloader:
             "https://www.instagram.com/" if _pf == "instagram" else
             "https://x.com/" if _pf == "twitter" else
             "https://www.facebook.com/" if _pf == "facebook" else
+            "https://www.youtube.com/" if _pf == "youtube" else
             "https://www.douyin.com/"
         )
         effective_ua = str(user_agent or self.ua)
@@ -77,6 +82,32 @@ class Downloader:
             "Referer": str(referer or platform_referer),
         }
         impersonate = impersonate_for_ua(effective_ua)
+        total_items = max(1, len(getattr(aweme, "medias", ()) or ()))
+        item_progress: dict[int, dict[str, Any]] = {}
+
+        def _emit_aggregate(idx: int, update: dict[str, Any]) -> None:
+            if on_progress is None:
+                return
+            entry = item_progress.setdefault(idx, {"written": 0, "total": 0, "speed_bps": 0.0, "phase": "downloading", "phase_label": "正在下载媒体"})
+            entry.update(update)
+            sum_written = sum(int(v.get("written") or 0) for v in item_progress.values())
+            sum_total = sum(int(v.get("total") or 0) for v in item_progress.values())
+            sum_speed = sum(float(v.get("speed_bps") or 0.0) for v in item_progress.values())
+            eta = None
+            if sum_total > sum_written and sum_speed > 0:
+                eta = max(1, int((sum_total - sum_written) / sum_speed))
+            try:
+                on_progress({
+                    "phase": entry.get("phase") or "downloading",
+                    "phase_label": entry.get("phase_label") or "正在下载媒体",
+                    "downloaded_bytes": sum_written,
+                    "total_bytes": sum_total if len(item_progress) >= total_items or total_items == 1 else 0,
+                    "speed_bps": sum_speed if sum_speed > 0 else None,
+                    "eta_seconds": eta,
+                    "media_count": total_items,
+                })
+            except Exception:
+                pass
 
         try:
             async with AsyncSession(
@@ -89,11 +120,31 @@ class Downloader:
                 trust_env=False,
             ) as cli:
                 async def fetch(m):
+                    m_idx = int(getattr(m, "index", 0) or 0)
                     fpath = out_dir / self._filename(aweme, m, title)
                     lock = self._file_locks.setdefault(fpath.resolve(), asyncio.Lock())
                     async with lock:
                         if fpath.exists() and fpath.stat().st_size > 0:
+                            sz = fpath.stat().st_size
+                            _emit_aggregate(m_idx, {"written": sz, "total": sz, "speed_bps": 0.0, "phase": "done", "phase_label": "已存在本地文件"})
                             return str(fpath), ""
+                        if (
+                            _pf == "youtube"
+                            and m.kind == "video"
+                            and any(h in str(m.url or "").lower() for h in ("youtube.com/", "youtu.be/"))
+                        ):
+                            async with self._media_sem:
+                                yt_err = await run_in_media_pool(
+                                    self._download_youtube_ytdlp,
+                                    m.url,
+                                    fpath,
+                                    proxy=str(proxy or ""),
+                                    user_agent=effective_ua,
+                                    cookies=cookies,
+                                    quality=str(getattr(aweme, "quality_label", "") or "highest"),
+                                    on_progress=(lambda upd, i=m_idx: _emit_aggregate(i, upd)) if on_progress else None,
+                                )
+                            return (str(fpath), "") if not yt_err else ("", yt_err)
                         decode_key = str(getattr(m, "decode_key", "") or "").strip()
                         if decode_key and decode_key != "0" and m.kind == "video":
                             from ..platforms.channels.decrypt import (
@@ -102,11 +153,15 @@ class Downloader:
                             )
                             enc_path = fpath.with_suffix(fpath.suffix + ".enc")
                             async with self._media_sem:
-                                err = await self._download_one(cli, m.url, enc_path)
+                                err = await self._download_one(
+                                    cli, m.url, enc_path,
+                                    on_progress=(lambda upd, i=m_idx: _emit_aggregate(i, upd)) if on_progress else None,
+                                )
                             if err:
                                 return "", err
+                            _emit_aggregate(m_idx, {"phase": "decrypting", "phase_label": "正在解密视频号媒体", "speed_bps": 0.0})
                             try:
-                                await asyncio.to_thread(
+                                await run_in_media_pool(
                                     decrypt_channels_video_file,
                                     enc_path,
                                     fpath,
@@ -128,12 +183,19 @@ class Downloader:
                             try:
                                 async with self._media_sem:
                                     v_err, a_err = await asyncio.gather(
-                                        self._download_one(cli, m.url, v_tmp),
-                                        self._download_one(cli, audio_url, a_tmp),
+                                        self._download_one(
+                                            cli, m.url, v_tmp,
+                                            on_progress=(lambda upd, i=m_idx * 2: _emit_aggregate(i, upd)) if on_progress else None,
+                                        ),
+                                        self._download_one(
+                                            cli, audio_url, a_tmp,
+                                            on_progress=(lambda upd, i=m_idx * 2 + 1: _emit_aggregate(i, upd)) if on_progress else None,
+                                        ),
                                     )
                                 if v_err or a_err:
                                     return "", v_err or a_err
-                                mux_err = await asyncio.to_thread(
+                                _emit_aggregate(m_idx * 2, {"phase": "muxing", "phase_label": "正在 FFmpeg 无损合流", "speed_bps": 0.0})
+                                mux_err = await run_in_media_pool(
                                     self._mux_dash_streams, v_tmp, a_tmp, mux_tmp
                                 )
                                 if mux_err:
@@ -146,12 +208,13 @@ class Downloader:
                                 mux_tmp.unlink(missing_ok=True)
                         async with self._media_sem:
                             backup_urls = list(getattr(m, "backup_urls", None) or ())
+                            cb = (lambda upd, i=m_idx: _emit_aggregate(i, upd)) if on_progress else None
                             if backup_urls:
                                 err = await self._download_one(
-                                    cli, m.url, fpath, backup_urls=backup_urls,
+                                    cli, m.url, fpath, backup_urls=backup_urls, on_progress=cb,
                                 )
                             else:
-                                err = await self._download_one(cli, m.url, fpath)
+                                err = await self._download_one(cli, m.url, fpath, on_progress=cb)
                         return (str(fpath), "") if not err else ("", err)
 
                 async def fetch_cover() -> None:
@@ -206,6 +269,7 @@ class Downloader:
         fpath: Path,
         *,
         backup_urls: List[str] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         """带断点续传与备用 CDN 回退的下载(同时兼容 curl_cffi stream 与 httpx stream)。"""
         candidates: List[str] = []
@@ -259,16 +323,37 @@ class Downloader:
                             if hasattr(r, "aiter_content")
                             else r.aiter_bytes(64 * 1024)
                         )
+                        started_at = time.monotonic()
+                        last_emit = started_at
+                        written_since_start = 0
+                        if on_progress is not None:
+                            on_progress({"written": written, "total": total, "speed_bps": 0.0, "phase": "downloading", "phase_label": "正在下载媒体"})
                         with open(tmp, mode) as f:
                             async for chunk in aiter:
                                 if chunk:
                                     f.write(chunk)
-                                    written += len(chunk)
+                                    nbytes = len(chunk)
+                                    written += nbytes
+                                    written_since_start += nbytes
+                                    if on_progress is not None:
+                                        now_m = time.monotonic()
+                                        if (now_m - last_emit) >= 0.18:
+                                            dt = max(0.05, now_m - started_at)
+                                            on_progress({
+                                                "written": written,
+                                                "total": total,
+                                                "speed_bps": written_since_start / dt,
+                                                "phase": "downloading",
+                                                "phase_label": "正在下载媒体",
+                                            })
+                                            last_emit = now_m
                         if total and written < total:
                             last = f"不完整 {written}/{total}"
                             force_fresh_conn = True
                             await asyncio.sleep((attempt + 1) * random.uniform(0.85, 1.35))
                             continue
+                        if on_progress is not None:
+                            on_progress({"written": written, "total": total or written, "speed_bps": 0.0, "phase": "done", "phase_label": "下载完成"})
                         tmp.replace(fpath)
                         return ""
                 except Exception as e:
@@ -284,6 +369,149 @@ class Downloader:
             tail = cr.rsplit("/", 1)[-1] if "/" in cr else ""
             return int(tail) if tail.isdigit() else 0
         return int(r.headers.get("content-length") or 0)
+
+    @staticmethod
+    def _download_youtube_ytdlp(
+        url: str,
+        fpath: Path,
+        *,
+        proxy: str = "",
+        user_agent: str = "",
+        cookies: Mapping[str, str] | None = None,
+        quality: str = "highest",
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
+        """通过 yt-dlp + 内置 FFmpeg 下载并无损封装 YouTube 高清音视频流。"""
+        import shutil
+        import tempfile
+        from ..runtime_tools import find_ffmpeg, find_node
+
+        try:
+            import yt_dlp
+        except Exception as exc:
+            return f"缺少 yt-dlp 组件，无法下载 YouTube 视频: {exc}"
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ch_yt_dl_"))
+        try:
+            # 严禁将 YouTube 账号登录 Cookie 交给 yt-dlp(Python OpenSSL TLS 栈)：
+            # 一方面避免账号会话 TLS 指纹突变，另一方面 YouTube 对无 PO Token 的带 Cookie web 请求会直接返回 "The page needs to be reloaded"
+            ff = find_ffmpeg()
+            node = find_node()
+            q = str(quality or "highest").strip().lower()
+            if ff:
+                if q == "lowest":
+                    fmt = "worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst"
+                elif q.isdigit():
+                    fmt = f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/best[height<={q}][ext=mp4]/best[height<={q}]/best"
+                else:
+                    fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            else:
+                # 环境中无 FFmpeg 时必须选择单流音视频封装格式，避免 yt-dlp 合并报错
+                if q == "lowest":
+                    fmt = "worst[ext=mp4][acodec!=none][vcodec!=none]/worst[acodec!=none][vcodec!=none]/worst[ext=mp4]/worst"
+                elif q.isdigit():
+                    fmt = f"best[height<={q}][ext=mp4][acodec!=none][vcodec!=none]/best[height<={q}][acodec!=none][vcodec!=none]/best[ext=mp4]/best"
+                else:
+                    fmt = "best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best[ext=mp4]/best"
+
+            out_tpl = str(tmp_dir / "video.%(ext)s")
+            base_opts: dict[str, Any] = {
+                "format": fmt,
+                "outtmpl": out_tpl,
+                "quiet": True,
+                "no_warnings": True,
+                "no_color": True,
+                "noprogress": True,
+                "noplaylist": True,
+                "retries": 2,
+                "socket_timeout": 30,
+            }
+            if on_progress is not None:
+                def _yt_hook(d: dict[str, Any]) -> None:
+                    st = str(d.get("status") or "")
+                    dl = int(d.get("downloaded_bytes") or 0)
+                    tot = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+                    spd = float(d.get("speed") or 0.0)
+                    on_progress({
+                        "written": dl,
+                        "total": tot,
+                        "speed_bps": spd,
+                        "phase": "downloading" if st == "downloading" else "muxing",
+                        "phase_label": "正在下载 YouTube 流" if st == "downloading" else "正在封装 MP4",
+                    })
+                def _yt_pp_hook(d: dict[str, Any]) -> None:
+                    if d.get("status") == "started":
+                        on_progress({
+                            "phase": "muxing",
+                            "phase_label": "正在 FFmpeg 无损合流",
+                            "speed_bps": 0.0,
+                        })
+                base_opts["progress_hooks"] = [_yt_hook]
+                base_opts["postprocessor_hooks"] = [_yt_pp_hook]
+            if ff:
+                # imageio-ffmpeg 可执行文件名通常带版本后缀（如 ffmpeg-win-x86_64-v7.1.exe），
+                # 必须传完整文件路径而非父目录，否则 yt-dlp 只认目录里的 ffmpeg.exe。
+                base_opts["ffmpeg_location"] = str(ff)
+                base_opts["merge_output_format"] = "mp4"
+            if node:
+                base_opts["js_runtimes"] = {"node": {"path": str(node)}}
+            if proxy:
+                base_opts["proxy"] = proxy
+
+            # 依次尝试：
+            # 1) 默认客户端（无 PO Token 限制的视频 / Shorts 可直接拿到高清 DASH 并由 FFmpeg 无损合流）；
+            # 2) android 客户端单流封装（规避 YouTube 对 android_vr/DASH 无 PO Token 返回 403 Forbidden）；
+            # 3) android_vr + tv + ios 兜底。
+            # 注意不覆写 http_headers["User-Agent"]，避免桌面 UA 破坏移动端 Innertube 客户端校验。
+            android_opts = {
+                **base_opts,
+                "format": "best[ext=mp4][acodec!=none][vcodec!=none]/best[ext=mp4]/best",
+                "extractor_args": {"youtube": {"player_client": ["android"]}},
+            }
+            android_opts.pop("merge_output_format", None)
+            attempts = [
+                base_opts,
+                android_opts,
+                {**base_opts, "extractor_args": {"youtube": {"player_client": ["android_vr", "tv", "ios"]}}},
+            ]
+            last_exc: Exception | None = None
+            for attempt_opts in attempts:
+                for leftover in list(tmp_dir.iterdir()):
+                    try:
+                        if leftover.is_dir():
+                            shutil.rmtree(leftover, ignore_errors=True)
+                        else:
+                            leftover.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                try:
+                    with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                        ydl.download([url])
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                clean_msg = re.sub(r"\x1b\[[0-9;]*m", "", str(last_exc)).strip()
+                return f"YouTube 视频下载失败: {clean_msg}"
+
+            candidates = [
+                p for p in tmp_dir.iterdir()
+                if p.is_file() and p.name.startswith("video.") and p.suffix.lower() not in {".part", ".ytdl", ".txt"}
+            ]
+            if not candidates:
+                return "yt-dlp 未生成可保存的视频文件"
+            best_file = max(candidates, key=lambda p: p.stat().st_size)
+            if best_file.stat().st_size <= 0:
+                return "yt-dlp 生成的视频文件为空"
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(best_file), str(fpath))
+            return ""
+        except Exception as exc:
+            clean_msg = re.sub(r"\x1b\[[0-9;]*m", "", str(exc)).strip()
+            return f"YouTube 视频下载失败: {clean_msg}"
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     @staticmethod
     def _mux_dash_streams(video_path: Path, audio_path: Path, out_path: Path) -> str:

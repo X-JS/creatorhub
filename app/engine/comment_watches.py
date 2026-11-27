@@ -25,13 +25,17 @@ from app.transport_matrix import douyin_client_environment
 class CommentWatchMixin:
     # ── 独立评论监控(CommentWatch)──
     async def _scan_comment_watches(self):
-        due = []
+        from app.services.login_sessions import has_active_open_browser
+
+        due: list[tuple[int, int | None]] = []
         with get_session() as s:
             ws = s.exec(select(CommentWatch).where(CommentWatch.enabled == True)).all()  # noqa: E712
             for w in ws:
                 if self._periodic_due(w, "comment_watch"):
-                    due.append(w.id)
-        for wid in due:
+                    due.append((w.id, w.account_id))
+        for wid, aid in due:
+            if aid and (await has_active_open_browser(aid) or self.browser.lock_for(f"acc:{aid}").locked()):
+                continue
             await self.scan_comment_watch(wid)
 
     async def scan_comment_watch(self, watch_id: int) -> dict:
@@ -92,7 +96,6 @@ class CommentWatchMixin:
                         return {"ok": False, "new_comments": 0, "error": msg, "skipped": True}
                     state = acc.storage_state or acc.creator_storage_state or ""
                     creator_state = acc.creator_storage_state or ""
-                    ua = acc.ua or self.cfg.engine.user_agent
                     proxy = acc.proxy or ""
                     has_creator = bool(creator_state)
                     identity = (
@@ -100,6 +103,7 @@ class CommentWatchMixin:
                         if callable(getattr(self.browser, "identity_for", None))
                         else None
                     )
+                    ua = self._direct_request_ua(identity if identity is not None else acc)
             if identity is None and not w.account_id:
                 identity, anon_px = self._anon_identity_proxy(platform, session=s)
                 proxy = proxy or anon_px
@@ -129,6 +133,14 @@ class CommentWatchMixin:
                 acc_fb = s.get(DouyinAccount, w.account_id) if w.account_id else None
                 if not w.account_id or not acc_fb or acc_fb.platform != "facebook" or acc_fb.status != "active" or not state:
                     msg = "Facebook 评论监控必须绑定已登录且状态正常的 Facebook 账号"
+                    w.last_scan_at = datetime.utcnow()
+                    w.last_error = msg
+                    s.add(w); s.commit()
+                    return {"ok": False, "new_comments": 0, "error": msg}
+            if platform == "youtube":
+                acc_yt = s.get(DouyinAccount, w.account_id) if w.account_id else None
+                if acc_yt and (acc_yt.platform != "youtube" or acc_yt.status != "active"):
+                    msg = "绑定的 YouTube 账号状态异常或已失效，请重新登录"
                     w.last_scan_at = datetime.utcnow()
                     w.last_error = msg
                     s.add(w); s.commit()
@@ -228,6 +240,12 @@ class CommentWatchMixin:
             elif platform == "facebook":
                 total_new, author = await self._cw_facebook_video(
                     watch_id, identity, state, ua, proxy, aweme_id, name, first_scan)
+            elif platform == "youtube" and kind == "user":
+                total_new, author = await self._cw_youtube_user(
+                    watch_id, identity, state, ua, proxy, sec_uid, name, first_scan)
+            elif platform == "youtube":
+                total_new, author = await self._cw_youtube_video(
+                    watch_id, identity, state, ua, proxy, aweme_id, name, first_scan)
             elif kind == "user" and mode == "creator":
                 total_new, author = await self._cw_creator(watch_id, identity, has_creator,
                                                            name, first_scan)
@@ -259,10 +277,11 @@ class CommentWatchMixin:
                         or (w.platform == "instagram" and w.title.startswith("IG "))
                         or (w.platform == "twitter" and w.title.startswith("推文 "))
                         or (w.platform == "facebook" and w.title.startswith("FB "))
+                        or (w.platform == "youtube" and w.title.startswith("YT "))
                     ):
                         w.title = author.get("nickname") or w.title
                     ava = (author.get("avatar_thumb") or {}).get("url_list") or []
-                    if ava and ava[0] and (not w.avatar or w.platform in {"instagram", "twitter", "facebook"}):
+                    if ava and ava[0] and (not w.avatar or w.platform in {"instagram", "twitter", "facebook", "youtube"}):
                         w.avatar = ava[0]
                 w.comment_count = len(s.exec(select(CommentRecord.id)
                                              .where(CommentRecord.watch_id == watch_id)).all())
@@ -379,9 +398,12 @@ class CommentWatchMixin:
             ct = int(it.get("create_time") or 0)
             if aid and (not cutoff or not ct or ct >= cutoff):
                 works.append((aid, (it.get("desc") or "")))
+        from app.pacing import PagePacer
         works = works[:settings["recent_works"]]
         total = 0
+        pacer = PagePacer(0.85)
         for aid, desc in works:
+            await pacer.step()
             with get_session() as s:
                 known = set(s.exec(select(CommentRecord.comment_id)
                                    .where(CommentRecord.watch_id == watch_id)
@@ -426,8 +448,11 @@ class CommentWatchMixin:
                 works.append((aw.aweme_id, aw.desc))
                 if len(works) >= settings["recent_works"]:
                     break
+        from app.pacing import PagePacer
         total = 0
+        pacer = PagePacer(0.95)
         for pid, desc in works:
+            await pacer.step()
             with get_session() as s:
                 known = set(s.exec(select(CommentRecord.comment_id)
                                    .where(CommentRecord.watch_id == watch_id)
@@ -574,8 +599,11 @@ class CommentWatchMixin:
                     if len(works) >= settings["recent_works"]:
                         break
 
+            from app.pacing import PagePacer
             total = 0
+            pacer = PagePacer(0.75)
             for oid, nid, desc in works:
+                await pacer.step()
                 n, _ = await self._cw_channels_video(
                     watch_id, identity, state, oid, nid, name, first_scan,
                     work_desc=desc, proto_client=proto_client)
@@ -654,9 +682,12 @@ class CommentWatchMixin:
             if aw and (not aw.create_time or aw.create_time >= cutoff):
                 works.append(aw)
         works.sort(key=lambda aw: (aw.create_time, aw.aweme_id), reverse=True)
+        from app.pacing import PagePacer
         works = works[:settings["recent_works"]]
         total = 0
+        pacer = PagePacer(1.0)
         for aw in works:
+            await pacer.step()
             count, _ = await self._cw_tiktok_video(
                 watch_id, identity, state, aw.aweme_id,
                 aw.author_unique_id or unique_id, name, first_scan, proxy, aw.desc)

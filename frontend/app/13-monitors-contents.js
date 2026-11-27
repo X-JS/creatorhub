@@ -1,22 +1,17 @@
-// 13-monitors-contents.js — 作品监控目标管理、已捕获内容库检索、批量操作与本地文件定位。
+// 13-monitors-contents.js — 主页作品监控目标管理、已捕获内容库检索、批量操作与本地文件定位。
 async function addMonitor() {
   const btn = evtBtn() || document.querySelector('button[onclick="addMonitor()"]');
   if (btn?.disabled) return;
   await withBusy(btn, "识别中", async () => {
-  const target_kind = (["xhs", "rednote"].includes(PLATFORM) && $("t-kind")) ? $("t-kind").value : "creator";
-  const normalizedTarget = target_kind === "keyword"
-    ? $("t-url").value.trim()
-    : await normalizeMonitorTarget(null, { quiet: true });
+  const normalizedTarget = await normalizeMonitorTarget(null, { quiet: true, toastErrors: true });
   if (normalizedTarget === null) return;
   const url_or_secuid = $("t-url").value.trim();
-  if (!url_or_secuid) { toast(target_kind === "keyword" ? "请输入搜索关键词" : "请输入主页链接 / 短链 / id", "err"); return; }
-  if (["xhs", "rednote", "douyin", "tiktok"].includes(PLATFORM) && !$("t-acc").value) {
+  if (!url_or_secuid) { toast("请输入创作者主页链接 / 短链 / ID", "err"); return; }
+  if (MONITOR_ACCOUNT_REQUIRED.includes(PLATFORM) && !$("t-acc").value) {
     const platformName = PF_NAME[PLATFORM] || "当前平台";
-    const available = PLATFORM === "tiktok"
-      ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
-      : ACCOUNTS;
-    if (!available.length) { toast(`请先在「账号」里完成${platformName}扫码登录`, "err"); switchTab("accounts"); return; }
-    toast(`${platformName}监控必须选择一个已登录账号`, "err"); return;
+    const available = ACCOUNTS.filter(a => a.status === "active" && (a.has_storage || a.has_creator));
+    if (!available.length) { toast(`请先在「账号矩阵」里完成${platformName}登录`, "err"); switchTab("accounts"); return; }
+    toast(`${platformName}主页作品监控必须选择一个已登录账号`, "err"); return;
   }
   const downloadMode = $("t-download").value;
   $("add-msg").textContent = "解析中…";
@@ -25,13 +20,13 @@ async function addMonitor() {
       await api("/api/monitors", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          url_or_secuid, platform: PLATFORM, target_kind,
+          url_or_secuid, platform: PLATFORM, target_kind: "creator",
           account_id: PLATFORM === "shipinhao" ? null : ($("t-acc").value ? +$("t-acc").value : null),
           interval_seconds: monitorIntervalSeconds("t-interval"),
           initial_backfill_count: !["xhs", "rednote"].includes(PLATFORM)
             ? ($("t-backfill").value === "" ? null : +$("t-backfill").value) : 0,
-          download_dir: $("t-dir").value.trim(),
-          video_quality: ["xhs", "rednote"].includes(PLATFORM) ? "" : $("t-quality").value,
+          download_dir: downloadMode === "none" ? "" : $("t-dir").value.trim(),
+          video_quality: QUALITY_PLATFORMS.includes(PLATFORM) && downloadMode !== "none" && downloadMode !== "images" ? $("t-quality").value : "",
           download_enabled: downloadMode !== "none",
           media_filter: downloadMode === "none" ? "all" : downloadMode,
           max_scrolls: +$("t-max-scrolls").value,
@@ -48,8 +43,9 @@ async function addMonitor() {
       });
       ["t-url", "t-dir", "t-alias"].forEach(id => $(id).value = "");
       setMetaValue("t-group", ""); setMetaValue("t-tags", "");
+      resetMonitorTargetState();
       $("add-msg").textContent = "已添加 ✓";
-      toast("已开始监控", "ok");
+      toast("已开始主页作品监控", "ok");
       globalThis.CreatorHubWorkbench?.completed?.("monitors");
     } catch (e) { $("add-msg").textContent = "失败: " + e.message; toast("添加失败:" + e.message, "err"); }
   });
@@ -137,11 +133,9 @@ function monitorIntervalSeconds(id) {
 }
 async function editMonitor(id) {
   const item = monitorById(id); if (!item) return;
-  const accounts = ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid");
-  const accountOptions = [
-    `<option value="">${item.account_id ? "保持当前绑定" : "不指定账号"}</option>`,
-    ...accounts.map(a => `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`),
-  ].join("");
+  const accounts = _preferCrawlAccounts(ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid"));
+  const supportsQuality = QUALITY_PLATFORMS.includes(item.platform);
+  const accountOptions = accOptions(accounts, item.account_id ? "保持当前绑定" : "不指定账号", { preferCrawler: true });
   const intervalOptions = monitorIntervalOptions(item.interval_seconds || 300);
   const backfillOptions = numericSelectOptions(item.initial_backfill_count ?? 0, [
     [0, "不回填历史"], [5, "最近 5 条"], [20, "最近 20 条"], [-1, "尽可能全量"],
@@ -154,6 +148,21 @@ async function editMonitor(id) {
     [0, "平台默认"], [5, "5 条"], [12, "12 条"], [20, "20 条"],
     [50, "50 条"], [100, "100 条"],
   ]);
+  const syncEditMonitorDownload = () => {
+    const dlMode = $("em-download")?.value || "all";
+    const recMedia = $("em-record-media")?.value || "all";
+    const isNone = dlMode === "none";
+    if ($("em-dir-wrap")) $("em-dir-wrap").style.display = isNone ? "none" : "";
+    if ($("em-quality-wrap")) $("em-quality-wrap").style.display = (supportsQuality && !isNone && dlMode !== "images") ? "" : "none";
+    const warnEl = $("em-download-conflict");
+    if (warnEl) {
+      const conflict = !isNone && ((recMedia === "video" && dlMode === "images") || (recMedia === "images" && dlMode === "video"));
+      warnEl.hidden = !conflict;
+      warnEl.textContent = conflict
+        ? `提示：入库类型（${recMedia === "video" ? "仅视频" : "仅图文"}）与自动下载范围（${dlMode === "images" ? "仅图集" : "仅视频"}）互斥，将不会触发媒体下载。`
+        : "";
+    }
+  };
   const value = await new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => {
@@ -166,7 +175,7 @@ async function editMonitor(id) {
         account_id: item.platform === "shipinhao"
           ? null
           : ($("em-account") && $("em-account").value ? +$("em-account").value : null),
-        download_dir: $("em-dir").value.trim(),
+        download_dir: downloadMode === "none" ? "" : $("em-dir").value.trim(),
         video_quality: $("em-quality") ? $("em-quality").value : "",
         download_enabled: downloadMode !== "none",
         media_filter: downloadMode === "none" ? "all" : downloadMode,
@@ -201,7 +210,7 @@ async function editMonitor(id) {
             ? ""
             : `<div><label class="field" for="em-account">抓取账号</label><select id="em-account">${accountOptions}</select></div>`}
         </div>
-        ${(item.platform !== "xhs" && (!item.last_scan_at || !(item.content_count > 0))) ? `<div><label class="field" for="em-backfill">首次历史回填</label>
+        ${(!["xhs", "rednote"].includes(item.platform) && (!item.last_scan_at || !(item.content_count > 0))) ? `<div><label class="field" for="em-backfill">首次历史回填</label>
           <select id="em-backfill">${backfillOptions}</select></div>` : ""}
         <div class="form-grid cols-4">
           <div><label class="field" for="em-max-scrolls">抓取深度</label><select id="em-max-scrolls">${depthOptions}</select></div>
@@ -221,11 +230,12 @@ async function editMonitor(id) {
         <legend>记录与下载</legend>
         <div class="row">
           <div><label class="field" for="em-download">自动下载范围</label>
-            <select id="em-download"><option value="all">全部作品</option><option value="video">仅视频</option><option value="images">仅图集</option><option value="none">仅记录，不下载</option></select></div>
-          ${item.platform === "xhs" ? "" : `<div><label class="field" for="em-quality">视频画质</label>
-            <select id="em-quality"><option value="">跟随全局默认</option><option value="highest">原画/最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>`}
+            <select id="em-download"><option value="all">全部作品</option><option value="video">仅视频</option><option value="images">仅图集</option><option value="none">仅记录，不下载</option></select>
+            <div class="field-help" id="em-download-conflict" style="color:var(--warn)" hidden></div></div>
+          ${supportsQuality ? `<div id="em-quality-wrap"><label class="field" for="em-quality">视频画质</label>
+            <select id="em-quality"><option value="">跟随全局默认</option><option value="highest">原画/最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>` : ""}
         </div>
-        <div><label class="field" for="em-dir">下载目录</label>
+        <div id="em-dir-wrap"><label class="field" for="em-dir">下载目录</label>
           <input id="em-dir" value="${esc(item.download_dir || "")}" placeholder="留空跟随全局默认"></div>
       </fieldset>`;
     enhanceMetaControl($("em-group"), "group"); enhanceMetaControl($("em-tags"), "tags");
@@ -243,10 +253,13 @@ async function editMonitor(id) {
     $("em-min-comments").value = String(item.min_comment_count || 0);
     $("em-include-keywords").value = (item.include_keywords || []).join(", ");
     $("em-exclude-keywords").value = (item.exclude_keywords || []).join(", ");
+    $("em-download")?.addEventListener("change", syncEditMonitorDownload);
+    $("em-record-media")?.addEventListener("change", syncEditMonitorDownload);
     ["em-interval", "em-account", "em-backfill", "em-quality", "em-download",
       "em-max-scrolls", "em-max-items", "em-record-media"]
       .forEach(key => { const el = $(key); if (el) enhanceSelect(el); });
-    _uiOpen("编辑作品监控", "监控对象保持不变。更换创作者或关键词，请新建监控。", {
+    syncEditMonitorDownload();
+    _uiOpen("编辑主页作品监控", "监控对象保持不变。更换创作者主页，请新建主页作品监控。", {
       okText: "保存修改", wide: true, icon: "i-eye",
       submit: value => api("/api/monitors/" + id, {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value),
@@ -254,7 +267,7 @@ async function editMonitor(id) {
     });
   });
   if (value === null) return;
-  toast("作品监控配置已更新", "ok"); refreshMonitors(); refreshContents();
+  toast("主页作品监控配置已更新", "ok"); refreshMonitors(); refreshContents();
 }
 function monitorStrategySummary(t) {
   const depth = t.max_scrolls || (t.platform === "xhs" ? 6 : 12);
@@ -323,8 +336,8 @@ async function monBatchDelete() {
   const ids = [...selMon];
   const btn = evtBtn();
   if (!await uiConfirm({
-    title: "批量删除作品监控",
-    message: `确认删除选中的 ${ids.length} 个作品监控任务吗？已抓取的作品记录与本地文件会保留。`,
+    title: "批量删除主页作品监控",
+    message: `确认删除选中的 ${ids.length} 个主页作品监控任务吗？已抓取的作品记录与本地文件会保留。`,
     okText: "删除",
     danger: true,
   })) return;
@@ -334,7 +347,7 @@ async function monBatchDelete() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids }),
       });
-      toast(`已删除 ${r.deleted || 0} 个作品监控`, "ok");
+      toast(`已删除 ${r.deleted || 0} 个主页作品监控`, "ok");
       selMon.clear();
       await refreshMonitors();
       refreshContents();
@@ -342,35 +355,40 @@ async function monBatchDelete() {
   });
 }
 function monRow(t) {
-  const plainLabel = t.target_kind === "keyword"
+  const isLegacyKeyword = (t.target_kind || "creator") !== "creator";
+  const plainLabel = isLegacyKeyword
     ? `#${t.keyword || ""}` : (t.nickname || (t.sec_uid || "").slice(0, 12));
-  const label = t.target_kind === "keyword"
-    ? `<span class="ic-text">${ic("i-hash")}${esc(t.keyword)}</span>` : esc(t.nickname || (t.sec_uid || "").slice(0, 12));
+  const label = isLegacyKeyword
+    ? `<span class="ic-text">${ic("i-hash")}${esc(t.keyword)}</span> <span class="pill q bare" title="关键词监控已下线，仅保留历史记录查看与删除；按词搜索请使用关键词采集">历史关键词(已下线)</span>`
+    : esc(t.nickname || (t.sec_uid || "").slice(0, 12));
   const acc = ACCOUNTS.find(a => a.id === t.account_id);
-  // 抖音/小红书都显示绑定账号:抖音未登录抓主页易拿到风控过的旧快照,绑号才稳定;视频号走本机微信客户端,无需绑定账号
+  const accRequired = MONITOR_ACCOUNT_REQUIRED.includes(t.platform);
   const accTag = t.platform === "shipinhao"
     ? `<div class="mut" style="font-size:11px;margin-top:2px">${acc ? `通道：本机微信客户端（附账号:${esc(acc.nickname)}）` : "通道：本机微信客户端"}</div>`
     : acc
     ? `<div class="mut" style="font-size:11px;margin-top:2px">账号:${esc(acc.nickname)}</div>`
-    : `<div class="ic-text" style="font-size:11px;margin-top:2px;color:var(--danger)">${ic("i-info")}未绑定账号</div>`;
+    : accRequired
+    ? `<div class="ic-text" style="font-size:11px;margin-top:2px;color:var(--danger)">${ic("i-info")}未绑定账号</div>`
+    : `<div class="mut" style="font-size:11px;margin-top:2px">匿名抓取（未绑号）</div>`;
   const downloadLabel = t.download_enabled === false ? "仅记录"
     : ({ all: "全部下载", video: "仅视频", images: "仅图集" }[t.media_filter] || "全部下载");
+  const showQualityPill = QUALITY_PLATFORMS.includes(t.platform) && t.download_enabled !== false && t.media_filter !== "images";
   const selected = selMon.has(t.id);
   return `<tr${selected ? ' class="is-selected"' : ""}>
-    <td class="task-check-cell"><label class="task-selection" title="选择此作品监控"><input type="checkbox" data-id="${t.id}" aria-label="选择作品监控 ${esc(plainLabel)}" onchange="monToggleOne(${t.id}, this.checked)"${selected ? " checked" : ""}></label></td>
+    <td class="task-check-cell"><label class="task-selection" title="选择此主页作品监控"><input type="checkbox" data-id="${t.id}" aria-label="选择主页作品监控 ${esc(plainLabel)}" onchange="monToggleOne(${t.id}, this.checked)"${selected ? " checked" : ""}></label></td>
     <td><div class="user-cell">${t.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(t.avatar))}" alt="" referrerpolicy="no-referrer">` : `<span class="wb-avatar-fallback" style="width:30px;height:30px;flex:0 0 30px;font-size:13px;border-radius:50%" aria-hidden="true">${esc((plainLabel || "监").replace(/^#/, "").slice(0, 1))}</span>`}<div><span title="${esc(plainLabel)}">${label}</span>${t.alias ? `<div class="alias-line" title="${esc(t.alias)}">${esc(t.alias)}</div>` : ""}${accTag}</div></div></td>
     <td>${metaChips(t)}</td>
     <td class="num"><button type="button" class="ghost sm monitor-record-link" data-monitor-records="${t.id}" onclick="showMonitorRecords(${t.id})">查看记录 <span>${t.content_count || 0}</span></button></td>
     <td class="num">${monitorIntervalText(t.interval_seconds)}</td>
     <td class="wrap" style="max-width:240px">
-      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="pill q bare">${downloadLabel}</span>${(t.platform === "xhs" || t.platform === "rednote") ? "" : `<span class="pill q bare">${QMAP[t.video_quality] || "默认画质"}</span>`}${monitorStrategySummary(t)}</div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="pill q bare">${downloadLabel}</span>${showQualityPill ? `<span class="pill q bare">${QMAP[t.video_quality] || "默认画质"}</span>` : ""}${monitorStrategySummary(t)}</div>
       ${t.download_dir ? `<div class="mut" title="${esc(t.download_dir)}" style="font-size:11px;margin-top:3px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">目录：${esc(t.download_dir)}</div>` : ""}</td>
-    <td class="mut">${t.last_scan_at ? new Date(t.last_scan_at + "Z").toLocaleString() : "—"}${t.last_error ? ` <span class="warn-ic" title="${esc(t.last_error)}">${ic("i-info")}</span>` : ""}${autoRunHint(t.next_auto_run_at)}</td>
-    <td><span class="pill ${t.enabled ? "active" : "paused"}">${t.enabled ? "监控中" : "已暂停"}</span></td>
+    <td class="mut">${t.last_scan_at ? new Date(t.last_scan_at + "Z").toLocaleString() : "—"}${t.last_error ? ` <span class="warn-ic" title="${esc(t.last_error)}">${ic("i-info")}</span>` : ""}${isLegacyKeyword ? "" : autoRunHint(t.next_auto_run_at)}</td>
+    <td><span class="pill ${isLegacyKeyword ? "paused" : (t.enabled ? "active" : "paused")}">${isLegacyKeyword ? "已下线" : (t.enabled ? "监控中" : "已暂停")}</span></td>
     <td class="acttd">
-      <button class="ghost sm" onclick="runNow(${t.id})">立即抓取</button>
+      ${isLegacyKeyword ? "" : `<button class="ghost sm" onclick="runNow(${t.id})">立即抓取</button>
       <button class="ghost sm" onclick="editMonitor(${t.id})">编辑</button>
-      <button class="ghost sm" onclick="toggleMon(${t.id})">${t.enabled ? "暂停" : "启用"}</button>
+      <button class="ghost sm" onclick="toggleMon(${t.id})">${t.enabled ? "暂停" : "启用"}</button>`}
       <button class="ghost sm danger" onclick="delMon(${t.id})">${ic("i-trash")}删除</button>
     </td></tr>`;
 }
@@ -407,12 +425,72 @@ async function refreshMonitors() {
   if ($("tb-mon")) $("tb-mon").textContent = ts.length;
   renderMonitorRows();
 }
+const _WATCHED_MONITOR_SCANS = new Set();
+function renderInlineDownloadProgHtml(recordId, downloadStatus = "", liveTask = null) {
+  const prog = window.CreatorHubProgress;
+  const task = liveTask || prog?.getTask?.("download:content:" + recordId);
+  const active = task && ["queued", "running"].includes(task.status);
+  if (!active && downloadStatus !== "downloading") return "";
+  const det = !!(task && task.determinate && task.percent !== null && task.percent !== undefined && Number.isFinite(Number(task.percent)));
+  const pct = det ? Math.max(0, Math.min(100, Math.round(Number(task.percent)))) : null;
+  const bar = prog?.renderProgressBar
+    ? prog.renderProgressBar({ determinate: det, percent: pct, tone: "info", label: "媒体下载进度", compact: true })
+    : `<div class="progress-track is-compact${det ? "" : " is-indeterminate"}"><div class="progress-fill" style="${det ? `width:${pct}%` : ""}"></div></div>`;
+  const parts = [];
+  if (task?.phase_label) parts.push(task.phase_label);
+  if (det) parts.push(`${pct}%`);
+  if (task && task.unit === "bytes" && Number(task.total) > 0) {
+    parts.push(`${prog?.fmtBytes?.(task.current) || ""} / ${prog?.fmtBytes?.(task.total) || ""}`);
+  } else if (task && task.unit === "bytes" && Number(task.current) > 0) {
+    parts.push(prog?.fmtBytes?.(task.current) || "");
+  }
+  const spd = task?.speed_bps ? (prog?.fmtSpeed?.(task.speed_bps) || "") : "";
+  if (spd) parts.push(spd);
+  const eta = task?.eta_seconds ? (prog?.fmtEta?.(task.eta_seconds) || "") : "";
+  if (eta) parts.push(eta);
+  return `<div class="dl-inline-prog">${bar}<div class="dl-inline-prog-meta progress-num">${esc(parts.join(" · ") || "正在下载…")}</div></div>`;
+}
+window.addEventListener("creatorhub:progress:update", e => {
+  const task = e?.detail?.task;
+  if (!task) return;
+  if (task.category === "monitor_scan" && _WATCHED_MONITOR_SCANS.has(task.task_key)) {
+    if (["completed", "failed", "canceled"].includes(task.status)) {
+      _WATCHED_MONITOR_SCANS.delete(task.task_key);
+      const r = task.extra?.result;
+      const tid = Number(task.extra?.target_id || 0);
+      if (task.status === "failed") {
+        toast("抓取未成功:" + (task.error || task.phase_label || "未知错误"), "err", 10000);
+      } else if (r) {
+        if (r.skipped) toast(r.reason || "本轮已跳过，请查看监控状态", "info", 6000);
+        else if (r.partial) toast(`部分完成：已获取 ${r.captured ?? r.new} 条作品，${r.failed || 0} 条详情失败。${r.error || ""}`, "info", 10000);
+        else if (r.error) toast("抓取未成功:" + r.error, "err", 10000);
+        else if (r.refreshed) toast(`抓取完成，新增 ${r.new} 条记录；已刷新 ${r.refreshed} 条失败记录的访问参数，可在作品记录中手动重试。`, "info", 10000);
+        else if ((r.scanned ?? 0) === 0 && (r.new ?? 0) === 0 && !r.filtered && (r.backfill_count === 0 || monitorById(tid)?.initial_backfill_count === 0)) {
+          toast("未抓取到作品：当前「首次历史回填」为“不回填历史(0 条)”，仅监控新建之后的新发布；可在「编辑」中改为“最近 5 条”后重抓。", "info", 8000);
+        }
+        else toast(`抓取完成,检查 ${r.scanned ?? r.new} 条，筛除 ${r.filtered || 0} 条，新增 ${r.new} 条`, "ok");
+      }
+    }
+    return;
+  }
+  if (task.category === "monitor_download" && typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "monitors") {
+    const recId = Number(task.extra?.record_id || String(task.task_key || "").split(":")[2] || 0);
+    if (!recId) return;
+    document.querySelectorAll(`[data-dl-prog="${recId}"]`).forEach(slot => {
+      slot.innerHTML = renderInlineDownloadProgHtml(recId, task.status === "running" ? "downloading" : "", task);
+    });
+  }
+});
 async function runNow(id) {
   const btn = evtBtn();
-  toast("抓取中…正在按配置的获取方式读取作品", "info", 7000);
-  await withBusy(btn, "抓取中", async () => {
+  await withBusy(btn, "发起中", async () => {
     try {
-      const r = await api("/api/monitors/" + id + "/run-now", { method: "POST" });
+      const r = await api("/api/monitors/" + id + "/run-now?async_mode=true", { method: "POST" });
+      if (r.async && r.queued) {
+        if (r.task_key) _WATCHED_MONITOR_SCANS.add(r.task_key);
+        toast(r.already_running ? "该监控正在后台抓取中，可在右上角「活动中心」查看进度" : "已开始后台抓取，可在右上角「活动中心」查看实时进度", "info", 4500);
+        return;
+      }
       if (r.skipped) toast(r.reason || "本轮已跳过，请查看监控状态", "info", 6000);
       else if (r.partial) toast(`部分完成：已获取 ${r.captured ?? r.new} 条作品，${r.failed || 0} 条详情失败。${r.error || ""}`, "info", 10000);
       else if (r.error) toast("抓取未成功:" + r.error, "err", 10000);
@@ -421,9 +499,9 @@ async function runNow(id) {
         toast("未抓取到作品：当前「首次历史回填」为“不回填历史(0 条)”，仅监控新建之后的新发布；可在「编辑」中改为“最近 5 条”后重抓。", "info", 8000);
       }
       else toast(`抓取完成,检查 ${r.scanned ?? r.new} 条，筛除 ${r.filtered || 0} 条，新增 ${r.new} 条`, "ok");
+      refreshMonitors(); refreshContents();
     } catch (e) { toast("抓取失败:" + e.message, "err"); }
   });
-  refreshMonitors(); refreshContents();
 }
 async function toggleMon(id) { try { await api("/api/monitors/" + id + "/toggle", { method: "POST" }); refreshMonitors(); } catch (e) { toast("操作失败:" + e.message, "err"); } }
 async function delMon(id) { if (await uiConfirm({ title: "删除监控", message: "删除该监控?", okText: "删除", danger: true })) { try { await api("/api/monitors/" + id, { method: "DELETE" }); selMon.delete(id); toast("监控已删除", "ok"); refreshMonitors(); } catch (e) { toast("删除失败:" + e.message, "err"); } } }
@@ -565,7 +643,7 @@ function noteCard(r) {
     ? `<img class="ncard-cover" src="${esc(safeMediaUrl(r.cover_url))}" alt="${esc((r.desc || "作品").slice(0, 20))}" referrerpolicy="no-referrer" loading="lazy" onclick="openPreview(${r.id})">`
     : `<div class="ncard-cover ph" onclick="openPreview(${r.id})">${ic(r.media_type === "images" ? "i-image" : "i-film")}</div>`;
   const hasLocal = Boolean(String(r.local_path || "").trim());
-  const canPickRepost = ["douyin", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && r.download_status === "done";
+  const canPickRepost = ["douyin", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM) && r.download_status === "done";
   return `<div class="ncard">
     ${cover}
     <span class="ncard-type">${ic(typeIc)}${esc(typeLabel)}</span>
@@ -578,6 +656,7 @@ function noteCard(r) {
         <span>${fmtTime(r.create_time)}</span>
         <span class="like">${ic("i-heart")}${fmtNum(r.like_count)} · 💬${fmtNum(r.comment_count)}</span>
       </div>
+      <div data-dl-prog="${r.id}">${renderInlineDownloadProgHtml(r.id, r.download_status)}</div>
       <div class="ncard-actions">
         <span class="pill ${r.download_status}" style="flex:1;justify-content:center" title="${esc(r.error || "")}">${contentStatusLabel(r.download_status)}${r.error ? " ⓘ" : ""}</span>
         ${hasLocal ? `<button class="ghost sm" style="flex:0 0 auto" onclick="revealContentPath(${r.id},this)" title="打开文件夹">${ic("i-folder")}</button>` : ""}
@@ -754,6 +833,7 @@ async function refreshContents(resetPage = false) {
       <td class="content-metrics num"><span class="metric like">${ic("i-heart")}${fmtNum(r.like_count)}</span><span class="metric">${ic("i-msg")}${fmtNum(r.comment_count)}</span></td>
       <td class="content-status-cell">
         <div class="content-status-row"><span class="pill ${r.download_status}">${contentStatusLabel(r.download_status)}</span>${r.error ? `<span class="warn-ic" data-tip="${esc(r.error)}" title="${esc(r.error)}">${ic("i-info")}</span>` : ""}</div>
+        <div data-dl-prog="${r.id}">${renderInlineDownloadProgHtml(r.id, r.download_status)}</div>
         ${contentPathCell(r)}
       </td>
       <td class="content-action-cell acttd">
@@ -761,7 +841,7 @@ async function refreshContents(resetPage = false) {
           <button type="button" class="ghost sm content-icon-btn" onclick="openPreview(${r.id})" data-tip="站内预览" title="站内预览" aria-label="预览作品">${ic("i-eye")}</button>
           ${hasLocal ? `<button type="button" class="ghost sm content-icon-btn local-path-action reveal" onclick="revealContentPath(${r.id},this)" data-tip="在文件夹中显示" title="在文件夹中显示" aria-label="在文件夹中显示">${ic("i-folder")}</button>` : ""}
           ${["failed", "skipped"].includes(r.download_status) ? `<button type="button" class="ghost sm" onclick="retryDl(${r.id})">${r.download_status === "skipped" ? "下载" : "重试"}</button>` : ""}
-          ${(["douyin", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && r.download_status === "done") ? `<button type="button" class="ghost sm content-action-primary" onclick="pickRepostTarget(${r.id})">${ic("i-send")}转发</button>` : ""}
+          ${(["douyin", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM) && r.download_status === "done") ? `<button type="button" class="ghost sm content-action-primary" onclick="pickRepostTarget(${r.id})">${ic("i-send")}转发</button>` : ""}
           ${(PLATFORM === "xhs" && r.download_status === "done") ? `<button class="ghost sm content-action-primary" onclick="repostDouyin(${r.id})">${ic("i-send")}发抖音</button>` : ""}
           <button type="button" class="ghost sm content-action-delete danger" onclick="delContent(${r.id})" data-tip="删除作品" title="删除作品" aria-label="删除作品">${ic("i-trash")}</button>
         </div>

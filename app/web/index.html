@@ -95,6 +95,7 @@
   .pswitch button.active[data-pf="instagram"] { background:rgba(225,48,108,.14); color:#e1306c; border-color:rgba(225,48,108,.42); }
   .pswitch button.active[data-pf="twitter"] { background:rgba(29,155,240,.15); color:#1d9bf0; border-color:rgba(29,155,240,.42); }
   .pswitch button.active[data-pf="facebook"] { background:rgba(24,119,242,.15); color:#1877f2; border-color:rgba(24,119,242,.42); }
+  .pswitch button.active[data-pf="youtube"] { background:rgba(255,0,0,.13); color:#e11d1d; border-color:rgba(255,0,0,.38); }
   .hidden { display:none !important; }
 
   /* Platform accents and light/dark themes are independent: appearance.css. */
@@ -719,7 +720,6 @@
   @media(pointer:coarse) { .proxy-input-grid .form-field > label, .proxy-address-label, .proxy-format-disclosure > summary { min-height:44px; } }
   .form-field > label, .form-label { display:flex; align-items:center; gap:6px; margin:0 0 6px; color:var(--mut); font-size:12px; font-weight:550; }
   .form-field > input, .form-field > textarea, .form-field > select, .form-field > .cs, .form-field > .input-affix, .form-field > .smart-target-input { width:100%; }
-  #col-source-ref-wrap { grid-column:2 / -1; }
   .field-help { margin-top:5px; color:var(--mut-2); font-size:11.5px; line-height:1.45; }
   .field-error { margin:5px 0 0; color:var(--danger); font-size:11.5px; line-height:1.4; }
   .input-affix { position:relative; }
@@ -760,6 +760,26 @@
   .switch-row:hover { border-color:color-mix(in srgb,var(--line) 60%,var(--fg)); background:var(--control-bg-hover); }
   .switch-row:has(input:checked) { border-color:color-mix(in srgb,var(--acc) 24%,var(--line)); background:color-mix(in srgb,var(--acc) 4%,var(--control-bg)); box-shadow:inset 0 1px 0 rgba(255,255,255,.025); }
   .switch-row:has(input:focus-visible) { border-color:var(--acc); box-shadow:0 0 0 3px var(--acc-ring); }
+  .switch-row.is-locked {
+    cursor:default;
+    border-color:color-mix(in srgb,var(--warn) 42%,var(--line));
+    background:color-mix(in srgb,var(--warn-soft) 55%,var(--surface));
+  }
+  .switch-row.is-locked:hover {
+    border-color:color-mix(in srgb,var(--warn) 48%,var(--line));
+    background:color-mix(in srgb,var(--warn-soft) 65%,var(--surface));
+  }
+  .switch-row.is-locked .switch-copy { flex:1 1 auto; }
+  .switch-row.is-locked button { flex:0 0 auto; white-space:nowrap; }
+  .switch-row input[type="checkbox"]:disabled { opacity:.65; cursor:not-allowed; }
+  .ac-lock-notice {
+    display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+    padding:9px 11px; border-radius:var(--r-xs);
+    border:1px solid color-mix(in srgb,var(--warn) 42%,var(--line));
+    background:color-mix(in srgb,var(--warn-soft) 60%,var(--surface));
+    color:var(--fg); font-size:12px; line-height:1.45;
+  }
+  .ac-lock-notice span { flex:1 1 220px; }
   .switch-row input[type="checkbox"] {
     appearance:none; -webkit-appearance:none; display:block; position:relative;
     width:38px!important; min-width:38px; height:22px; min-height:22px; flex:0 0 38px; align-self:center;
@@ -1921,7 +1941,6 @@
     .option-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
   }
   @media(max-width:860px) {
-    #col-source-ref-wrap { grid-column:auto; }
     main { padding:20px 18px; }
     .page-context { align-items:center; }
     .page-context h2 { font-size:20px; }
@@ -2853,7 +2872,7 @@
   .mx-cmt-like svg { width:12px !important; height:12px !important; }
 
   .mx-split-detail {
-    position:sticky; top:84px; max-height:calc(100vh - 104px); overflow-y:auto;
+    position:sticky; top:calc(var(--header-h) + 16px); max-height:calc(100vh - var(--header-h) - 32px); overflow-y:auto;
     border-radius:var(--r); background:var(--surface-card, var(--surface));
     border:1px solid var(--border-card, var(--line)); box-shadow:var(--sh-sm); padding:14px;
   }
@@ -2936,7 +2955,9 @@
   .mx-file-pill button:hover { background:var(--danger-soft); color:var(--danger); }
   .mx-file-pill button svg { width:12px !important; height:12px !important; }
   .mx-inline-warn { display:flex; align-items:center; gap:7px; padding:8px 11px; border-radius:9px; background:var(--warn-soft); color:var(--warn); font-size:12px; }
+  .mx-pub-submit-box { display:flex; flex-direction:column; gap:8px; }
   .mx-pub-submit-box button { width:100%; justify-content:center; }
+  .mx-cover-pill img { width:28px; height:20px; border-radius:4px; object-fit:cover; }
 
   .mx-empty-box {
     padding:36px 20px; text-align:center; display:grid; justify-items:center; gap:8px;
@@ -3688,6 +3709,152 @@
   @media(max-width:680px) {
     .ai-source-seg { grid-template-columns:1fr; }
   }
+
+
+  /* ── 统一进度条增强（确定/流光不确定/语义配色）与活动任务中心 ── */
+  .progress-track { position:relative; }
+  .progress-track.is-compact { height:5px; }
+  .progress-fill.tone-ok { background:linear-gradient(90deg,var(--success),#34d399); }
+  .progress-fill.tone-warn { background:linear-gradient(90deg,var(--warn),#fbbf24); }
+  .progress-fill.tone-danger { background:linear-gradient(90deg,var(--danger),#fb7185); }
+  .progress-track.is-indeterminate .progress-fill {
+    position:absolute; inset:0 auto 0 0; width:38%;
+    animation:progressSlide 1.35s cubic-bezier(.4,0,.2,1) infinite;
+  }
+  @keyframes progressSlide { 0% { transform:translateX(-110%); } 100% { transform:translateX(310%); } }
+  .progress-num { font-variant-numeric:tabular-nums; }
+  @media (prefers-reduced-motion: reduce) {
+    .progress-track.is-indeterminate .progress-fill { animation:none; width:100%; opacity:.45; }
+  }
+
+  .activity-trigger {
+    position:relative; display:inline-flex; align-items:center; gap:7px; padding:0 11px; min-height:34px;
+    border-radius:999px; font-size:12.5px; font-weight:580; overflow:hidden;
+  }
+  .activity-trigger .act-dot {
+    width:7px; height:7px; border-radius:50%; background:var(--mut); opacity:.55; flex:0 0 auto;
+    transition:background .2s var(--ease), transform .2s var(--ease);
+  }
+  .activity-trigger.is-active { border-color:var(--acc-ring); color:var(--fg-strong); background:var(--acc-soft); }
+  .activity-trigger.is-active .act-dot { background:var(--acc); opacity:1; box-shadow:0 0 0 3px var(--acc-soft); animation:actPulse 1.6s ease-in-out infinite; }
+  .activity-trigger.is-warn { border-color:color-mix(in srgb,var(--warn) 55%,transparent); background:color-mix(in srgb,var(--warn) 12%,transparent); color:var(--fg-strong); }
+  .activity-trigger.is-warn .act-dot { background:var(--warn); opacity:1; animation:actPulse 1.2s ease-in-out infinite; }
+  .activity-trigger.is-error .act-dot { background:var(--danger); opacity:1; }
+  .activity-trigger .act-count {
+    min-width:18px; height:18px; padding:0 5px; border-radius:999px; font:650 11px/18px var(--mono);
+    background:var(--surface-3); color:var(--fg); text-align:center;
+  }
+  .activity-trigger.is-active .act-count { background:var(--acc); color:#fff; }
+  .activity-trigger.is-warn .act-count { background:var(--warn); color:#111; }
+  .activity-trigger .act-mini-bar {
+    position:absolute; left:0; right:0; bottom:0; height:2px; background:transparent; opacity:0; transition:opacity .2s;
+  }
+  .activity-trigger .act-mini-bar.on { opacity:1; }
+  .activity-trigger .act-mini-bar i { display:block; height:100%; width:0; background:var(--acc); transition:width .25s var(--ease); }
+  .activity-trigger .act-mini-bar.indeterminate i { width:40%!important; animation:progressSlide 1.35s cubic-bezier(.4,0,.2,1) infinite; }
+  @keyframes actPulse { 0%,100% { transform:scale(1); opacity:1; } 50% { transform:scale(1.32); opacity:.55; } }
+
+  .activity-drawer {
+    position:fixed; top:calc(var(--header-h) + 6px); right:18px; width:min(440px,calc(100vw - 24px)); max-height:min(76vh,680px);
+    z-index:220; display:flex; flex-direction:column; border-radius:14px;
+    background:var(--surface); border:1px solid var(--line); box-shadow:0 22px 48px -16px rgba(0,0,0,.45);
+    overflow:hidden; animation:actDrop .18s var(--ease);
+  }
+  .activity-drawer[hidden] { display:none!important; }
+  @keyframes actDrop { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:none; } }
+  .activity-drawer-head {
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:12px 14px; border-bottom:1px solid var(--line-soft); background:var(--surface-2);
+  }
+  .activity-drawer-title { min-width:0; display:grid; gap:2px; }
+  .activity-drawer-title b { font-size:14px; color:var(--fg-strong); }
+  .activity-drawer-title span { font-size:11.5px; }
+  .activity-drawer-head-actions { display:flex; align-items:center; gap:6px; flex-shrink:0; }
+  .activity-drawer-body { overflow:auto; padding:12px 14px; display:grid; gap:14px; }
+  .act-empty { display:grid; justify-items:center; text-align:center; gap:6px; padding:26px 14px; color:var(--mut); }
+  .act-empty b { color:var(--fg-strong); font-size:13.5px; }
+  .act-empty span { font-size:12px; line-height:1.5; max-width:290px; }
+  .act-group { display:grid; gap:8px; }
+  .act-group-title {
+    margin:0; font-size:11.5px; font-weight:650; color:var(--mut); letter-spacing:.3px;
+    display:flex; align-items:center; justify-content:space-between;
+  }
+  .act-group-title span { font-family:var(--mono); opacity:.8; }
+  .act-list { display:grid; gap:8px; }
+  .act-item {
+    display:grid; gap:6px; padding:10px 12px; border-radius:10px;
+    background:var(--surface-2); border:1px solid var(--line-soft);
+  }
+  .act-item.tone-warn { border-color:color-mix(in srgb,var(--warn) 48%,transparent); background:color-mix(in srgb,var(--warn) 6%,var(--surface-2)); }
+  .act-item.tone-danger { border-color:color-mix(in srgb,var(--danger) 45%,transparent); }
+  .act-item-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .act-item-badges { display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+  .act-item-pct { font:650 11.5px/1 var(--mono); color:var(--fg-strong); white-space:nowrap; }
+  .act-item-title { font-size:13px; font-weight:600; color:var(--fg-strong); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .act-item-phase { font-size:12px; color:var(--fg); line-height:1.4; overflow-wrap:anywhere; }
+  .act-item-meta { font-size:11.5px; color:var(--mut); }
+  .act-item-err { font-size:11.5px; color:var(--danger); line-height:1.4; overflow-wrap:anywhere; }
+  .act-item-actions { display:flex; justify-content:flex-end; gap:6px; margin-top:2px; }
+
+  .share-live-list { display:grid; gap:10px; }
+  .share-live-card {
+    display:grid; gap:8px; padding:12px 14px; border-radius:12px;
+    background:var(--surface-2); border:1px solid var(--line);
+  }
+  .share-live-card.is-warn { border-color:color-mix(in srgb,var(--warn) 50%,transparent); }
+  .share-live-card.is-failed { border-color:color-mix(in srgb,var(--danger) 50%,transparent); }
+  .share-live-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .share-live-title { font-size:13.5px; font-weight:620; color:var(--fg-strong); min-width:0; overflow-wrap:anywhere; }
+  .share-live-sub { font-size:12px; color:var(--mut); display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .share-live-items { display:grid; gap:6px; margin-top:2px; }
+  .share-live-subitem {
+    display:grid; gap:4px; padding:8px 10px; border-radius:8px;
+    background:var(--surface); border:1px solid var(--line-soft);
+  }
+  .share-live-subitem-row { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; }
+
+  .pub-stepper { display:flex; align-items:center; gap:4px; flex-wrap:wrap; margin-top:5px; }
+  .pub-step {
+    display:inline-flex; align-items:center; gap:4px; padding:2px 7px; border-radius:999px;
+    font-size:10.5px; background:var(--surface-3); color:var(--mut); border:1px solid var(--line-soft);
+  }
+  .pub-step.done { background:color-mix(in srgb,var(--success) 14%,transparent); color:var(--success); border-color:color-mix(in srgb,var(--success) 35%,transparent); }
+  .pub-step.active { background:var(--acc-soft); color:var(--acc); border-color:var(--acc-ring); font-weight:600; }
+  .pub-step.warn { background:color-mix(in srgb,var(--warn) 16%,transparent); color:var(--warn); border-color:color-mix(in srgb,var(--warn) 45%,transparent); font-weight:600; }
+  .pub-upload-progress { display:grid; gap:5px; margin-top:8px; padding:9px 11px; border-radius:9px; background:var(--surface-2); border:1px solid var(--line-soft); }
+  .pub-upload-progress-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; color:var(--fg); }
+
+  .queue-table .queue-col-progress { width:158px; }
+  .queue-progress-cell { display:grid; gap:4px; min-width:128px; }
+  .queue-progress-head { display:flex; align-items:center; justify-content:space-between; gap:6px; font-size:11px; color:var(--mut); }
+  .queue-progress-head b { color:var(--fg-strong); font-family:var(--mono); }
+  .dl-inline-prog { display:grid; gap:4px; margin-top:5px; min-width:120px; }
+  .dl-inline-prog-head { display:flex; justify-content:space-between; gap:6px; font-size:11px; color:var(--mut); }
+  .mx-batch-progress-card {
+    display:grid; gap:8px; padding:12px 14px; border-radius:12px; margin-bottom:12px;
+    background:var(--surface); border:1px solid var(--acc-ring); box-shadow:var(--sh-sm);
+  }
+  .mx-batch-progress-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .mx-batch-progress-stats { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12px; color:var(--mut); }
+  .mx-batch-progress-stats b { color:var(--fg-strong); }
+
+  .queue-progress-head span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .queue-progress-meta, .dl-inline-prog-meta { font-size:11px; color:var(--mut); line-height:1.35; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* ── 自定义封面与草稿徽章 ── */
+  .pub-cover-drop .filepick-cta { padding:12px 14px; font-size:12.5px; }
+  .pub-cover-drop.compact .filepick-cta { padding:9px 10px; font-size:12px; }
+  .pub-meta-badges { display:flex; flex-wrap:wrap; align-items:center; gap:5px; margin-top:4px; }
+  .pub-badge-mini { display:inline-flex; align-items:center; gap:4px; padding:1px 6px; border-radius:999px; font-size:11px; line-height:1.45; border:1px solid var(--line); background:var(--surface-2); color:var(--mut); white-space:nowrap; }
+  .pub-badge-mini.draft { border-color:color-mix(in srgb,var(--warn) 42%,transparent); background:color-mix(in srgb,var(--warn) 14%,transparent); color:var(--warn); }
+  .pub-badge-mini.cover { border-color:var(--acc-ring); background:var(--acc-soft); color:var(--acc); }
+  .pub-cover-thumb { width:26px; height:26px; border-radius:5px; object-fit:cover; border:1px solid var(--line); cursor:pointer; vertical-align:middle; transition:transform .14s var(--ease), border-color .14s var(--ease); }
+  .pub-cover-thumb:hover { transform:scale(1.1); border-color:var(--acc); }
+  .ep-cover-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:8px 10px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--bg); }
+  .ep-cover-preview { width:56px; height:56px; border-radius:6px; object-fit:cover; border:1px solid var(--line); background:var(--surface-2); flex:0 0 auto; cursor:pointer; }
+  .ep-cover-meta { flex:1 1 160px; min-width:0; display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--mut); }
+  .ep-cover-meta b { color:var(--fg-strong); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pill.draft { background:color-mix(in srgb,var(--mut) 16%,transparent); color:var(--fg-strong); border:1px solid color-mix(in srgb,var(--mut) 35%,transparent); }
 </style>
 <link rel="stylesheet" href="/static/appearance.css">
 <link rel="stylesheet" href="/static/workbench.css">
@@ -3769,38 +3936,60 @@
 
 <header>
   <div class="header-inner">
-  <button class="ghost mobile-nav-toggle" id="nav-toggle" type="button" aria-label="打开导航" aria-controls="main-sidebar" aria-expanded="false"><svg aria-hidden="true"><use href="#i-menu"/></svg></button>
-  <div class="brand">
-    <span class="brand-mark" aria-hidden="true"><svg><use href="#i-brand"/></svg></span>
-    <div class="brand-copy">
-      <h1>CreatorHub<span class="badge-lite">LITE</span></h1>
-      <span class="brand-sub">多平台内容工作台</span>
+    <button class="ghost mobile-nav-toggle" id="nav-toggle" type="button" aria-label="打开导航" aria-controls="main-sidebar" aria-expanded="false"><svg aria-hidden="true"><use href="#i-menu"/></svg></button>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><svg><use href="#i-brand"/></svg></span>
+      <div class="brand-copy">
+        <h1>CreatorHub<span class="badge-lite">LITE</span></h1>
+        <span class="brand-sub">多平台内容工作台</span>
+      </div>
     </div>
-  </div>
-  <div class="pswitch" role="tablist" aria-label="平台切换">
-    <button role="tab" data-pf="all" data-base-label="全平台" onclick="switchPlatform('all')" title="跨 10 大平台全局汇总与矩阵管理"><svg class="ps-ic" aria-hidden="true"><use href="#i-globe"/></svg><span class="ps-lbl">全平台</span></button>
-    <button role="tab" data-pf="douyin" onclick="switchPlatform('douyin')">抖音</button>
-    <button role="tab" data-pf="xhs" onclick="switchPlatform('xhs')">小红书</button>
-    <button role="tab" data-pf="rednote" onclick="switchPlatform('rednote')" title="海外小红书 (Rednote)">海外小红书</button>
-    <button role="tab" data-pf="kuaishou" onclick="switchPlatform('kuaishou')">快手</button>
-    <button role="tab" data-pf="shipinhao" onclick="switchPlatform('shipinhao')">视频号</button>
-    <button role="tab" data-pf="tiktok" onclick="switchPlatform('tiktok')">TikTok</button>
-    <button role="tab" data-pf="bilibili" onclick="switchPlatform('bilibili')">哔哩哔哩</button>
-    <button role="tab" data-pf="instagram" onclick="switchPlatform('instagram')">Instagram</button>
-    <button role="tab" data-pf="twitter" onclick="switchPlatform('twitter')">Twitter</button>
-    <button role="tab" data-pf="facebook" onclick="switchPlatform('facebook')">Facebook</button>
-  </div>
-  <div class="header-actions">
-    <button class="ghost command-trigger" id="command-trigger" type="button" aria-label="搜索功能" aria-haspopup="dialog" aria-controls="command-dialog" aria-keyshortcuts="Control+k Meta+k" title="搜索功能（Ctrl / ⌘ K）"><svg aria-hidden="true"><use href="#i-logo"/></svg><span>搜索功能</span><kbd>Ctrl K</kbd></button>
-    <div class="theme-switch" role="group" aria-label="画面主题">
-      <button type="button" data-theme-choice="light" aria-label="日间主题" aria-pressed="false" title="日间主题"><svg aria-hidden="true"><use href="#i-sun"/></svg></button>
-      <button type="button" data-theme-choice="dark" aria-label="夜间主题" aria-pressed="false" title="夜间主题"><svg aria-hidden="true"><use href="#i-moon"/></svg></button>
-      <button type="button" data-theme-choice="system" aria-label="跟随系统主题" aria-pressed="true" title="跟随系统"><svg aria-hidden="true"><use href="#i-monitor"/></svg></button>
+    <div class="pswitch-host" id="pswitch-host">
+      <div class="pswitch" role="tablist" aria-label="平台切换">
+        <button role="tab" data-pf="all" data-base-label="全平台" onclick="switchPlatform('all')" title="跨 11 大平台全局汇总与矩阵管理"><svg class="ps-ic" aria-hidden="true"><use href="#i-globe"/></svg><span class="ps-lbl">全平台</span></button>
+        <button role="tab" data-pf="douyin" onclick="switchPlatform('douyin')">抖音</button>
+        <button role="tab" data-pf="xhs" onclick="switchPlatform('xhs')">小红书</button>
+        <button role="tab" data-pf="rednote" onclick="switchPlatform('rednote')" title="海外小红书 (Rednote)">海外小红书</button>
+        <button role="tab" data-pf="kuaishou" onclick="switchPlatform('kuaishou')">快手</button>
+        <button role="tab" data-pf="shipinhao" onclick="switchPlatform('shipinhao')">视频号</button>
+        <button role="tab" data-pf="tiktok" onclick="switchPlatform('tiktok')">TikTok</button>
+        <button role="tab" data-pf="bilibili" onclick="switchPlatform('bilibili')">哔哩哔哩</button>
+        <button role="tab" data-pf="instagram" onclick="switchPlatform('instagram')">Instagram</button>
+        <button role="tab" data-pf="twitter" onclick="switchPlatform('twitter')">Twitter</button>
+        <button role="tab" data-pf="facebook" onclick="switchPlatform('facebook')">Facebook</button>
+        <button role="tab" data-pf="youtube" onclick="switchPlatform('youtube')">YouTube</button>
+        <button type="button" class="pswitch-more-btn" id="pswitch-more-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="pswitch-popover" title="展开更多平台" hidden><span id="pswitch-more-label">+0</span><span class="ps-more-dot" id="pswitch-more-dot" hidden></span><svg aria-hidden="true"><use href="#i-chevron"/></svg></button>
+      </div>
     </div>
-  </div>
-  <span class="engine" id="engine-status" role="status" aria-live="polite" title="后台任务引擎正在运行"><span class="dot live"></span><span class="engine-label">服务已连接</span></span>
+    <div class="header-actions">
+      <button class="ghost command-trigger" id="command-trigger" type="button" aria-label="搜索功能" aria-haspopup="dialog" aria-controls="command-dialog" aria-keyshortcuts="Control+k Meta+k" title="搜索功能（Ctrl / ⌘ K）"><svg aria-hidden="true"><use href="#i-logo"/></svg><kbd>Ctrl K</kbd></button>
+      <button class="ghost activity-trigger is-idle" id="activity-trigger" type="button" aria-label="活动任务中心" aria-expanded="false" aria-controls="activity-drawer" title="活动任务中心 · 查看后台实时进度" onclick="window.CreatorHubProgress?.toggleDrawer()">
+        <svg class="act-ic" aria-hidden="true"><use href="#i-bolt"/></svg>
+        <span class="act-dot" aria-hidden="true"></span>
+        <span class="act-text" id="activity-trigger-label">活动中心</span>
+        <span class="act-count" id="activity-trigger-count" hidden>0</span>
+        <span class="act-mini-bar" id="activity-trigger-bar" aria-hidden="true"><i></i></span>
+      </button>
+      <button class="ghost theme-cycle-btn" id="theme-cycle-btn" type="button" aria-label="切换画面主题" title="画面主题：跟随系统（点击切换）"><svg aria-hidden="true"><use href="#i-monitor"/></svg></button>
+      <span class="engine" id="engine-status" role="status" aria-live="polite" title="服务已连接 · 后台任务引擎运行中"><span class="dot live"></span><span class="engine-label">服务已连接</span></span>
+    </div>
   </div>
 </header>
+<div id="pswitch-popover" class="pswitch-popover" role="dialog" aria-label="切换平台" hidden></div>
+<aside id="activity-drawer" class="activity-drawer" role="region" aria-label="活动任务中心" hidden>
+  <div class="activity-drawer-head">
+    <div class="activity-drawer-title">
+      <b>活动任务中心</b>
+      <span class="mut" id="activity-drawer-sub">实时同步后台任务进度</span>
+    </div>
+    <div class="activity-drawer-head-actions">
+      <button type="button" class="ghost sm" id="activity-clear-btn" onclick="window.CreatorHubProgress?.clearFinished()" hidden>清空已结束</button>
+      <button type="button" class="ghost sm" onclick="window.CreatorHubProgress?.toggleDrawer(false);switchTab('queue',true)">全部队列</button>
+      <button type="button" class="ghost sm icon-only" onclick="window.CreatorHubProgress?.toggleDrawer(false)" aria-label="关闭活动任务中心"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+    </div>
+  </div>
+  <div class="activity-drawer-body" id="activity-drawer-body"></div>
+</aside>
 
 <div class="shell">
 <button class="nav-backdrop" id="nav-backdrop" type="button" tabindex="-1" aria-label="关闭导航"></button>
@@ -3811,13 +4000,14 @@
     <button class="navitem" data-tab="media-hub" onclick="switchTab('media-hub', true)"><svg><use href="#i-image"/></svg><span class="nav-label">汇总预览库</span></button>
     <button class="navitem" data-tab="accounts" onclick="switchTab('accounts', true)"><svg><use href="#i-card"/></svg><span class="nav-label">账号矩阵</span><span class="nav-badge" id="tb-acc">0</span></button>
     <div class="nav-sep single-pf-only" id="nav-sep-collect">采集与监控</div>
-    <button class="navitem single-pf-only notsh-only" data-tab="monitors" onclick="switchTab('monitors', true)"><svg><use href="#i-target"/></svg><span class="nav-label">作品监控</span><span class="nav-badge" id="tb-mon">0</span></button>
+    <button class="navitem single-pf-only notsh-only" data-tab="monitors" onclick="switchTab('monitors', true)"><svg><use href="#i-target"/></svg><span class="nav-label">主页作品监控</span><span class="nav-badge" id="tb-mon">0</span></button>
     <button class="navitem single-pf-only collect-only" data-tab="collections" onclick="switchTab('collections', true)"><svg><use href="#i-hash"/></svg><span class="nav-label" id="nav-collections-label">关键词采集</span><span class="nav-badge" id="tb-col">0</span></button>
     <button class="navitem single-pf-only notsh-only" data-tab="comments" onclick="switchTab('comments', true)"><svg><use href="#i-msg"/></svg><span class="nav-label">评论监控</span><span class="nav-badge" id="tb-watch">0</span></button>
     <button class="navitem single-pf-only danmaku-only" data-tab="danmaku" onclick="switchTab('danmaku', true)"><svg><use href="#i-captions"/></svg><span class="nav-label">弹幕监控</span><span class="nav-badge" id="tb-danmaku">0</span></button>
     <div class="nav-sep">运营与分发</div>
     <button class="navitem" data-tab="hub" onclick="switchTab('hub', true)"><svg><use href="#i-library"/></svg><span class="nav-label" id="nav-hub-label">矩阵数据与私信</span></button>
     <button class="navitem single-pf-only tk-only" data-tab="tiktok-tools" onclick="switchTab('tiktok-tools', true)"><svg><use href="#i-user"/></svg><span class="nav-label">用户互动</span></button>
+    <button class="navitem single-pf-only yt-only" data-tab="youtube-tools" onclick="switchTab('youtube-tools', true)"><svg><use href="#i-play"/></svg><span class="nav-label">互动与养号</span></button>
     <button class="navitem pub-only" data-tab="publish" onclick="switchTab('publish', true)"><svg><use href="#i-send"/></svg><span class="nav-label" id="nav-publish-label">内容发布</span><span class="nav-badge" id="tb-pub">0</span></button>
     <button class="navitem single-pf-only notsh-only tk-hide rn-hide" data-tab="autocomment" onclick="switchTab('autocomment', true)"><svg><use href="#i-automation"/></svg><span class="nav-label">自动评论</span><span class="nav-badge" id="tb-ac">0</span></button>
     <button class="navitem" data-tab="queue" onclick="switchTab('queue', true)"><svg><use href="#i-list"/></svg><span class="nav-label">任务队列</span><span class="nav-badge" id="tb-queue">0</span></button>
@@ -3868,7 +4058,7 @@
         </button>
         <button class="quick-action notsh-only" type="button" onclick="switchTab('monitors', true)">
           <span class="qa-ic"><svg><use href="#i-target"/></svg></span>
-          <span class="qa-copy"><b>添加作品监控</b><span>设置目标与自动下载策略</span></span>
+          <span class="qa-copy"><b>添加主页作品监控</b><span>持续追踪创作者主页新作品与下载</span></span>
           <svg><use href="#i-next"/></svg>
         </button>
         <button class="quick-action" type="button" onclick="switchTab('share-download', true)">
@@ -3924,6 +4114,8 @@
         <button class="ghost tw-only" onclick="toggleCookie()">Token / Cookie 登录</button>
         <button class="fb-only" onclick="startFacebookLogin()"><svg><use href="#i-login"/></svg>Facebook 登录</button>
         <button class="ghost fb-only" onclick="toggleCookie()">Cookie 粘贴登录</button>
+        <button class="yt-only" onclick="startYouTubeLogin()"><svg><use href="#i-login"/></svg>YouTube 登录</button>
+        <button class="ghost yt-only" onclick="toggleCookie()">Cookie 粘贴登录</button>
         <button class="ghost ig-only" onclick="toggleCookie()">Cookie 粘贴</button>
       </div>
       <div id="qrbox" style="display:none;margin-bottom:14px">
@@ -4103,6 +4295,183 @@
         <div class="form-field"><label for="tk-target-text">目标评论原文 <span class="field-scope">回复任务必填，用于在页面定位回复区</span></label><textarea id="tk-target-text" rows="2" placeholder="顶层评论可留空"></textarea></div>
         <div class="form-actions"><label class="check-row"><input id="tk-comment-run-now" type="checkbox"><span>立即执行</span></label><span class="actions-spacer"></span><button type="button" onclick="createTikTokCommentTask()"><svg><use href="#i-send"/></svg>创建评论任务</button></div>
         <div class="form-note"><svg aria-hidden="true"><use href="#i-info"/></svg><span>这是主动写入工具，因此与账号资料分开；任务结果在「任务队列」查看。</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section data-panel="youtube-tools" class="yt-only">
+    <div class="platform-callout" role="note">
+      <svg aria-hidden="true"><use href="#i-info"/></svg>
+      <div><b>YouTube 互动与观看养号工具</b><p>在账号独立隔离浏览器中执行视频/评论互动、按真实播放进度观看、关键词搜索浏览养号、筛选发现与品牌频道切换；所有写操作均受统一风控节流与审计记录保护，绝不自动绕过 Google 验证。</p></div>
+    </div>
+
+    <div class="card" data-section="yt-interact">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-heart-up"/></svg></span>
+        <h2>YouTube 主动互动 <span class="sub">点赞 / 点踩 / 订阅 / 评论回复 / 批量赞评论 / 修改频道名</span></h2>
+      </div>
+      <div class="stack">
+        <div class="form-grid cols-auto">
+          <div class="form-field"><label for="yt-act-account">执行账号</label><select id="yt-act-account"></select></div>
+          <div class="form-field"><label for="yt-act-type">互动动作</label>
+            <select id="yt-act-type" onchange="syncYouTubeInteractForm()">
+              <option value="like">视频点赞 (Like)</option>
+              <option value="unlike">取消视频点赞 (Unlike)</option>
+              <option value="dislike">视频点踩 (Dislike)</option>
+              <option value="undislike">取消视频点踩 (Undislike)</option>
+              <option value="subscribe">订阅频道 (Subscribe)</option>
+              <option value="unsubscribe">取消订阅频道 (Unsubscribe)</option>
+              <option value="comment">发表视频主评论</option>
+              <option value="reply_comment">回复指定评论 (?lc= 或评论 ID)</option>
+              <option value="like_comment">点赞单条高亮评论 (?lc=)</option>
+              <option value="unlike_comment">取消单条评论点赞</option>
+              <option value="like_video_comments">批量点赞视频评论区</option>
+              <option value="change_profile_name">修改频道展示名称 (Studio)</option>
+            </select>
+          </div>
+          <div class="form-field"><label for="yt-act-channel">品牌频道名称 <span class="field-scope">可选，多频道自动切换</span></label><input id="yt-act-channel" placeholder="留空使用当前默认频道"></div>
+        </div>
+        <div class="form-field" id="yt-act-target-row">
+          <label for="yt-act-target" id="yt-act-target-label">目标链接或 ID</label>
+          <input id="yt-act-target" placeholder="https://www.youtube.com/watch?v=...、youtu.be/...、/shorts/... 或 11 位视频 ID">
+        </div>
+        <div class="form-grid cols-auto hidden" id="yt-act-cid-row">
+          <div class="form-field"><label for="yt-act-cid">目标评论 ID <span class="field-scope">链接已含 ?lc= 时可留空</span></label><input id="yt-act-cid" placeholder="例如 Ugzx..."></div>
+        </div>
+        <div class="form-field hidden" id="yt-act-comment-row">
+          <label for="yt-act-comment">评论 / 回复内容</label>
+          <textarea id="yt-act-comment" rows="3" placeholder="输入最终要发布的评论或回复文案（不支持未展开的 {a|b} 模板）"></textarea>
+        </div>
+        <div class="form-grid cols-auto hidden" id="yt-act-batch-row">
+          <div class="form-field"><label for="yt-act-like-count">点赞条数 (1–20)</label><input id="yt-act-like-count" type="number" min="1" max="20" value="3"></div>
+          <div class="form-field"><label>挑选方式</label><label class="check-row"><input id="yt-act-random" type="checkbox"><span>在已加载评论中随机挑选点赞</span></label></div>
+        </div>
+        <div class="form-field hidden" id="yt-act-name-row">
+          <label for="yt-act-new-name">新的频道展示名称</label>
+          <input id="yt-act-new-name" maxlength="60" placeholder="输入新的 YouTube 频道名称">
+        </div>
+        <div class="form-actions">
+          <span class="status-text" id="yt-act-status" role="status" aria-live="polite"></span>
+          <button type="button" onclick="runYouTubeInteract()"><svg><use href="#i-send"/></svg>打开浏览器执行互动</button>
+        </div>
+        <div class="form-note"><svg aria-hidden="true"><use href="#i-info"/></svg><span>写操作会打开该账号独立的可见浏览器窗口按拟人节奏执行，并在操作完成后记录到风控审计与任务记录。</span></div>
+      </div>
+    </div>
+
+    <div class="card" data-section="yt-watch">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-play"/></svg></span>
+        <h2>真实观看视频 <span class="sub">按真实播放器进度观看、自动跳过广告并联动赞 / 订 / 评</span></h2>
+      </div>
+      <div class="stack">
+        <div class="form-grid cols-auto">
+          <div class="form-field"><label for="yt-watch-account">执行账号</label><select id="yt-watch-account"></select></div>
+          <div class="form-field"><label for="yt-watch-channel">品牌频道名称 <span class="field-scope">可选</span></label><input id="yt-watch-channel" placeholder="留空使用当前默认频道"></div>
+          <div class="form-field"><label for="yt-watch-mode">观看时长方式</label>
+            <select id="yt-watch-mode" onchange="syncYouTubeWatchForm()">
+              <option value="seconds">按固定时长（秒）</option>
+              <option value="percentage">按视频总时长百分比</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-field">
+          <label for="yt-watch-url">目标视频 / Shorts 链接或 11 位 ID</label>
+          <input id="yt-watch-url" placeholder="https://www.youtube.com/watch?v=... 或 https://www.youtube.com/shorts/...">
+        </div>
+        <div class="form-grid cols-auto">
+          <div class="form-field" id="yt-watch-sec-row"><label for="yt-watch-seconds">观看秒数 (5–600)</label><input id="yt-watch-seconds" type="number" min="5" max="600" value="35"></div>
+          <div class="form-field hidden" id="yt-watch-pct-row"><label for="yt-watch-pct">目标完播比例 % (5–100)</label><input id="yt-watch-pct" type="number" min="5" max="100" value="50"></div>
+          <div class="form-field hidden" id="yt-watch-limit-row"><label for="yt-watch-pct-limit">单次最长上限秒数 (10–600)</label><input id="yt-watch-pct-limit" type="number" min="10" max="600" value="120"></div>
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:14px">
+          <label class="check-row"><input id="yt-watch-skip-ads" type="checkbox" checked><span>自动跳过前贴/插播广告</span></label>
+          <label class="check-row"><input id="yt-watch-like" type="checkbox"><span>观看中途随机点赞视频</span></label>
+          <label class="check-row"><input id="yt-watch-sub" type="checkbox"><span>观看中途随机订阅频道</span></label>
+        </div>
+        <div class="form-field">
+          <label for="yt-watch-comment">完播后追加评论 <span class="field-scope">可选，留空不评论</span></label>
+          <textarea id="yt-watch-comment" rows="2" placeholder="观看完成后顺手发表一条评论（留空跳过）"></textarea>
+        </div>
+        <div class="form-actions">
+          <span class="status-text" id="yt-watch-status" role="status" aria-live="polite"></span>
+          <button type="button" onclick="runYouTubeWatch()"><svg><use href="#i-play"/></svg>开始真实观看</button>
+        </div>
+        <div id="yt-watch-result" class="hidden"></div>
+      </div>
+    </div>
+
+    <div class="card" data-section="yt-warmup">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-sparkles"/></svg></span>
+        <h2>关键词搜索养号 <span class="sub">模拟正常用户搜索、滚动浏览、随机观看与概率点赞</span></h2>
+      </div>
+      <div class="stack">
+        <div class="form-grid cols-auto">
+          <div class="form-field"><label for="yt-warmup-account">执行账号</label><select id="yt-warmup-account"></select></div>
+          <div class="form-field"><label for="yt-warmup-keyword">养号兴趣关键词</label><input id="yt-warmup-keyword" placeholder="例如 tech review、lofi music、编程教程" onkeydown="if(event.key==='Enter'){event.preventDefault();runYouTubeWarmup()}"></div>
+          <div class="form-field"><label for="yt-warmup-count">随机观看视频数 (1–8)</label><input id="yt-warmup-count" type="number" min="1" max="8" value="2"></div>
+          <div class="form-field"><label for="yt-warmup-sec">单条基准观看秒数 (5–180)</label><input id="yt-warmup-sec" type="number" min="5" max="180" value="20"></div>
+          <div class="form-field"><label for="yt-warmup-prob">点赞概率 % (0–100)</label><input id="yt-warmup-prob" type="number" min="0" max="100" value="50"></div>
+        </div>
+        <div class="form-actions">
+          <span class="status-text" id="yt-warmup-status" role="status" aria-live="polite"></span>
+          <button type="button" onclick="runYouTubeWarmup()"><svg><use href="#i-sparkles"/></svg>启动养号浏览</button>
+        </div>
+        <div class="table-wrap"><table aria-label="YouTube 养号观看记录"><thead><tr><th>已观看视频链接</th><th>观看时长</th><th>点赞状态</th></tr></thead><tbody id="yt-warmup-results"></tbody></table></div>
+        <div class="form-note"><svg aria-hidden="true"><use href="#i-info"/></svg><span>系统会打开可见浏览器进入首页、搜索关键词、拟人滚动列表并随机挑选视频播放（自动跳过广告），实际单条时长会在基准秒数附近随机浮动。</span></div>
+      </div>
+    </div>
+
+    <div class="card" data-section="yt-discover">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-search"/></svg></span>
+        <h2>筛选发现与多频道管理 <span class="sub">带条件搜索视频/频道并一键联动互动，或同步品牌频道列表</span></h2>
+      </div>
+      <div class="stack">
+        <div class="form-grid cols-auto">
+          <div class="form-field"><label for="yt-search-account">执行账号</label><select id="yt-search-account"></select></div>
+          <div class="form-field"><label for="yt-search-query">搜索关键词</label><input id="yt-search-query" type="search" placeholder="输入主题词、频道名或 #标签" onkeydown="if(event.key==='Enter'){event.preventDefault();searchYouTubeTools()}"></div>
+          <div class="form-field"><label for="yt-search-scope">搜索范围</label>
+            <select id="yt-search-scope" onchange="syncYouTubeSearchForm()">
+              <option value="videos">视频 / Shorts</option>
+              <option value="channels">频道</option>
+            </select>
+          </div>
+          <div class="form-field" id="yt-search-date-row"><label for="yt-search-date">上传时间</label>
+            <select id="yt-search-date">
+              <option value="">不限</option>
+              <option value="hour">1 小时内</option>
+              <option value="today">今天</option>
+              <option value="week">本周</option>
+              <option value="month">本月</option>
+              <option value="year">今年</option>
+            </select>
+          </div>
+          <div class="form-field" id="yt-search-dur-row"><label for="yt-search-dur">视频时长</label>
+            <select id="yt-search-dur">
+              <option value="">不限</option>
+              <option value="short">短（&lt; 4 分钟）</option>
+              <option value="medium">中（4–20 分钟）</option>
+              <option value="long">长（&gt; 20 分钟）</option>
+            </select>
+          </div>
+          <div class="form-field" id="yt-search-sort-row"><label for="yt-search-sort">排序方式</label>
+            <select id="yt-search-sort">
+              <option value="">综合相关</option>
+              <option value="date">最新发布</option>
+              <option value="views">播放最多</option>
+              <option value="rating">评分最高</option>
+            </select>
+          </div>
+          <div class="form-field"><label for="yt-search-limit">结果上限</label><input id="yt-search-limit" type="number" min="1" max="120" value="20"></div>
+        </div>
+        <div class="form-actions">
+          <span class="status-text" id="yt-search-status" role="status" aria-live="polite"></span>
+          <button type="button" class="ghost" onclick="syncYouTubeManagedChannels()"><svg><use href="#i-refresh"/></svg>同步账号下多频道</button>
+          <button type="button" onclick="searchYouTubeTools()"><svg><use href="#i-search"/></svg>搜索</button>
+        </div>
+        <div class="table-wrap"><table aria-label="YouTube 搜索结果"><thead><tr><th>标题 / 频道</th><th>创作者 / 标识</th><th>数据</th><th style="text-align:right">快捷操作</th></tr></thead><tbody id="yt-search-results"></tbody></table></div>
+        <div class="table-wrap"><table aria-label="当前账号可管理频道"><thead><tr><th>频道名称</th><th>Handle / 频道 ID</th><th>订阅数</th><th>状态</th><th style="text-align:right">操作</th></tr></thead><tbody id="yt-channel-results"></tbody></table></div>
       </div>
     </div>
   </section>
@@ -4491,7 +4860,7 @@
         <h2>任务明细 <span class="sub">统一查看采集、发布、评论、账号动作和下载任务</span></h2>
       </div>
       <div class="queue-toolbar" aria-label="任务队列筛选">
-        <div class="form-field"><label for="queue-platform">平台范围</label><select id="queue-platform" onchange="refreshTaskQueue(true)"><option value="current" id="queue-platform-current">当前平台</option><option value="all">全部平台</option></select></div>
+        <div class="form-field" id="queue-platform-wrap"><label for="queue-platform">平台范围</label><select id="queue-platform" onchange="refreshTaskQueue(true)"><option value="all">全部平台</option></select></div>
         <div class="form-field"><label for="queue-type">队列类型</label><select id="queue-type" onchange="refreshTaskQueue(true)"><option value="">全部队列</option><option value="collections">关键词采集</option><option value="publishes">内容发布</option><option value="comments">自动评论</option><option value="actions">账号动作</option><option value="monitor_downloads">监控下载</option><option value="collection_downloads">采集下载</option></select></div>
         <div class="form-field"><label for="queue-state">任务状态</label><select id="queue-state" onchange="refreshTaskQueue(true)"><option value="active">活动任务</option><option value="pending">等待执行</option><option value="running">正在执行</option><option value="blocked">风控延后</option><option value="failed">失败任务</option><option value="completed">已完成</option><option value="all">全部状态</option></select></div>
         <div class="form-field"><label for="queue-query">搜索</label><input id="queue-query" type="search" placeholder="任务内容、账号、错误或风控原因" onkeydown="if(event.key==='Enter'){event.preventDefault();refreshTaskQueue(true)}"></div>
@@ -4500,7 +4869,7 @@
       </div>
       <div class="table-wrap" id="queue-table-wrap">
         <table class="queue-table" aria-label="任务队列明细">
-          <thead><tr><th style="width:44px"><input type="checkbox" aria-label="选择本页全部任务" onchange="toggleTaskQueuePage(this.checked)"></th><th class="queue-col-type">队列</th><th class="queue-col-content">任务内容</th><th class="queue-col-account">账号</th><th class="queue-col-time">时间</th><th class="queue-col-status">状态</th><th class="queue-col-reason">阻塞 / 错误</th><th class="queue-col-action">操作</th></tr></thead>
+          <thead><tr><th style="width:44px"><input type="checkbox" aria-label="选择本页全部任务" onchange="toggleTaskQueuePage(this.checked)"></th><th class="queue-col-type">队列</th><th class="queue-col-content">任务内容</th><th class="queue-col-account">账号</th><th class="queue-col-time">时间</th><th class="queue-col-status">状态</th><th class="queue-col-progress">进度 / 阶段</th><th class="queue-col-reason">阻塞 / 错误</th><th class="queue-col-action">操作</th></tr></thead>
           <tbody id="queue-table"></tbody>
         </table>
       </div>
@@ -4524,41 +4893,22 @@
         <h2><span id="collection-create-title">新建关键词采集</span> <span class="sub" id="collection-create-sub">批量搜索作品并抓取评论</span></h2>
       </div>
       <div class="stack">
-        <div class="form-grid cols-4">
-          <div class="form-field"><label for="col-source">采集来源</label><select id="col-source" onchange="collectionSourceChanged()"><option value="keyword">关键词搜索</option><option value="creator">创作者主页</option><option value="favorite_all" data-xhs-source>全部收藏</option><option value="favorite_board" data-xhs-source>指定收藏夹</option><option value="account_works" data-channels-source>本账号作品</option></select></div>
-          <div class="form-field xhs-only" id="col-board-wrap" style="display:none"><label for="col-board">收藏夹</label><select id="col-board"><option value="">先选择账号并加载</option></select><p class="hint" id="col-board-help"></p></div>
-          <div class="form-field" id="col-source-ref-wrap" style="display:none">
-            <label for="col-source-ref" id="col-source-ref-label">创作者用户 ID / 主页或视频链接</label>
-            <div class="smart-target-input">
-              <input id="col-source-ref" maxlength="100000" autocomplete="off"
-                placeholder="抖音 sec_uid / 小红书 user_id / 快手 user_id 或主页链接或短链"
-                onpaste="handleCollectionCreatorPaste()" oninput="resetCollectionCreatorState()">
-              <button type="button" class="smart-target-action" onclick="normalizeCollectionCreatorTarget(this)"
-                aria-label="识别并清洗创作者链接" title="识别并提取创作者标识">
-                <svg><use href="#i-bolt"/></svg><span>识别</span>
-              </button>
-            </div>
-            <div class="smart-target-feedback" id="col-source-ref-feedback" role="status" aria-live="polite">
-              使用公开主页作品列表；视频号可粘贴 v2_...@finder、主页链接或单条视频 weixin.qq.com/sph/... 链接（自动反查作者）
-            </div>
-          </div>
-        </div>
         <div class="form-field" id="col-keywords-wrap">
           <label for="col-keywords">关键词 <span class="field-scope">必填 · 最多 20 个</span></label>
           <textarea id="col-keywords" rows="5" placeholder="每行一个关键词，例如：&#10;露营装备&#10;城市骑行&#10;夏季穿搭" aria-describedby="col-keywords-help"></textarea>
           <p class="hint" id="col-keywords-help">支持换行或逗号分隔；任务会按关键词逐个执行并自动去重。</p>
         </div>
         <div class="form-grid cols-4">
-          <div class="form-field" id="col-account-wrap"><label for="col-account">使用账号</label><select id="col-account" onchange="collectionAccountChanged()"></select></div>
+          <div class="form-field" id="col-account-wrap"><label for="col-account">使用账号</label><select id="col-account"></select></div>
           <div class="form-field"><label for="col-content-limit" id="col-content-limit-label">每词作品上限</label><input id="col-content-limit" type="number" min="1" max="100" value="20" inputmode="numeric"></div>
-          <div class="form-field"><label for="col-comment-limit">每作品评论上限</label><input id="col-comment-limit" type="number" min="0" max="200" value="20" inputmode="numeric"></div>
-          <div class="form-field dy-only"><label for="col-quality">视频画质</label><select id="col-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
+          <div class="form-field"><label for="col-comment-limit">每作品评论上限</label><input id="col-comment-limit" type="number" min="0" max="200" value="20" inputmode="numeric" oninput="applyCollectionForm()"></div>
+          <div class="form-field" id="col-quality-wrap" style="display:none"><label for="col-quality">视频画质</label><select id="col-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
         </div>
         <div class="form-grid cols-4 collection-filter-grid" aria-label="搜索深度与排序">
           <div class="form-field"><label for="col-page-limit" id="col-page-limit-label">每词采集深度 <span class="field-scope">1–40 页</span></label><input id="col-page-limit" type="number" min="1" max="40" value="12" inputmode="numeric"><p class="hint" id="col-page-help">一页对应一次搜索结果下滑。</p></div>
           <div class="form-field" id="col-sort-wrap"><label for="col-sort">搜索排序</label><select id="col-sort"><option value="general">综合排序</option><option value="latest">最新发布</option><option value="most_liked">最多点赞</option></select></div>
           <div class="form-field"><label for="col-publish-time">发布时间</label><select id="col-publish-time"><option value="all">不限</option><option value="day">一天内</option><option value="week">一周内</option><option value="half_year">半年内</option></select></div>
-          <div class="form-field"><label for="col-content-type">内容类型</label><select id="col-content-type"><option value="all">全部作品</option><option value="video">视频</option><option value="images">图文 / 图集</option></select></div>
+          <div class="form-field"><label for="col-content-type">内容类型</label><select id="col-content-type" onchange="applyCollectionForm()"><option value="all">全部作品</option><option value="video">视频</option><option value="images">图文 / 图集</option></select></div>
         </div>
         <details class="collection-advanced">
           <summary>高级停止与数据门槛 <span>可选，减少无效结果</span></summary>
@@ -4576,7 +4926,7 @@
         </div>
         <div class="option-grid" aria-label="采集选项">
           <label class="switch-row"><input type="checkbox" id="col-download" onchange="applyCollectionForm()"><span class="switch-copy"><b>下载媒体</b><span>保存视频、图集和封面来源</span></span></label>
-          <label class="switch-row"><input type="checkbox" id="col-replies"><span class="switch-copy"><b>包含二级评论</b><span id="col-replies-help">采集平台当前可返回的回复</span></span></label>
+          <label class="switch-row" id="col-replies-row"><input type="checkbox" id="col-replies"><span class="switch-copy"><b>包含二级评论</b><span id="col-replies-help">采集平台当前可返回的回复</span></span></label>
         </div>
         <div class="platform-callout" role="note">
           <svg aria-hidden="true"><use href="#i-info"/></svg>
@@ -4584,7 +4934,7 @@
         </div>
         <div class="form-actions">
           <span class="status-text" id="col-create-msg" role="status" aria-live="polite"></span>
-          <button type="button" onclick="createCollection()"><svg><use href="#i-play"/></svg>开始批量采集</button>
+          <button type="button" onclick="createCollection()"><svg><use href="#i-play"/></svg>开始关键词采集</button>
         </div>
       </div>
     </div>
@@ -4629,20 +4979,13 @@
   </section>
 
   <section data-panel="monitors">
-    <!-- 添加作品监控 -->
+    <!-- 添加主页作品监控 -->
     <div class="card">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-plus"/></svg></span>
-        <h2 id="mon-add-title">添加作品监控 <span class="sub">监控并下载新作品</span></h2>
+        <h2 id="mon-add-title">添加主页作品监控 <span class="sub">持续追踪创作者主页新作品</span></h2>
       </div>
       <div class="stack">
-        <div class="xhs-rn-only">
-          <label class="field" for="t-kind">监控类型</label>
-          <select id="t-kind" aria-label="监控类型" onchange="applyMonitorForm()">
-            <option value="creator">创作者笔记(盯一个博主)</option>
-            <option value="keyword">关键词(盯一个搜索词)</option>
-          </select>
-        </div>
         <div>
           <label class="field" for="t-url" id="t-url-label">创作者主页 / 完整分享文案 / sec_uid</label>
           <div class="smart-target-input">
@@ -4659,7 +5002,7 @@
             支持完整分享文案、主页长链、平台短链或用户 ID
           </div>
         </div>
-        <div>
+        <div id="t-dir-wrap">
           <label class="field" for="t-dir">下载目录(可选)</label>
           <input id="t-dir" placeholder="留空使用全局默认目录">
         </div>
@@ -4686,7 +5029,7 @@
               <option value="1800">每 30 分钟</option><option value="3600">每小时</option>
               <option value="custom">自定义…</option>
           </select><p id="t-interval-help" class="field-help">支持秒、分钟和自定义间隔；实际执行仍受任务耗时、错峰和账号限制影响。</p></div>
-          <div class="form-field dy-only"><label for="t-quality">视频画质</label><select id="t-quality">
+          <div class="form-field" id="t-quality-wrap"><label for="t-quality">视频画质</label><select id="t-quality">
               <option value="">跟随全局设置</option><option value="highest">原画 / 最高</option>
               <option value="1080">1080P</option><option value="720">720P</option>
               <option value="540">540P</option><option value="lowest">最低省流</option>
@@ -4696,10 +5039,10 @@
               <option value="0">不下载历史作品</option><option value="5">最近 5 条</option>
               <option value="20">最近 20 条</option><option value="-1">尽可能全量</option>
           </select></div>
-          <div class="form-field"><label for="t-download">自动下载范围</label><select id="t-download">
+          <div class="form-field"><label for="t-download">自动下载范围</label><select id="t-download" onchange="applyMonitorDownloadLinkage()">
               <option value="all">全部作品</option><option value="video">仅视频</option>
               <option value="images">仅图集</option><option value="none">仅记录，不下载</option>
-          </select></div>
+          </select><p id="t-download-conflict" class="field-help" style="color:var(--warn)" hidden></p></div>
         </div>
         <details class="collection-advanced monitor-advanced">
           <summary>高级抓取与筛选 <span>控制翻页深度、单轮上限和入库条件</span></summary>
@@ -4715,7 +5058,7 @@
                 <option value="12">12 条</option><option value="20">20 条</option>
                 <option value="50">50 条</option><option value="100">100 条</option>
               </select></div>
-              <div class="form-field"><label for="t-record-media">作品类型</label><select id="t-record-media">
+              <div class="form-field"><label for="t-record-media">作品类型</label><select id="t-record-media" onchange="applyMonitorDownloadLinkage()">
                 <option value="all">全部入库</option><option value="video">仅视频</option>
                 <option value="images">仅图文/图集</option>
               </select></div>
@@ -4753,7 +5096,7 @@
       <div class="stack">
         <div>
           <label class="field" for="sd-text">分享链接 / 分享口令 / 含中文和符号的完整文案</label>
-          <textarea id="sd-text" rows="5" placeholder="例如：复制这段内容，打开对应平台查看作品 https://v.douyin.com/xxxx/ 😄&#10;支持全角符号、HTML 实体、URL 编码、Unicode 转义和一段文字中的多个链接"></textarea>
+          <textarea id="sd-text" rows="5" onpaste="handleShareTextPaste()" placeholder="例如：复制这段内容，打开对应平台查看作品 https://v.douyin.com/xxxx/ 😄&#10;支持全角符号、HTML 实体、URL 编码、Unicode 转义和一段文字中的多个链接"></textarea>
         </div>
         <div class="form-grid cols-4">
           <div class="form-field">
@@ -4797,6 +5140,14 @@
         </div>
         <div id="sd-links" class="hint" style="display:none"></div>
       </div>
+    </div>
+    <div class="card" id="sd-live-card" style="display:none">
+      <div class="card-head">
+        <span class="card-ic"><svg><use href="#i-download"/></svg></span>
+        <h2>实时下载队列 <span class="sub" id="sd-live-summary"></span></h2>
+        <button type="button" class="ghost sm" onclick="window.CreatorHubProgress?.clearFinished()">清理已完成</button>
+      </div>
+      <div id="sd-live-list" class="share-live-list"></div>
     </div>
     <div class="card" id="sd-result-card" style="display:none">
       <div class="card-head">
@@ -5068,7 +5419,7 @@
               <option value="zh">始终使用自然中文</option>
               <option value="en">始终使用自然英文</option>
             </select>
-            <div class="field-help">海外平台（IG / X / Facebook）选自动即可跟评外语内容。</div>
+            <div class="field-help">海外平台（IG / X / Facebook / YouTube）选自动即可跟评外语内容。</div>
           </div>
           <div class="form-field">
             <label for="ai-max-chars">单条评论字数上限</label>
@@ -5145,6 +5496,7 @@
                 <option value="instagram">Instagram</option>
                 <option value="twitter">X (Twitter)</option>
                 <option value="facebook">Facebook</option>
+                <option value="youtube">YouTube</option>
               </select>
             </div>
             <div class="form-field">
@@ -5215,7 +5567,7 @@
         <div class="eng-section-head">
           <div>
             <h3>一键运行方案</h3>
-            <p>按电脑配置和使用习惯一键切换，套用后仍可在下方卡片自由微调（不会改动你的监控范围和私信/健康提醒开关）。</p>
+            <p>按电脑配置和使用习惯一键切换，套用后仍可在下方卡片自由微调（不会改动你的监控范围、评论审核锁和私信/健康提醒开关）。</p>
           </div>
         </div>
         <div class="eng-presets" role="group" aria-label="快捷运行方案">
@@ -5229,7 +5581,7 @@
           </button>
           <button type="button" class="eng-preset" data-eng-preset="compat" onclick="CreatorHubEngineSettings.applyPreset('compat')">
             <div class="eng-preset-top"><b>稳妥兼容</b><span class="eng-preset-tag">网络波动 / 防验证</span></div>
-            <p>拉长关键词采集间隔与请求等待时间，遇阻自动回退浏览器并保持审核与可见窗口。</p>
+            <p>拉长关键词采集间隔与请求等待时间，遇阻自动回退浏览器并保持可见窗口。</p>
           </button>
         </div>
       </div>
@@ -5336,14 +5688,14 @@
                     <b>互动、私信与下载体验</b>
                     <span class="eng-module-badge" id="eng-badge-interact">推荐值</span>
                   </div>
-                  <p>决定自动评论要不要人工先审核、是否显示浏览器窗口，以及小红书私信监听。</p>
+                  <p>管理小红书全局审核保险锁、评论浏览器窗口显示，以及小红书私信监听。</p>
                 </div>
               </div>
             </div>
             <div class="eng-module-main stack">
               <label class="switch-row" for="engine-xhs_comment_review_before_publish">
                 <input id="engine-xhs_comment_review_before_publish" name="xhs_comment_review_before_publish" type="checkbox" disabled>
-                <span class="switch-copy"><b>小红书自动评论先审核再发</b><span>推荐开启。关闭后，命中的评论将直接进入发送队列。</span></span>
+                <span class="switch-copy"><b>强制小红书评论先审核再发（覆盖单条规则）</b><span>默认关闭，由每条自动评论规则自身的「发布前审核」开关决定；开启后将作为全局保险锁，忽略单条规则设置并强制全部先存草稿。</span></span>
               </label>
               <label class="switch-row" for="engine-comment_browser_headed">
                 <input id="engine-comment_browser_headed" name="comment_browser_headed" type="checkbox" disabled>
@@ -5705,6 +6057,22 @@
                       <option value="browser">仅隔离浏览器</option>
                     </select>
                     <p class="field-help">动态/主页/群组/快拍发布与互动固定走隔离浏览器通道。</p>
+                  </div>
+                </div>
+              </div>
+
+              <!-- YouTube -->
+              <div class="eng-pf-card" data-platform="youtube">
+                <div class="eng-pf-head"><b>YouTube</b><span class="eng-pf-tag" data-pf-badge="youtube"></span></div>
+                <div class="stack">
+                  <div class="form-field">
+                    <label for="engine-youtube_read_mode">频道、搜索与评论读取</label>
+                    <select id="engine-youtube_read_mode" name="youtube_read_mode" disabled title="优先走 SSR ytInitialData 与 Innertube Web (/youtubei/v1/*) 协议直采，异常时自动回退隔离浏览器">
+                      <option value="hybrid">协议 API 优先，失败回退浏览器（推荐）</option>
+                      <option value="api">仅协议 API 直连</option>
+                      <option value="browser">仅隔离浏览器</option>
+                    </select>
+                    <p class="field-help">YouTube Studio 视频/Shorts 上传、评论/互动与观看养号固定走隔离浏览器通道。</p>
                   </div>
                 </div>
               </div>
@@ -6074,6 +6442,16 @@
             <div class="filepick-cta"><svg><use href="#i-download"/></svg><span><b>点击选择</b> 或拖拽文件到此</span></div>
             <div class="filepick-list" id="pub-filelist"></div>
           </div>
+          <div id="pub-upload-progress" class="pub-upload-progress" hidden></div>
+        </div>
+        <div id="pub-cover-wrap">
+          <label class="field" id="pub-cover-label" for="pub-cover">自定义封面（可选，JPG / PNG / WEBP）</label>
+          <div class="filepick pub-cover-drop" id="pub-cover-drop">
+            <input type="file" id="pub-cover" class="filepick-input" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" aria-label="选择自定义封面图片">
+            <div class="filepick-cta"><svg><use href="#i-image"/></svg><span><b>点击选择</b> 或拖拽自定义封面图到此（留空则使用平台默认/视频首帧）</span></div>
+            <div class="filepick-list" id="pub-cover-list"></div>
+          </div>
+          <div class="field-help" id="pub-cover-help">视频发布时自动上传为自定义封面（全平台适用；图文发布一般以首图为封面）。</div>
         </div>
         <div>
           <label class="field" for="pub-title"><span id="pub-title-label-text">标题(≤20 字)</span></label>
@@ -6086,6 +6464,14 @@
         <div class="form-grid">
           <div class="form-field"><label for="pub-topics">话题</label><input id="pub-topics" placeholder="逗号分隔，不用带 #；例如：露营,户外"></div>
           <div class="form-field"><label for="pub-when">发布时间</label><input type="datetime-local" id="pub-when" aria-label="定时发布（留空则尽快发布）"><div class="field-help">留空表示尽快发布</div></div>
+          <div class="form-field">
+            <label for="pub-action">提交模式</label>
+            <select id="pub-action" aria-label="提交模式" onchange="onPubActionChange()">
+              <option value="publish">直接发布作品</option>
+              <option value="draft">暂存到平台草稿箱（上传并填表后存草稿，不公开）</option>
+            </select>
+            <div class="field-help" id="pub-action-help">选择「暂存到平台草稿箱」时，自动上传素材与封面并点击平台存草稿按钮。</div>
+          </div>
         </div>
         <div class="form-field sh-only">
           <label for="pub-location">位置（可选）</label><input id="pub-location" placeholder="城市或地点名，例如：东莞市 / 杭州西湖">
@@ -6139,7 +6525,7 @@
         </fieldset>
         <fieldset class="publish-permissions bili-only" id="pub-bili-opts">
           <legend>哔哩哔哩投稿与互动设置</legend>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-bili-tid-wrap">
             <label class="field" for="pub-bili-tid">投稿分区</label>
             <select id="pub-bili-tid" aria-label="哔哩哔哩投稿分区">
               <option value="21">生活 · 日常</option>
@@ -6155,7 +6541,7 @@
               <option value="27">动画 · 综合</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-bili-copyright-wrap">
             <label class="field" for="pub-bili-copyright">稿件类型</label>
             <select id="pub-bili-copyright" aria-label="哔哩哔哩稿件类型" onchange="onBiliCopyrightChange()">
               <option value="1">自制</option>
@@ -6166,7 +6552,7 @@
             <label class="field" for="pub-bili-source">转载来源</label>
             <input id="pub-bili-source" maxlength="200" placeholder="转载时必填原视频链接或出处">
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-bili-statement-wrap">
             <label class="field" for="pub-bili-statement">创作声明</label>
             <select id="pub-bili-statement" aria-label="哔哩哔哩创作声明">
               <option value="-1">内容无需标注</option>
@@ -6177,7 +6563,7 @@
               <option value="-2">内容为转载</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-bili-recreate-wrap">
             <label class="field" for="pub-bili-recreate">二创权限</label>
             <select id="pub-bili-recreate" aria-label="哔哩哔哩二创权限">
               <option value="-1">默认（不开启二创）</option>
@@ -6191,7 +6577,7 @@
               <option value="private">仅自己可见</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-bili-close-danmu-wrap">
             <label class="field" for="pub-bili-close-danmu">弹幕权限</label>
             <select id="pub-bili-close-danmu" aria-label="哔哩哔哩弹幕权限">
               <option value="0">开启弹幕</option>
@@ -6240,22 +6626,22 @@
           <legend>Facebook 发布位置与互动设置</legend>
           <div class="publish-permission">
             <label class="field" for="pub-fb-target">发布目标</label>
-            <select id="pub-fb-target" aria-label="Facebook 发布目标">
+            <select id="pub-fb-target" aria-label="Facebook 发布目标" onchange="syncPublishPlatformFields()">
               <option value="profile">个人动态（Profile Feed）</option>
               <option value="page">公共主页（Profile+ Page）</option>
               <option value="group">Facebook 群组（Group）</option>
               <option value="story">快拍（Story）</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-fb-page-wrap" style="display:none">
             <label class="field" for="pub-fb-page-id">公共主页 ID（可选，i_user 切换）</label>
             <input id="pub-fb-page-id" maxlength="64" placeholder="发公共主页或以主页身份发群组时填写数字 Page ID">
           </div>
-          <div class="publish-permission">
-            <label class="field" for="pub-fb-group-url">目标群组链接或 ID（群组发布时填写）</label>
+          <div class="publish-permission" id="pub-fb-group-wrap" style="display:none">
+            <label class="field" for="pub-fb-group-url">目标群组链接或 ID（群组发布必填）</label>
             <input id="pub-fb-group-url" maxlength="300" placeholder="例如 https://www.facebook.com/groups/123456789/">
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-fb-privacy-wrap">
             <label class="field" for="pub-fb-privacy">动态可见范围</label>
             <select id="pub-fb-privacy" aria-label="Facebook 可见范围">
               <option value="public">公开（Public）</option>
@@ -6263,30 +6649,82 @@
               <option value="only_me">仅自己（Only Me）</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-fb-first-comment-wrap">
             <label class="field" for="pub-fb-first-comment">发布后首评（可选）</label>
             <input id="pub-fb-first-comment" maxlength="500" placeholder="发帖成功后自动在主帖下追加一条首评（如外链、引导文案）">
+          </div>
+        </fieldset>
+        <fieldset class="publish-permissions yt-only" id="pub-yt-opts">
+          <legend>YouTube Studio 发布与频道设置</legend>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-kind">发布形态</label>
+            <select id="pub-yt-kind" aria-label="YouTube 发布形态" onchange="syncPublishPlatformFields()">
+              <option value="video">常规视频（Video）</option>
+              <option value="shorts">Shorts 短视频（自动附加 #Shorts）</option>
+            </select>
+          </div>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-visibility">视频可见范围</label>
+            <select id="pub-yt-visibility" aria-label="YouTube 可见范围" onchange="syncPublishPlatformFields()">
+              <option value="public">公开（Public）</option>
+              <option value="unlisted">不公开列出（Unlisted）</option>
+              <option value="private">私享（Private）</option>
+            </select>
+          </div>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-mfk">受众（儿童向）</label>
+            <select id="pub-yt-mfk" aria-label="是否面向儿童">
+              <option value="0">否，内容并非面向儿童（推荐）</option>
+              <option value="1">是，内容面向儿童（Made for Kids）</option>
+            </select>
+          </div>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-channel">切换品牌频道名称（可选）</label>
+            <input id="pub-yt-channel" maxlength="100" placeholder="多频道账号可填写目标频道名（留空使用当前默认频道）">
+          </div>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-tags">视频标签 Tags（逗号分隔，可选）</label>
+            <input id="pub-yt-tags" maxlength="450" placeholder="例如 tech, tutorial, ai（YouTube 总标签上限 500 字符）">
+          </div>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-playlists">加入播放列表（逗号分隔，可选）</label>
+            <input id="pub-yt-playlists" maxlength="300" placeholder="填写已创建的播放列表名称，多个用逗号分隔">
+          </div>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-thumbnail">自定义缩略图本地路径（可选，优先使用上方上传的封面）</label>
+            <input id="pub-yt-thumbnail" maxlength="400" placeholder="可选，也可直接在上方「自定义封面」选择图片">
+          </div>
+          <div class="publish-permission" id="pub-yt-premiere-wrap">
+            <label class="field" for="pub-yt-premiere">即时首映（Premiere）</label>
+            <select id="pub-yt-premiere" aria-label="即时首映">
+              <option value="0">否，常规发布</option>
+              <option value="1">设为即时首映（仅公开常规视频有效）</option>
+            </select>
+          </div>
+          <div class="publish-permission">
+            <label class="field" for="pub-yt-first-comment">发布后首评（可选）</label>
+            <input id="pub-yt-first-comment" maxlength="500" placeholder="视频发布成功后自动前往观看页追加一条置顶引导评论">
           </div>
         </fieldset>
         <fieldset class="publish-permissions ig-only" id="pub-ig-opts">
           <legend>Instagram 发布形态与互动设置</legend>
           <div class="publish-permission">
             <label class="field" for="pub-ig-kind">发布形态</label>
-            <select id="pub-ig-kind" aria-label="Instagram 发布形态">
+            <select id="pub-ig-kind" aria-label="Instagram 发布形态" onchange="syncPublishPlatformFields()">
               <option value="auto">动态帖子 / Reels / 多图轮播（自动识别）</option>
               <option value="reels">Reels 短视频（configure_to_clips）</option>
               <option value="feed">普通视频动态（configure）</option>
               <option value="story">Story 快拍（configure_to_story）</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-ig-share-feed-wrap">
             <label class="field" for="pub-ig-share-feed">Reels 同步主页</label>
             <select id="pub-ig-share-feed" aria-label="Instagram Reels 同步主页">
               <option value="1">同步展示到个人主页网格</option>
               <option value="0">仅展示在 Reels 标签页</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission" id="pub-ig-comment-wrap">
             <label class="field" for="pub-ig-comment">评论权限</label>
             <select id="pub-ig-comment" aria-label="Instagram 评论权限">
               <option value="1">开启评论</option>
@@ -6296,7 +6734,8 @@
         </fieldset>
         <div class="form-actions">
           <span class="status-text" id="pub-msg" role="status" aria-live="polite"></span>
-          <button onclick="addPublish()"><svg><use href="#i-send"/></svg>加入发布队列</button>
+          <button type="button" class="ghost" id="pub-draft-btn" onclick="addPublish({ saveAsDraft: true })"><svg><use href="#i-edit"/></svg>存为本地草稿</button>
+          <button type="button" id="pub-submit-btn" onclick="addPublish()"><svg><use href="#i-send"/></svg><span id="pub-submit-label">加入发布队列</span></button>
         </div>
         <div class="form-note" id="pub-hint"><svg aria-hidden="true"><use href="#i-info"/></svg><span>发布通过自动化创作平台完成，遇到验证码或需补充封面时，可在弹出的浏览器窗口中手动处理。定时任务由后台引擎按计划执行。</span></div>
       </div>
@@ -6306,7 +6745,18 @@
     <div class="card" data-section="records">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-list"/></svg></span>
-        <h2>发布记录 <span class="sub">排队中与历史发布任务</span></h2>
+        <h2>发布记录 <span class="sub">本地草稿、排队中与历史发布任务</span></h2>
+        <div class="right" style="margin-left:auto">
+          <select id="pub-status-filter" aria-label="按状态筛选发布记录" onchange="renderPublishRows()" style="min-width:130px">
+            <option value="">全部状态</option>
+            <option value="draft">本地草稿</option>
+            <option value="pending">排队中</option>
+            <option value="publishing">执行中</option>
+            <option value="done">已完成</option>
+            <option value="failed">失败</option>
+            <option value="uncertain">结果待确认</option>
+          </select>
+        </div>
       </div>
       <div class="table-wrap"><table aria-label="发布任务列表"><thead><tr>
         <th>标题</th><th>发布账号</th><th>类型 / 素材</th><th>来源</th><th>计划时间</th><th>状态</th><th style="text-align:right">操作</th>
@@ -6341,6 +6791,7 @@
           <div class="ac-policy-actions">
             <button type="button" class="ghost sm" onclick="openAiSettingsSection()">配置 AI 文案 →</button>
             <button type="button" class="ghost sm" onclick="openRiskRulesSection()">风控规则 →</button>
+            <button type="button" class="ghost sm" onclick="openAcEngineReviewSettings()">采集与运行 →</button>
           </div>
         </div>
 
@@ -6435,7 +6886,7 @@
             <div class="form-grid">
               <div class="form-field">
                 <label for="ac-match-mode">包含词匹配方式</label>
-                <select id="ac-match-mode">
+                <select id="ac-match-mode" onchange="syncAcFilterLinkage()">
                   <option value="any">命中任一包含词（留空 = 全部通过）</option>
                   <option value="all_terms">同时包含全部词</option>
                   <option value="regex">正则表达式匹配（每行或逗号一个）</option>
@@ -6452,7 +6903,7 @@
               </div>
             </div>
             <div class="form-grid">
-              <div class="form-field">
+              <div class="form-field" id="ac-include-kw-wrap">
                 <label for="ac-include-kw">包含关键词（支持中英文逗号、分号或换行分隔）</label>
                 <input id="ac-include-kw" placeholder="例如：链接, 哪里买, 教程, 多少钱（留空=不限）">
               </div>
@@ -6470,11 +6921,11 @@
                 <label for="ac-max-age">仅处理最近 N 小时内（0 = 跟随天数）</label>
                 <input type="number" id="ac-max-age" value="0" min="0" max="8760">
               </div>
-              <div class="form-field">
+              <div class="form-field" id="ac-recent-works-wrap">
                 <label for="ac-recent-works">扫描近期作品数（0 = 跟随全局默认）</label>
                 <input type="number" id="ac-recent-works" value="0" min="0" max="50">
               </div>
-              <div class="form-field">
+              <div class="form-field" id="ac-recent-days-wrap">
                 <label for="ac-recent-days">扫描近期天数（0 = 跟随全局默认）</label>
                 <input type="number" id="ac-recent-days" value="0" min="0" max="365">
               </div>
@@ -6485,9 +6936,10 @@
         <!-- 4. 审核与频率 -->
         <div class="ac-section-box">
           <div class="ac-section-title"><span>4. 审核方式与执行频率</span></div>
-          <label class="switch-row">
-            <input type="checkbox" id="ac-review" onchange="syncAcCreatePolicySummary()">
-            <span class="switch-copy"><b>发布前先存草稿人工审核</b><span id="ac-review-help">推荐开启：生成后进入「任务与审核」页核对原文与回复，人工通过后再按节流发送。</span></span>
+          <label class="switch-row" id="ac-review-row">
+            <input type="checkbox" id="ac-review" onchange="onAcReviewToggle()">
+            <span class="switch-copy"><b id="ac-review-title">发布前先存草稿人工审核</b><span id="ac-review-help">推荐开启：生成后进入「任务与审核」页核对原文与回复，人工通过后再按节流发送。</span></span>
+            <button type="button" class="ghost sm" id="ac-review-unlock-btn" hidden onclick="event.preventDefault();event.stopPropagation();openAcEngineReviewSettings()">去设置关闭 →</button>
           </label>
           <div class="form-grid">
             <div class="form-field">
@@ -6535,6 +6987,7 @@
         <div class="ac-policy-actions">
           <button type="button" class="ghost sm" onclick="openAiSettingsSection()">AI 文案设置 →</button>
           <button type="button" class="ghost sm" onclick="openRiskRulesSection()">风控规则 →</button>
+          <button type="button" class="ghost sm" onclick="openAcEngineReviewSettings()">采集与运行 →</button>
         </div>
       </div>
       <div class="table-wrap"><table aria-label="自动评论规则列表"><thead><tr>
@@ -6644,8 +7097,8 @@
       <span class="filter-count" id="mon-filter-count" role="status" aria-live="polite"></span>
       <div class="toolbar-actions"><span class="toolbar-actions-label">操作</span><div class="export-actions" role="group" aria-label="监控列表 Excel 导出"><span class="export-caption" title="导出当前模块数据"><svg aria-hidden="true"><use href="#i-download"/></svg>Excel</span><button type="button" class="export-btn filtered" onclick="exportModuleReport('monitors', false, this)" title="导出当前条件下的全部匹配记录" aria-label="导出监控列表当前结果"><svg aria-hidden="true"><use href="#i-download"/></svg>当前结果</button><button type="button" class="export-btn full" onclick="exportModuleReport('monitors', true, this)" title="导出当前平台全部记录" aria-label="导出监控列表全部数据"><svg aria-hidden="true"><use href="#i-download"/></svg>全部数据</button></div><button class="ghost sm" id="mon-selall-btn" type="button" onclick="monSelAllToggle()" disabled>全选</button><span id="mon-selbar" style="display:none;align-items:center;gap:8px"><span class="mut" id="mon-selcount">已选 0 项</span><button class="ghost sm" type="button" onclick="monSelClear()">取消</button><button class="sm danger" type="button" onclick="monBatchDelete()"><svg><use href="#i-trash"/></svg>批量删除</button></span></div>
     </div>
-    <div class="table-wrap"><table aria-label="作品监控列表"><thead><tr>
-      <th class="task-check-col"><input type="checkbox" id="mon-selall" onchange="monToggleAll(this.checked)" aria-label="全选当前显示的作品监控"></th>
+    <div class="table-wrap"><table aria-label="主页作品监控列表"><thead><tr>
+      <th class="task-check-col"><input type="checkbox" id="mon-selall" onchange="monToggleAll(this.checked)" aria-label="全选当前显示的主页作品监控"></th>
       <th>监控对象</th><th>分组 / 标签</th><th>已采记录</th><th>检查间隔</th><th>抓取与下载策略</th><th>上次扫描</th><th>状态</th><th style="text-align:right">操作</th>
     </tr></thead><tbody id="mon-table"></tbody></table></div>
   </div>
@@ -6770,10 +7223,10 @@
           </div>
         </div>
         <div class="form-grid cols-auto">
-          <div class="form-field"><label for="w-kind">监控对象类型</label><select id="w-kind" onchange="resetWatchTargetState()">
-              <option value="auto">自动识别</option><option value="video">单条视频</option><option value="user">账号近期作品</option>
+          <div class="form-field"><label for="w-kind">监控对象类型</label><select id="w-kind" onchange="onWatchKindChange()">
+              <option value="auto">自动识别</option><option value="video">单条视频 / 作品</option><option value="user">账号近期作品</option>
           </select></div>
-          <div class="form-field dy-only"><label for="w-mode">评论来源</label><select id="w-mode" onchange="populateWatchAccount()">
+          <div class="form-field dy-only" id="w-mode-wrap"><label for="w-mode">评论来源</label><select id="w-mode" onchange="onWatchModeChange()">
               <option value="public">公开评论区</option><option value="creator">创作中心（仅自有账号）</option>
           </select></div>
           <div class="form-field" id="w-acc-wrap"><label for="w-acc">使用账号</label><select id="w-acc"></select></div>
@@ -6799,15 +7252,15 @@
           </div>
         </div>
         <div class="form-grid cols-auto">
-          <div class="form-field"><label for="w-recent">近期作品数</label><select id="w-recent">
+          <div class="form-field" id="w-recent-wrap"><label for="w-recent">近期作品数</label><select id="w-recent">
               <option value="0">跟随全局设置</option><option value="3">最近 3 个作品</option>
               <option value="5">最近 5 个作品</option><option value="10">最近 10 个作品</option><option value="20">最近 20 个作品</option>
           </select></div>
-          <div class="form-field"><label for="w-days">作品时间范围</label><select id="w-days">
+          <div class="form-field" id="w-days-wrap"><label for="w-days">作品时间范围</label><select id="w-days">
               <option value="0">跟随全局设置</option><option value="3">最近 3 天</option>
               <option value="7">最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option>
           </select></div>
-          <div class="form-field"><label for="w-depth">评论抓取深度</label><select id="w-depth">
+          <div class="form-field" id="w-depth-wrap"><label for="w-depth">评论抓取深度</label><select id="w-depth">
               <option value="0">跟随全局设置</option><option value="3">浅层抓取</option>
               <option value="6">标准抓取</option><option value="12">深度抓取</option><option value="20">最大抓取</option>
           </select></div>
@@ -6945,10 +7398,10 @@
           </div>
         </div>
         <div class="form-grid cols-auto">
-          <div class="form-field"><label for="d-w-kind">监控对象</label><select id="d-w-kind" onchange="applyDanmakuForm()">
+          <div class="form-field"><label for="d-w-kind">监控对象</label><select id="d-w-kind" onchange="applyDanmakuForm(false)">
             <option value="auto">自动识别</option><option value="video">单条视频</option><option value="user">账号近期作品</option>
           </select></div>
-          <div class="form-field"><label for="d-w-mode">弹幕来源</label><select id="d-w-mode" onchange="applyDanmakuForm()">
+          <div class="form-field" id="d-w-mode-wrap"><label for="d-w-mode">弹幕来源</label><select id="d-w-mode" onchange="applyDanmakuForm(false)">
             <option value="public">公开视频播放页</option><option value="creator" class="dy-only">创作中心（自己的视频）</option>
           </select></div>
           <div class="form-field"><label for="d-w-acc" id="d-w-acc-label">播放页账号（可选）</label><select id="d-w-acc"></select></div>
@@ -7101,8 +7554,8 @@
       <div class="tabbar" style="position:static;margin-bottom:14px">
         <button class="tab active" data-hubtab="myworks" onclick="switchHubTab('myworks')"><svg><use href="#i-film"/></svg>我的作品 <span class="tab-badge" id="hb-myworks">0</span></button>
         <button class="tab notsh-only tk-hide rn-hide" data-hubtab="following" onclick="switchHubTab('following')"><svg><use href="#i-user"/></svg>关注 <span class="tab-badge" id="hb-following">0</span></button>
-        <button class="tab notsh-only tk-hide rn-hide" data-hubtab="fans" onclick="switchHubTab('fans')"><svg><use href="#i-heart"/></svg>粉丝 <span class="tab-badge" id="hb-fans">0</span></button>
-        <button class="tab notsh-only tk-hide rn-hide" data-hubtab="dm" onclick="switchHubTab('dm')"><svg><use href="#i-send"/></svg>私信 <span class="tab-badge" id="hb-dm">0</span></button>
+        <button class="tab notsh-only tk-hide rn-hide yt-hide" data-hubtab="fans" onclick="switchHubTab('fans')"><svg><use href="#i-heart"/></svg>粉丝 <span class="tab-badge" id="hb-fans">0</span></button>
+        <button class="tab notsh-only tk-hide rn-hide yt-hide" data-hubtab="dm" onclick="switchHubTab('dm')"><svg><use href="#i-send"/></svg>私信 <span class="tab-badge" id="hb-dm">0</span></button>
         <button class="tab" data-hubtab="stats" onclick="switchHubTab('stats')"><svg><use href="#i-eye"/></svg>数据 <span class="tab-badge" id="hb-stats">0</span></button>
       </div>
 
@@ -7254,11 +7707,29 @@
         <div><label class="field" for="rp-topics">话题</label><input id="rp-topics" placeholder="逗号分隔，不用带 #"></div>
         <div><label class="field" for="rp-when">定时发布</label><input type="datetime-local" id="rp-when" aria-label="定时发布（留空尽快发布）"></div>
       </div>
+      <div class="form-grid">
+        <div>
+          <label class="field" for="rp-action">提交模式</label>
+          <select id="rp-action" aria-label="提交模式">
+            <option value="publish">直接发布</option>
+            <option value="draft">暂存到目标平台草稿箱</option>
+          </select>
+        </div>
+        <div id="rp-cover-wrap">
+          <label class="field" for="rp-cover">自定义封面（可选）</label>
+          <div class="filepick pub-cover-drop compact" id="rp-cover-drop">
+            <input type="file" id="rp-cover" class="filepick-input" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" aria-label="选择自定义封面">
+            <div class="filepick-cta"><svg><use href="#i-image"/></svg><span><b>选择封面图</b>（留空用默认）</span></div>
+            <div class="filepick-list" id="rp-cover-list"></div>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="ui-modal-footer">
       <span class="mut" id="rp-msg" role="status" tabindex="-1"></span>
       <div class="row" id="rp-actions">
         <button class="ghost" onclick="hideRepost()">取消</button>
+        <button class="ghost" id="rp-save-draft" onclick="submitRepost({ saveAsDraft: true })"><svg aria-hidden="true"><use href="#i-edit"/></svg>存为本地草稿</button>
         <button id="rp-submit" onclick="submitRepost()"><svg aria-hidden="true"><use href="#i-send"/></svg>确认推送</button>
       </div>
     </div>

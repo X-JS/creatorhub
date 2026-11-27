@@ -11,12 +11,15 @@ from sqlalchemy import delete, func, or_
 from sqlmodel import select
 
 from app import runtime as app_runtime
+from app.progress_hub import progress_hub
 from app.browser import fetch_follows
 from app.db import get_session
 from app.models import AccountStatSnapshot, AccountWork, DouyinAccount, FollowEdge
 from app.platforms.bilibili import BilibiliClient
 from app.platforms.instagram import InstagramClient
+from app.platforms.youtube import YouTubeClient
 from app.risk import OperationKind
+from app.services import account_profiles as account_profiles_service
 from app.transport_matrix import resolve_transport
 
 router = APIRouter()
@@ -163,7 +166,7 @@ async def _sync_follows_impl(account_id: int, direction: str = "following",
         operation = "following_list" if direction == "following" else "followers_list"
         transport = (
             resolve_transport(app_runtime.cfg, platform, operation, acc)
-            if platform in {"douyin", "bilibili", "instagram"}
+            if platform in {"douyin", "bilibili", "instagram", "youtube"}
             else None
         )
         effective_mode = (transport["effective_mode"] if transport else "browser")
@@ -174,30 +177,36 @@ async def _sync_follows_impl(account_id: int, direction: str = "following",
                 f"{transport.get('reason') or transport.get('note') or '该通道不可用'}")
         if app_runtime.browser is None and effective_mode in {"browser"}:
             raise HTTPException(503, "浏览器未就绪")
-        if app_runtime.browser is None and effective_mode == "hybrid" and platform not in {"bilibili", "instagram"}:
+        if app_runtime.browser is None and effective_mode == "hybrid" and platform not in {"bilibili", "instagram", "youtube"}:
             raise HTTPException(503, "浏览器未就绪")
         if platform == "douyin" and effective_mode in {"api", "hybrid"} \
                 and app_runtime.engine is None:
             raise HTTPException(503, "抖音 API 读取引擎未就绪")
         identity = (
             None
-            if platform in {"douyin", "bilibili", "instagram"} and effective_mode == "api"
+            if platform in {"douyin", "bilibili", "instagram", "youtube"} and effective_mode == "api"
             else (
                 app_runtime.browser.identity_for(acc)
                 if callable(getattr(app_runtime.browser, "identity_for", None))
                 else None
             )
         )
+        aligned_ua = account_profiles_service._direct_request_ua(
+            identity if identity is not None else acc
+        )
         bili_state = (acc.storage_state or acc.cookie or "") if platform == "bilibili" else ""
-        bili_ua = (acc.ua or app_runtime.cfg.engine.user_agent) if platform == "bilibili" else ""
+        bili_ua = aligned_ua if platform == "bilibili" else ""
         bili_proxy = (acc.proxy or "") if platform == "bilibili" else ""
         bili_mid = (acc.uid or acc.sec_uid or "") if platform == "bilibili" else ""
         ig_state = (acc.storage_state or acc.creator_storage_state or acc.cookie or "") if platform == "instagram" else ""
-        ig_ua = (acc.ua or app_runtime.cfg.engine.user_agent) if platform == "instagram" else ""
+        ig_ua = aligned_ua if platform == "instagram" else ""
         ig_proxy = (acc.proxy or "") if platform == "instagram" else ""
         ig_uid = (acc.uid or acc.sec_uid or acc.douyin_id or "") if platform == "instagram" else ""
         ig_seed = (acc.fp_seed or acc.profile_dir or "") if platform == "instagram" else ""
         ig_tz = (acc.timezone_id or "Asia/Shanghai") if platform == "instagram" else "Asia/Shanghai"
+        yt_state = (acc.storage_state or acc.creator_storage_state or acc.cookie or "") if platform == "youtube" else ""
+        yt_ua = aligned_ua if platform == "youtube" else ""
+        yt_proxy = (acc.proxy or "") if platform == "youtube" else ""
         known: set[str] = set()
         existing_count = int(s.exec(select(func.count(FollowEdge.id)).where(
             FollowEdge.account_id == account_id,
@@ -316,6 +325,22 @@ async def _sync_follows_impl(account_id: int, direction: str = "following",
             if effective_mode == "api" or direct_err.startswith(("logged_out", "verification_required")) or app_runtime.browser is None:
                 source = "api"
                 return [], direct_err
+        elif platform == "youtube" and effective_mode in {"api", "hybrid"} and yt_state:
+            report(phase="fetching", source="api")
+            ycli = YouTubeClient(
+                yt_state,
+                yt_ua,
+                proxy=yt_proxy,
+                timeout=app_runtime.cfg.engine.request_timeout_seconds,
+            )
+            async with ycli.session_scope():
+                yt_users, direct_err = await ycli.fetch_subscriptions(max_items=200, max_pages=5)
+            if yt_users or (not direct_err):
+                source = "api"
+                return yt_users, ("" if yt_users else "empty")
+            if effective_mode == "api" or direct_err.startswith("verification_required") or app_runtime.browser is None:
+                source = "api"
+                return [], direct_err
 
         source = "browser_fallback" if effective_mode == "hybrid" else "browser"
         report(phase="fetching", source=source, pages=0, fetched=0)
@@ -394,12 +419,77 @@ def _follow_sync_job_view(job: dict) -> dict:
     return view
 
 
+def _sync_follow_to_hub(job: dict, *, immediate: bool = False) -> None:
+    view = _follow_sync_job_view(job)
+    key = f"follow:{job['id']}"
+    direction_label = "粉丝列表" if job.get("direction") == "fan" else "关注列表"
+    phase_labels = {
+        "queued": "等待同步",
+        "fetching": "正在获取列表",
+        "saving": "正在写入本地库",
+        "completed": "同步完成",
+        "failed": "同步失败",
+        "canceled": "已取消",
+        "canceling": "正在取消",
+        "deferred": "风控暂缓",
+    }
+    status_map = {
+        "queued": "queued",
+        "running": "running",
+        "canceling": "running",
+        "completed": "completed",
+        "failed": "failed",
+        "canceled": "canceled",
+        "deferred": "blocked",
+    }
+    fetched = int(view.get("fetched") or 0)
+    expected = int(view.get("expected_total") or 0)
+    saved = int(view.get("saved") or 0)
+    pages = int(view.get("pages") or 0)
+    phase = str(view.get("phase") or view.get("status") or "running")
+    if phase == "saving":
+        detail = f"已写入 {saved} / {fetched} 条"
+    elif expected:
+        detail = f"已获取 {fetched} / 约 {expected} 条 · 第 {pages} 页"
+    else:
+        detail = f"已获取 {fetched} 条 · 第 {pages} 页"
+    progress_hub.upsert(
+        key,
+        immediate=immediate,
+        category="follow_sync",
+        title=f"{direction_label}同步 · {job.get('account_name') or ('账号 #' + str(job.get('account_id')))}",
+        platform=str(job.get("platform") or ""),
+        account_id=job.get("account_id"),
+        account_name=str(job.get("account_name") or ""),
+        source_tab="hub",
+        status=status_map.get(str(view.get("status") or "running"), "running"),
+        phase=phase,
+        phase_label=phase_labels.get(phase, "同步中"),
+        detail=detail,
+        error=str(view.get("error") or ""),
+        determinate=view.get("percent") is not None,
+        percent=float(view["percent"]) if view.get("percent") is not None else None,
+        current=saved if phase == "saving" else fetched,
+        total=fetched if phase == "saving" else expected,
+        unit="items",
+        metrics={"pages": pages, "fetched": fetched, "saved": saved, "added": int(view.get("added") or 0)},
+        cancelable=bool(view.get("cancelable")),
+        extra={
+            "job_id": job["id"],
+            "direction": job.get("direction"),
+            "capped": bool(view.get("capped")),
+            "source": view.get("source") or "",
+        },
+    )
+
+
 async def _run_follow_sync_job(job_id: str):
     job = app_runtime._follow_sync_jobs[job_id]
 
     def update(changes: dict):
         job.update(changes)
         job["updated_at"] = datetime.utcnow().isoformat()
+        _sync_follow_to_hub(job)
 
     update({"status": "running", "phase": "fetching"})
     try:
@@ -442,6 +532,8 @@ async def start_follow_sync_job(account_id: int,
             raise HTTPException(404, "账号不存在")
         expected_total = (account.following_count if direction == "following"
                           else account.follower_count)
+        account_platform = str(account.platform or "")
+        account_name = str(account.nickname or account.douyin_id or f"账号 #{account_id}")
     for existing in reversed(list(app_runtime._follow_sync_jobs.values())):
         if (existing.get("account_id") == account_id
                 and existing.get("direction") == direction
@@ -456,6 +548,7 @@ async def start_follow_sync_job(account_id: int,
     job_id = uuid.uuid4().hex
     job = {
         "id": job_id, "account_id": account_id, "direction": direction,
+        "platform": account_platform, "account_name": account_name,
         "status": "queued", "phase": "queued", "pages": 0,
         "fetched": 0, "saved": 0, "added": 0,
         "expected_total": max(0, int(expected_total or 0)),
@@ -463,6 +556,8 @@ async def start_follow_sync_job(account_id: int,
         "updated_at": now, "completed_at": None,
     }
     app_runtime._follow_sync_jobs[job_id] = job
+    _sync_follow_to_hub(job, immediate=True)
+    progress_hub.register_cancel(f"follow:{job_id}", lambda jid=job_id: cancel_follow_sync_job(jid))
     task = asyncio.create_task(_run_follow_sync_job(job_id))
     app_runtime._follow_sync_tasks[job_id] = task
     task.add_done_callback(lambda _task, key=job_id:
@@ -500,6 +595,7 @@ async def cancel_follow_sync_job(job_id: str):
         raise HTTPException(409, "数据正在提交，不能中途取消")
     job["status"] = "canceling"
     job["updated_at"] = datetime.utcnow().isoformat()
+    _sync_follow_to_hub(job, immediate=True)
     task = app_runtime._follow_sync_tasks.get(job_id)
     if task:
         task.cancel()

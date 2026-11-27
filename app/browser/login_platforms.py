@@ -14,6 +14,7 @@ from app.browser.human_interaction import (
 from app.browser.identity import Identity
 from app.browser.login_common import _LOGIN_COOKIES, _focus, _open_first_environment_check, _read_ks_nickname, _read_nickname
 from app.browser.manager import BrowserManager
+from app.browser.storage_state import capture_context_storage_state
 
 
 async def interactive_login(mgr: BrowserManager, identity: Identity,
@@ -73,8 +74,8 @@ async def interactive_login(mgr: BrowserManager, identity: Identity,
 
         if logged:
             await human_wait(page, 800)   # 给登录跳转/localStorage 一次落盘机会
-            state = await ctx.storage_state()
-            state_json = json.dumps(state)
+            state = await capture_context_storage_state(ctx, platform="douyin")
+            state_json = json.dumps(state, ensure_ascii=False)
             nickname = await _read_nickname(page)
     finally:
         try:
@@ -198,7 +199,10 @@ async def interactive_ks_login(mgr: BrowserManager, identity: Identity,
             waited += 0.5
         if logged:
             await human_wait(page, 1500)
-            state_json = json.dumps(await ctx.storage_state())
+            state_json = json.dumps(
+                await capture_context_storage_state(ctx, platform="kuaishou"),
+                ensure_ascii=False,
+            )
             nickname = await _read_ks_nickname(page)
     finally:
         try:
@@ -242,7 +246,10 @@ async def interactive_ks_creator_login(mgr: BrowserManager, identity: Identity,
                     on_cp and _ks_web_login_ready(names)):
                 await human_wait(page, 1500)
                 try:
-                    state_json = json.dumps(await ctx.storage_state())
+                    state_json = json.dumps(
+                        await capture_context_storage_state(ctx, platform="kuaishou"),
+                        ensure_ascii=False,
+                    )
                     logged = True
                     nickname = await _read_ks_nickname(page)
                 except Exception:
@@ -308,7 +315,10 @@ async def interactive_tiktok_login(
             waited += 0.5
         if logged:
             await human_wait(page, 800)
-            state_json = json.dumps(await ctx.storage_state())
+            state_json = json.dumps(
+                await capture_context_storage_state(ctx, platform="tiktok"),
+                ensure_ascii=False,
+            )
     finally:
         try:
             await ctx.close()
@@ -437,7 +447,10 @@ async def interactive_channels_login(mgr: BrowserManager, identity: Identity,
             logged = _channels_login_ready(
                 names, auth_verified.is_set(), still_on_platform)
             if logged:
-                state_json = json.dumps(await ctx.storage_state())
+                state_json = json.dumps(
+                    await capture_context_storage_state(ctx, platform="shipinhao"),
+                    ensure_ascii=False,
+                )
     finally:
         try:
             await ctx.close()
@@ -542,7 +555,7 @@ async def interactive_bilibili_login(
 
         if logged:
             await human_wait(page, 1200)
-            state_obj = await ctx.storage_state()
+            state_obj = await capture_context_storage_state(ctx, platform="bilibili")
             from ..services.session_keepalive import (
                 extract_bili_refresh_token,
                 upsert_local_storage_value,
@@ -559,7 +572,9 @@ async def interactive_bilibili_login(
                     ac_val = await page.evaluate(
                         "() => (window.localStorage && window.localStorage.getItem('ac_time_value')) || ''"
                     )
-                    state_obj = await ctx.storage_state()
+                    state_obj = await capture_context_storage_state(
+                        ctx, platform="bilibili", existing_state=state_obj
+                    )
                     if ac_val and not extract_bili_refresh_token(state_obj):
                         upsert_local_storage_value(
                             state_obj,
@@ -594,7 +609,15 @@ async def interactive_bilibili_creator_login(
     )
 
 
-_IG_AUTH_BLOCKED_PATHS = ("/accounts/login", "/challenge/", "/checkpoint/", "/two_factor", "/suspended")
+_IG_AUTH_BLOCKED_PATHS = (
+    "/accounts/login",
+    "/challenge/",
+    "/checkpoint/",
+    "/two_factor",
+    "/suspended",
+    "/accounts/disabled",
+    "__coig_ufac",
+)
 
 
 async def interactive_instagram_login(
@@ -676,7 +699,10 @@ async def interactive_instagram_login(
                         nickname = str(fd.get("first_name") or fd.get("username") or "").strip()[:40]
                 except Exception:
                     pass
-                state_json = json.dumps(await ctx.storage_state())
+                state_json = json.dumps(
+                    await capture_context_storage_state(ctx, platform="instagram"),
+                    ensure_ascii=False,
+                )
             else:
                 logged = False
     finally:
@@ -786,7 +812,10 @@ async def interactive_twitter_login(
                         nickname = str(nav_info).strip()[:40]
                 except Exception:
                     pass
-                state_json = json.dumps(await ctx.storage_state())
+                state_json = json.dumps(
+                    await capture_context_storage_state(ctx, platform="twitter"),
+                    ensure_ascii=False,
+                )
             else:
                 logged = False
     finally:
@@ -897,7 +926,10 @@ async def interactive_facebook_login(
                         nickname = str(nav_name).strip()[:40]
                 except Exception:
                     pass
-                state_json = json.dumps(await ctx.storage_state())
+                state_json = json.dumps(
+                    await capture_context_storage_state(ctx, platform="facebook"),
+                    ensure_ascii=False,
+                )
             else:
                 logged = False
     finally:
@@ -916,5 +948,128 @@ async def interactive_facebook_creator_login(
 ) -> Tuple[bool, str, str]:
     """Facebook 发布、公共主页与群组共用 `.facebook.com` 会话。"""
     return await interactive_facebook_login(
+        mgr, identity, timeout_seconds=timeout_seconds, force_reauth=force_reauth
+    )
+
+
+# ── YouTube / Google 登录 ──
+_YOUTUBE_AUTH_BLOCKED_TOKENS = (
+    "accounts.google.com",
+    "youtube.com/oops",
+    "/disabled/",
+    "/signin/rejected",
+    "/signin/challenge",
+)
+
+
+async def interactive_youtube_login(
+    mgr: BrowserManager,
+    identity: Identity,
+    timeout_seconds: int = 300,
+    force_reauth: bool = False,
+) -> Tuple[bool, str, str]:
+    """YouTube 独立隔离浏览器登录（支持 Google 账号密码、2FA 动态口令、Passkey 与多频道选择）。
+
+    判定成功：存在 Google/YouTube 强登录 Cookie，页面停留在 youtube.com（非 accounts.google.com / oops / disabled），
+    且顶栏渲染已登录头像按钮 (`button#avatar-btn` 或 `ytd-notification-topbar-button-renderer`)。
+    """
+    from app.platforms.youtube.protocol import has_youtube_login_cookies
+
+    ctx = await mgr.open_headed(identity)
+    if force_reauth:
+        await ctx.clear_cookies()
+    await _open_first_environment_check(mgr, identity, ctx)
+    page = await ctx.new_page()
+    await _focus(page)
+    logged, nickname, state_json = False, "", ""
+
+    try:
+        await page.goto(
+            "https://www.youtube.com/",
+            wait_until="domcontentloaded",
+            timeout=45000,
+        )
+        await _focus(page)
+        # 若首页未登录，自动引导点击登录按钮进入 Google ServiceLogin
+        await human_click_first(
+            page,
+            (
+                'a[href*="accounts.google.com/ServiceLogin"]',
+                '#buttons a[href*="ServiceLogin"]',
+            ),
+            timeout=2500,
+        )
+        waited = 0.0
+        stable_hits = 0
+        while waited < timeout_seconds:
+            if page.is_closed():
+                break
+            try:
+                cookies = await ctx.cookies(["https://www.youtube.com", "https://accounts.google.com", "https://studio.youtube.com"])
+            except Exception:
+                break
+            cmap = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+            cur_url = str(page.url or "").lower()
+            on_yt = "youtube.com" in cur_url
+            on_blocked = any(tok in cur_url for tok in _YOUTUBE_AUTH_BLOCKED_TOKENS)
+            has_avatar = False
+            if on_yt and not on_blocked:
+                try:
+                    has_avatar = bool(await page.evaluate(
+                        """() => !!(document.querySelector('button#avatar-btn') || document.querySelector('ytd-notification-topbar-button-renderer'))"""
+                    ))
+                except Exception:
+                    has_avatar = False
+            if has_youtube_login_cookies(cmap) and on_yt and not on_blocked and has_avatar:
+                stable_hits += 1
+                if stable_hits >= 2:
+                    logged = True
+                    break
+            else:
+                stable_hits = 0
+            await asyncio.sleep(1.5)
+            waited += 1.5
+
+        if logged:
+            await human_wait(page, 1500)
+            try:
+                # 轻点头像按钮读取频道昵称
+                av = page.locator("button#avatar-btn").first
+                if await av.count() and await av.is_visible():
+                    await DEFAULT_HUMAN_ENGINE.click_locator(av, page=page, timeout=3000)
+                    await human_wait(page, 1000)
+                    nav_name = await page.evaluate(
+                        """() => {
+                            const n = document.querySelector('#account-name');
+                            if (n) return (n.getAttribute('title') || n.innerText || '').trim();
+                            const h = document.querySelector('#channel-handle');
+                            if (h) return (h.innerText || '').trim();
+                            return '';
+                        }"""
+                    )
+                    if nav_name and str(nav_name).strip():
+                        nickname = str(nav_name).strip()[:48]
+            except Exception:
+                pass
+            state_json = json.dumps(
+                await capture_context_storage_state(ctx, platform="youtube"),
+                ensure_ascii=False,
+            )
+    finally:
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+    return logged, state_json, nickname
+
+
+async def interactive_youtube_creator_login(
+    mgr: BrowserManager,
+    identity: Identity,
+    timeout_seconds: int = 300,
+    force_reauth: bool = False,
+) -> Tuple[bool, str, str]:
+    """YouTube Studio 与主站共用 `.youtube.com` / `.google.com` 会话。"""
+    return await interactive_youtube_login(
         mgr, identity, timeout_seconds=timeout_seconds, force_reauth=force_reauth
     )

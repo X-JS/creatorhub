@@ -1,4 +1,4 @@
-"""十平台交互式扫码/窗口登录流程编排与指纹前置校验。"""
+"""十一平台交互式扫码/窗口登录流程编排与指纹前置校验。"""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -16,7 +16,7 @@ from app.account_merge import (
     duplicate_platform_account_ids,
     reconcile_platform_accounts,
 )
-from app.browser import interactive_bilibili_login, interactive_channels_login, interactive_creator_login, interactive_facebook_login, interactive_instagram_login, interactive_ks_creator_login, interactive_ks_login, interactive_login, interactive_rednote_creator_login, interactive_rednote_login, interactive_tiktok_login, interactive_twitter_login, interactive_xhs_creator_login, interactive_xhs_login
+from app.browser import interactive_bilibili_login, interactive_channels_login, interactive_creator_login, interactive_facebook_login, interactive_instagram_login, interactive_ks_creator_login, interactive_ks_login, interactive_login, interactive_rednote_creator_login, interactive_rednote_login, interactive_tiktok_login, interactive_twitter_login, interactive_xhs_creator_login, interactive_xhs_login, interactive_youtube_login
 from app.browser.backends import ACCOUNT_BROWSER_BACKENDS, LOCAL_BACKEND
 from app.browser.ip_fingerprint import derive_ip_fingerprint
 from app.db import get_session
@@ -122,10 +122,6 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
             requested_backend = str(browser_backend or "default").strip().lower()
             if requested_backend not in ACCOUNT_BROWSER_BACKENDS:
                 requested_backend = "default"
-            if platform == "xhs" and requested_backend != "fingerprint_chromium":
-                requested_backend = LOCAL_BACKEND
-                browser_runtime_id = ""
-                fingerprint_overrides = None
             backend_status = getattr(app_runtime.browser, "backend_status", None)
             effective_backend = ""
             if callable(backend_status):
@@ -133,6 +129,13 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
                     requested_backend, browser_runtime_id).get("name", "")
             is_fingerprint_environment = (
                 effective_backend == "fingerprint_chromium")
+            if is_fingerprint_environment and not str(browser_runtime_id or "").strip():
+                picker = getattr(app_runtime.browser, "pick_runtime_for_seed", None)
+                if callable(picker):
+                    browser_runtime_id = picker(new_fields["fp_seed"])
+            if not is_fingerprint_environment:
+                browser_runtime_id = ""
+                fingerprint_overrides = None
             # 配置了代理或使用指纹内核时，探测真实出口归属地并对齐时区/语言/经纬度
             if proxy or is_fingerprint_environment:
                 geo = await proxies_service._proxy_geo(proxy, timeout=6)
@@ -285,6 +288,10 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
             elif platform == "facebook":
                 reauth_options = {"force_reauth": True} if account_id else {}
                 ok, state_json, nickname = await interactive_facebook_login(
+                    app_runtime.browser, identity, **reauth_options)
+            elif platform == "youtube":
+                reauth_options = {"force_reauth": True} if account_id else {}
+                ok, state_json, nickname = await interactive_youtube_login(
                     app_runtime.browser, identity, **reauth_options)
             elif creator:
                 reauth_options = {"force_reauth": True} if account_id else {}

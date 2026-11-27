@@ -704,7 +704,7 @@ function pollReloginTask(tid) {
 }
 async function delAccount(id) {
   const a = findAnyAccount(id);
-  const warn = a && a.monitor_count > 0 ? `\n关联的 ${a.monitor_count} 个作品监控也会暂停。` : "";
+  const warn = a && a.monitor_count > 0 ? `\n关联的 ${a.monitor_count} 个主页作品监控也会暂停。` : "";
   if (!await uiConfirm({ title: "删除账号", message: "删除该账号将取消未执行任务、停用关联规则并清理独占登录环境；历史内容保留。执行中的操作需要先结束。" + warn, okText: "删除并停止关联任务", danger: true })) return;
   try {
     const result = await api("/api/accounts/" + id, { method: "DELETE" });
@@ -743,7 +743,7 @@ function transportSourceSuffix(source) {
 function renderTransportMatrix(data) {
   const body = $("transport-matrix-body"), isolation = $("transport-isolation-body");
   if (!body || !isolation) return;
-  const platformNames = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook" };
+  const platformNames = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook", youtube: "YouTube" };
   const rows = Array.isArray(data?.rows) ? data.rows : [];
   body.innerHTML = rows.length ? rows.map(row => `<tr>
     <td><b>${esc(platformNames[row.platform] || row.platform)}</b></td>
@@ -799,6 +799,18 @@ function openAiChannelsManager() {
 function openAiSettingsSection() {
   if (typeof switchTab === "function") switchTab("settings", true);
   globalThis.CreatorHubWorkbench?.showSection?.("settings", "ai");
+}
+function openEngineSettingsSection(focusFieldId = "") {
+  if (typeof switchTab === "function") switchTab("settings", true);
+  globalThis.CreatorHubWorkbench?.showSection?.("settings", "engine");
+  if (focusFieldId) {
+    setTimeout(() => {
+      const el = $(focusFieldId);
+      if (!el) return;
+      for (let d = el.closest("details"); d; d = d.parentElement?.closest("details")) d.open = true;
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 140);
+  }
 }
 function _aiSelectedChannel() {
   const cid = $("ai-channel-id")?.value || AI_CHANNELS_STATE.active_channel_id || "default";

@@ -15,6 +15,7 @@ class EngineConfig:
     scan_interval_seconds: int = 300
     worker_pool_size: int = 2          # 下载并发(跨作品)
     scan_concurrency: int = 2          # 同时抓取的目标数(并发浏览器上下文)
+    collection_concurrency: int = 2    # 同时执行的关键词/创作者采集任务数(同账号与同出口仍串行)
     block_media_resources: bool = False  # 屏蔽图片/视频/字体加载(省带宽但可能打断抖音 SPA 致拿不到数据,默认关)
     monitor_initial_backfill_count: int = 0  # 新增博主时回填最近 N 条;0=仅建立时间基线,-1=尽可能全量
     comment_recent_works: int = 5      # 监控评论时,只看每个目标最近 N 条作品
@@ -44,7 +45,7 @@ class EngineConfig:
     media_dir: str = "./data/media"
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
     )
     # ── 多账号风控隔离 ──
     profiles_dir: str = "./data/profiles"   # 每账号持久化浏览器 profile 根目录
@@ -81,6 +82,9 @@ class EngineConfig:
     # Facebook 读取与写入通道: hybrid=Cookie SSR轻读优先、动态时间线/搜索/评论走隔离浏览器; browser=全程隔离浏览器
     facebook_read_mode: str = "hybrid"        # hybrid | api | browser
     facebook_write_mode: str = "browser"      # browser
+    # YouTube 读取与写入通道: hybrid=SSR/Innertube直连优先、兼容失败回退隔离浏览器; browser=全程隔离浏览器
+    youtube_read_mode: str = "hybrid"         # hybrid | api | browser
+    youtube_write_mode: str = "browser"       # browser
     # 视频号读取模式: auto=优先桌面微信原生 Finder CDP 协议、回退创作者助手页面;
     # protocol=仅原生 Finder 协议; browser=仅创作者助手页面。
     channels_read_mode: str = "auto"          # auto | protocol | browser
@@ -111,22 +115,22 @@ class EngineConfig:
     xhs_dm_realtime_debounce_seconds: float = 1.5
     xhs_dm_fallback_interval_seconds: int = 600
     xhs_dm_max_conversations_per_poll: int = 2
-    xhs_dm_poll_jitter: float = 0.0
+    xhs_dm_poll_jitter: float = 0.30
     xhs_dm_auto_reply_enabled: bool = False
     active_accounts: int = 3                # 同一时刻最多并发活跃的账号数(错峰)
-    scan_jitter: float = 0.0                # 周期扫描额外等待上限比例(0=关闭,由风控中心随机错峰开关统一管理)
-    initial_scan_spread_seconds: int = 0    # 新监控/规则首次自动执行额外等待上限(秒,0=关闭)
+    scan_jitter: float = 0.20               # 周期扫描额外等待上限比例(由风控中心随机错峰开关统一管理)
+    initial_scan_spread_seconds: int = 45   # 新监控/规则首次自动执行额外等待上限(秒)
     route_download_via_proxy: bool = True   # 媒体下载是否走账号代理(避免 CDN 拉流暴露真实 IP)
     # ── 自动评论基础限制(默认全部关闭/0=不限,需要限制时建议在「风控中心 → 风控规则」统一开启)──
     comment_daily_cap_per_account: int = 0   # 每账号每日自动评论总上限(跨所有规则),0=不限
     comment_min_gap_seconds: int = 0         # 同账号两条评论的全局最小间隔(秒),0=不限
-    comment_jitter: float = 0.0              # 评论排队间隔额外等待上限比例(0=关闭)
+    comment_jitter: float = 0.25             # 评论排队间隔额外等待上限比例
     comment_hourly_cap_per_account: int = 0  # 每账号每小时自动评论上限,0=不限
     comment_risk_cooldown_seconds: int = 21600  # 平台拒绝/验证后暂停该账号写操作参考时长(默认6小时)
     # 小红书评论发布通道:browser=页面操作;api=显式兼容;manual=只保留草稿。
     xhs_comment_write_mode: str = "browser"  # browser | api | manual
-    # true=先存草稿,人工点击“通过”后由队列自动发布; false=生成后直接排队发布。
-    xhs_comment_review_before_publish: bool = True
+    # 全局强制保险锁(默认关闭): true=强制所有小红书评论先存草稿审核(覆盖单条规则); false=按各规则自身「发布前审核」开关决定。
+    xhs_comment_review_before_publish: bool = False
     # 抖音发评论用有头浏览器(弹真实窗口):抖音对无头写操作常降级/拦截,有头更稳,
     # 且能让你手动过验证码;量大嫌弹窗可设 false 试无头。
     comment_browser_headed: bool = True
@@ -179,21 +183,21 @@ class LoggingConfig:
 
 @dataclass
 class RiskControlConfig:
-    """Unified, opt-in cross-feature risk control rules (all disabled by default)."""
-    # 总开关默认关闭；开启后仅生效下方已勾选的子规则模块
-    enabled: bool = False
+    """Unified cross-feature risk control rules (baseline protections enabled by default)."""
+    # 总开关默认开启基线防护（冷却/节拍/同出口串行/随机错峰），写额度硬上限保持按需勾选
+    enabled: bool = True
     # custom=所见即所得（输入值直接生效）；conservative 保留用于兼容旧配置文件
     mode: str = "custom"
-    # 分模块独立开关（全部默认关闭，用户可按需勾选或在 UI 一键套用场景方案）
-    cooldown_enabled: bool = False        # 异常自动冷却与渐进恢复
-    write_limits_enabled: bool = False    # 写操作间隔与每小时/每日额度保护
-    pacing_enabled: bool = False          # 读写防抖与连续操作自动休息
-    network_guard_enabled: bool = False   # 同网络出口串行与多号熔断保护
-    jitter_enabled: bool = False          # 自动任务随机错峰（扫描/评论/私信/首跑/重试）
-    # 以下参数仅在对应模块开启时生效，默认预填稳妥均衡参考值便于一键开启
+    # 分模块独立开关（默认开启非侵入式基础防护，用户可在「风控中心」随时调整）
+    cooldown_enabled: bool = True         # 异常自动冷却与渐进恢复
+    write_limits_enabled: bool = False    # 写操作间隔与每小时/每日额度保护（按需开启）
+    pacing_enabled: bool = True           # 读写防抖与连续操作自动休息
+    network_guard_enabled: bool = True    # 同网络出口串行与多号熔断保护
+    jitter_enabled: bool = True           # 自动任务随机错峰（扫描/评论/私信/首跑/重试）
+    # 以下参数仅在对应模块开启时生效
     network_group_concurrency: int = 1
-    read_light_gap_seconds: int = 15
-    read_heavy_gap_seconds: int = 45
+    read_light_gap_seconds: int = 8
+    read_heavy_gap_seconds: int = 20
     shared_write_gap_seconds: int = 180
     comment_min_gap_seconds: int = 300
     comment_hourly_cap: int = 6
@@ -220,11 +224,11 @@ class RiskControlConfig:
     network_group_risk_window_seconds: int = 900
     network_group_cooldown_seconds: int = 7200
     # 账号级操作节奏与连续操作休息（仅在 pacing_enabled=True 时生效）。
-    operation_gap_min_seconds: int = 6
-    operation_gap_max_seconds: int = 18
+    operation_gap_min_seconds: int = 3
+    operation_gap_max_seconds: int = 8
     session_operation_limit: int = 15
-    session_rest_min_seconds: int = 120
-    session_rest_max_seconds: int = 300
+    session_rest_min_seconds: int = 90
+    session_rest_max_seconds: int = 210
     network_retry_jitter_seconds: int = 30  # 网络失败退避额外随机等待上限（仅 jitter_enabled=True 时生效）
 
 
@@ -290,7 +294,8 @@ def load_config(path: str | None = None) -> Config:
                 ("instagram_read_mode", "hybrid"),
                 ("instagram_write_mode", "hybrid"),
                 ("twitter_read_mode", "hybrid"),
-                ("facebook_read_mode", "hybrid")):
+                ("facebook_read_mode", "hybrid"),
+                ("youtube_read_mode", "hybrid")):
             mode = str(getattr(cfg.engine, name, default) or default).strip().lower()
             setattr(cfg.engine, name, mode if mode in {"hybrid", "api", "browser"}
                     else default)
@@ -313,6 +318,8 @@ def load_config(path: str | None = None) -> Config:
         for name in ("scan_jitter", "comment_jitter"):
             value = float(getattr(cfg.engine, name))
             setattr(cfg.engine, name, min(1.0, max(0.0, value)) if math.isfinite(value) else 0.0)
+        cfg.engine.collection_concurrency = max(
+            1, min(8, int(cfg.engine.collection_concurrency or 2)))
         cfg.engine.initial_scan_spread_seconds = max(
             0, min(600, int(cfg.engine.initial_scan_spread_seconds)))
         cfg.engine.quiet_hours_wake_jitter_minutes = max(

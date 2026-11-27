@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import datetime
+import hashlib
 import json
 
 from fastapi import HTTPException
+from sqlmodel import select
 
 from app import runtime as app_runtime
+from app.browser.storage_state import capture_context_storage_state, merge_state_origins
 from app.db import get_session
-from app.models import DouyinAccount
+from app.models import AccountActionTask, CommentTask, DouyinAccount, PublishTask
 from app.windowing import CHROMIUM_WINDOW_CLASSES, bring_window_to_front, capture_window_snapshot
 
 
@@ -37,11 +41,71 @@ def _active_login_task() -> tuple[str, dict] | None:
     return None
 
 
+def _schedule_dead_lease_reap(account_id: int, lease: "_OpenBrowserLease") -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if not loop.is_closed():
+        loop.create_task(_release_open_browser(account_id, lease))
+
+
+def _lease_is_alive(lease) -> bool:
+    if lease is None:
+        return False
+    checker = getattr(lease, "is_alive", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    return bool(getattr(lease, "active", True))
+
+
 def _active_open_browser_account_ids() -> list[int]:
-    return [
-        account_id for account_id, lease in app_runtime.open_browsers.items()
-        if bool(getattr(lease, "active", True))
-    ]
+    alive: list[int] = []
+    for account_id, lease in list(app_runtime.open_browsers.items()):
+        if _lease_is_alive(lease):
+            alive.append(account_id)
+        else:
+            _schedule_dead_lease_reap(account_id, lease)
+    return alive
+
+
+async def has_active_open_browser(account_id: int | None) -> bool:
+    """Return True if this account owns a live manual browser window; reap stale leases."""
+    if not account_id:
+        return False
+    lease = app_runtime.open_browsers.get(account_id)
+    if lease is None:
+        return False
+    if _lease_is_alive(lease):
+        return True
+    await _release_open_browser(account_id, lease)
+    return False
+
+
+async def close_open_browser_for_account(
+    account_id: int | None,
+    *,
+    nudge: bool = True,
+) -> bool:
+    """Persist cookies, close the manual browser window, and release its account lock."""
+    if not account_id:
+        return False
+    lease = app_runtime.open_browsers.pop(account_id, None)
+    closed = False
+    if lease is not None:
+        try:
+            await lease.close()
+            closed = True
+        except Exception:
+            pass
+    if app_runtime.browser is not None:
+        with suppress(Exception):
+            await app_runtime.browser.close_context(account_id)
+    _wake_open_browser_blocked_tasks(account_id, nudge=nudge)
+    return closed
 
 
 def _login_scope_label(platform: str, creator: bool) -> str:
@@ -55,6 +119,7 @@ def _login_scope_label(platform: str, creator: bool) -> str:
         "instagram": "Instagram",
         "twitter": "Twitter",
         "facebook": "Facebook",
+        "youtube": "YouTube",
         "douyin": "抖音",
     }.get(platform, platform or "平台")
     return f"{label}创作者" if creator else label
@@ -112,73 +177,248 @@ class _OpenBrowserLease:
     """Keep the unified account/network guard until a headed context closes."""
 
     def __init__(self, context, guard, close_callback=None, page=None,
-                 *, account_id: int | None = None, open_scope: str = "read"):
+                 *, account_id: int | None = None, open_scope: str = "read",
+                 platform: str = ""):
         self.context = context
         self.guard = guard
         self.close_callback = close_callback
         self.page = page
         self.account_id = account_id
         self.open_scope = open_scope
+        self.platform = str(platform or "").strip().lower()
         self._released = False
         self._closed = False
         self._release_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
+        self._persist_lock = asyncio.Lock()
+        self._last_cookie_digest = ""
+        self._sync_task: asyncio.Task | None = None
+        self._debounce_task: asyncio.Task | None = None
 
     @property
     def active(self) -> bool:
         return not self._released and not self._closed
 
-    async def _persist_context_state(self) -> None:
-        if not self.account_id or self.context is None:
-            return
-        storage_fn = getattr(self.context, "storage_state", None)
-        if not callable(storage_fn):
+    def is_alive(self) -> bool:
+        """Verify the underlying Playwright/Patchright context still has a live page."""
+        if not self.active or self.context is None:
+            return False
+        try:
+            browser = getattr(self.context, "browser", None)
+            if browser is not None:
+                is_connected = getattr(browser, "is_connected", None)
+                if callable(is_connected) and not is_connected():
+                    return False
+            pages = getattr(self.context, "pages", None)
+            if pages is not None:
+                page_list = list(pages)
+                if not page_list:
+                    return False
+                if all(bool(getattr(p, "is_closed", lambda: False)()) for p in page_list):
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def start_state_sync(self, interval_seconds: float = 8.0) -> None:
+        """Periodically persist changed cookies while the manual window is open.
+
+        If the user solves an in-page captcha and then closes Chromium with the
+        window X button, ``ctx.on('close')`` runs after the context is already
+        torn down and ``storage_state()`` raises TargetClosedError. Syncing on
+        cookie changes while open ensures verified cookies still land in DB.
+        """
+        if self._sync_task is not None and not self._sync_task.done():
             return
         try:
-            state_obj = await storage_fn()
-            if not isinstance(state_obj, dict) or not state_obj.get("cookies"):
-                return
-            state_json = json.dumps(state_obj, ensure_ascii=False)
-            with get_session() as session:
-                account = session.get(DouyinAccount, self.account_id)
-                if account is None:
-                    return
-                now_utc = datetime.utcnow()
-                if self.open_scope == "creator" and account.platform in {"xhs", "rednote"}:
-                    account.creator_storage_state = state_json
-                else:
-                    account.storage_state = state_json
-                    if account.platform in {"kuaishou", "shipinhao", "bilibili", "instagram", "twitter", "facebook"}:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if loop.is_closed():
+            return
+        step = max(3.0, float(interval_seconds))
+
+        async def _loop() -> None:
+            try:
+                while self.active and self.is_alive():
+                    await asyncio.sleep(step)
+                    if not self.active or not self.is_alive():
+                        break
+                    await self._persist_context_state(force=False)
+            except asyncio.CancelledError:
+                pass
+
+        self._sync_task = loop.create_task(_loop())
+
+    def schedule_persist(self, delay: float = 1.5) -> None:
+        """Debounced cookie persistence triggered by manual window navigation."""
+        if not self.active:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if loop.is_closed():
+            return
+        if self._debounce_task is not None and not self._debounce_task.done():
+            self._debounce_task.cancel()
+
+        async def _run() -> None:
+            try:
+                await asyncio.sleep(max(0.2, float(delay)))
+                if self.active and self.is_alive():
+                    await self._persist_context_state(force=False)
+            except asyncio.CancelledError:
+                pass
+
+        self._debounce_task = loop.create_task(_run())
+
+    @staticmethod
+    def _has_douyin_auth_cookies(state_obj: dict) -> bool:
+        auth_names = {"sessionid", "sessionid_ss", "sid_tt"}
+        return any(
+            isinstance(c, dict) and str(c.get("name") or "") in auth_names
+            for c in (state_obj.get("cookies") or [])
+        )
+
+    async def _persist_context_state(self, *, force: bool = True) -> bool:
+        if not self.account_id or self.context is None:
+            return False
+        async with self._persist_lock:
+            if not force and not self.active:
+                return False
+            try:
+                if not self.platform:
+                    with get_session() as session:
+                        account = session.get(DouyinAccount, self.account_id)
+                        if account is None:
+                            return False
+                        self.platform = str(account.platform or "").strip().lower()
+                live_state = await capture_context_storage_state(
+                    self.context,
+                    platform=self.platform,
+                    timeout=5.0,
+                    filter_cookies_by_platform=(self.platform == "rednote"),
+                )
+                if not isinstance(live_state, dict) or not live_state.get("cookies"):
+                    return False
+                live_digest = hashlib.sha256(
+                    json.dumps(live_state, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                if not force and live_digest == self._last_cookie_digest:
+                    return False
+                with get_session() as session:
+                    account = session.get(DouyinAccount, self.account_id)
+                    if account is None:
+                        return False
+                    platform = str(account.platform or self.platform or "").strip().lower()
+                    self.platform = platform
+                    is_creator_scope = (
+                        self.open_scope == "creator" and platform in {"xhs", "rednote"}
+                    )
+                    prev_raw = (
+                        account.creator_storage_state if is_creator_scope else account.storage_state
+                    ) or ""
+                    state_obj = {
+                        "cookies": live_state["cookies"],
+                        "origins": merge_state_origins(
+                            prev_raw, live_state.get("origins"), platform=platform
+                        ),
+                    }
+                    if platform == "douyin" and account.storage_state:
+                        try:
+                            prev_state = json.loads(account.storage_state)
+                        except Exception:
+                            prev_state = {}
+                        if (
+                            isinstance(prev_state, dict)
+                            and self._has_douyin_auth_cookies(prev_state)
+                            and not self._has_douyin_auth_cookies(state_obj)
+                        ):
+                            return False
+                    state_json = json.dumps(state_obj, ensure_ascii=False)
+                    now_utc = datetime.utcnow()
+                    if is_creator_scope:
                         account.creator_storage_state = state_json
-                account.last_keepalive_at = now_utc
-                account.last_cookie_refresh_at = now_utc
-                account.keepalive_note = "已从账号浏览器窗口同步最新登录态"
-                session.add(account)
-                session.commit()
-        except Exception:
-            # 窗口若已被用户直接点 X 关闭，storage_state() 可能抛 TargetClosedError；静默跳过即可
-            pass
+                    else:
+                        account.storage_state = state_json
+                        if platform in {"kuaishou", "shipinhao", "bilibili", "instagram", "twitter", "facebook", "youtube"}:
+                            account.creator_storage_state = state_json
+                    account.last_keepalive_at = now_utc
+                    account.last_cookie_refresh_at = now_utc
+                    account.keepalive_note = "已从账号浏览器窗口同步最新登录态"
+                    session.add(account)
+                    session.commit()
+                self._last_cookie_digest = live_digest
+                return True
+            except Exception:
+                # 窗口若已被用户直接点 X 关闭，cookies() 可能抛 TargetClosedError；静默跳过即可
+                return False
 
     async def release(self) -> None:
         async with self._release_lock:
             if self._released:
                 return
             self._released = True
-            await self.guard.__aexit__(None, None, None)
+            with suppress(Exception):
+                await self.guard.__aexit__(None, None, None)
 
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
                 return
             self._closed = True
+            for bg_task in (self._debounce_task, self._sync_task):
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
             try:
-                await self._persist_context_state()
-                if self.close_callback is not None:
-                    await self.close_callback()
-                else:
-                    await self.context.close()
+                await self._persist_context_state(force=True)
+                with suppress(Exception):
+                    if self.close_callback is not None:
+                        await asyncio.wait_for(self.close_callback(), timeout=10.0)
+                    elif self.context is not None:
+                        await asyncio.wait_for(self.context.close(), timeout=10.0)
             finally:
                 await self.release()
+
+
+def _wake_open_browser_blocked_tasks(account_id: int, *, nudge: bool = True) -> None:
+    """Clear open_browser deferral markers once the manual window closes and optionally nudge publisher."""
+    if not account_id:
+        return
+    woken_publish = False
+    try:
+        with get_session() as session:
+            changed = False
+            for model in (PublishTask, CommentTask, AccountActionTask):
+                rows = session.exec(
+                    select(model).where(
+                        model.account_id == account_id,
+                        model.status == "pending",
+                        model.blocked_signal == "open_browser",
+                    )
+                ).all()
+                for row in rows:
+                    row.blocked_reason = ""
+                    row.blocked_signal = ""
+                    row.blocked_operation = ""
+                    row.blocked_at = None
+                    row.next_allowed_at = None
+                    if row.error and "手动浏览器" in row.error:
+                        row.error = ""
+                    session.add(row)
+                    changed = True
+                    if model is PublishTask:
+                        woken_publish = True
+            if changed:
+                session.commit()
+    except Exception:
+        pass
+    if nudge and woken_publish and app_runtime.engine is not None:
+        nudge_fn = getattr(app_runtime.engine, "nudge_publish_queue", None)
+        if callable(nudge_fn):
+            with suppress(Exception):
+                nudge_fn()
 
 
 async def _release_open_browser(account_id: int, lease: _OpenBrowserLease) -> None:
@@ -187,6 +427,7 @@ async def _release_open_browser(account_id: int, lease: _OpenBrowserLease) -> No
     finally:
         if app_runtime.open_browsers.get(account_id) is lease:
             app_runtime.open_browsers.pop(account_id, None)
+        _wake_open_browser_blocked_tasks(account_id)
 
 
 def _persist_native_ua(account_id: int, ua: str) -> None:
@@ -225,7 +466,11 @@ def _persist_douyin_read_session(identity, profile: dict, state: dict, recipe: d
         if not binding:
             return False
         now_utc = datetime.utcnow()
-        account.storage_state = json.dumps(state, ensure_ascii=False)
+        merged_state = dict(state)
+        merged_state["origins"] = merge_state_origins(
+            account.storage_state, state.get("origins"), platform="douyin"
+        )
+        account.storage_state = json.dumps(merged_state, ensure_ascii=False)
         account.last_keepalive_at = now_utc
         account.last_cookie_refresh_at = now_utc
         account.keepalive_note = "抖音浏览器被动同步最新登录态"

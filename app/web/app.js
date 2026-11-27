@@ -110,6 +110,58 @@ function apiFetch(path, options) {
   return fetch(path, { ...options, credentials: "same-origin" });
 }
 
+// 支持真实上传字节进度、速率与取消的 FormData 上传封装（替代无进度的 fetch 上传）。
+function apiUploadWithProgress(path, formData, { onProgress = null, signal = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", path, true);
+    xhr.withCredentials = true;
+    try {
+      const adminToken = sessionStorage.getItem("creatorhub-risk-admin-token") || "";
+      if (adminToken) xhr.setRequestHeader("X-CreatorHub-Admin-Token", adminToken);
+    } catch (e) {}
+    xhr.setRequestHeader("X-CreatorHub-Actor", "creatorhub-web");
+    const startedAt = Date.now();
+    if (xhr.upload && typeof onProgress === "function") {
+      xhr.upload.onprogress = e => {
+        const loaded = Number(e.loaded || 0);
+        const total = e.lengthComputable ? Number(e.total || 0) : 0;
+        const elapsedSec = Math.max(0.1, (Date.now() - startedAt) / 1000);
+        const speedBps = loaded / elapsedSec;
+        const percent = total > 0 ? Math.min(99, Math.round((loaded * 100) / total)) : null;
+        const etaSeconds = (total > loaded && speedBps > 0) ? Math.max(1, Math.round((total - loaded) / speedBps)) : null;
+        try { onProgress({ loaded, total, percent, speedBps, etaSeconds }); } catch (_) {}
+      };
+    }
+    const onAbort = () => { try { xhr.abort(); } catch (_) {} };
+    if (signal) {
+      if (signal.aborted) { onAbort(); reject(new Error("上传已取消")); return; }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    const cleanup = () => { if (signal) signal.removeEventListener("abort", onAbort); };
+    xhr.onload = () => {
+      cleanup();
+      let body = {};
+      try { body = JSON.parse(xhr.responseText || "{}"); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (typeof onProgress === "function") {
+          try { onProgress({ loaded: 1, total: 1, percent: 100, speedBps: 0, etaSeconds: 0 }); } catch (_) {}
+        }
+        resolve(body);
+        return;
+      }
+      const err = new Error(apiErrorMessage(body.detail, xhr.status));
+      err.status = xhr.status;
+      err.detail = body.detail;
+      reject(err);
+    };
+    xhr.onerror = () => { cleanup(); reject(new Error("上传网络异常，请重试")); };
+    xhr.onabort = () => { cleanup(); reject(new Error("上传已取消")); };
+    xhr.send(formData);
+  });
+}
+window.apiUploadWithProgress = apiUploadWithProgress;
+
 const api = async (path, opts) => {
   const workbenchRequest = globalThis.CreatorHubWorkbench?.requestStarted?.({ path, method: (opts?.method || "GET").toUpperCase() });
   _apiActive++; _barSync();
@@ -509,6 +561,570 @@ function uiPrompt({ title, hint, value, placeholder, multiline, rows, secret = f
   });
 }
 
+// 01b-progress-center.js — 全局统一 SSE 实时进度总线与顶栏「活动任务中心」浮层。
+(() => {
+  const ACTIVE_STATES = new Set(["queued", "running", "waiting_user", "blocked"]);
+  const TERMINAL_STATES = new Set(["completed", "failed", "canceled"]);
+  const CATEGORY_META = {
+    collection: { label: "关键词采集", tab: "collections" },
+    share_download: { label: "链接下载", tab: "share-download" },
+    publish: { label: "内容发布", tab: "publish" },
+    monitor_download: { label: "监控下载", tab: "monitors" },
+    collection_download: { label: "采集下载", tab: "collections" },
+    monitor_scan: { label: "主页作品监控", tab: "monitors" },
+    follow_sync: { label: "关注/粉丝", tab: "hub" },
+    matrix_batch: { label: "矩阵批处理", tab: "accounts" },
+    works_sync: { label: "作品同步", tab: "hub" },
+    comment_rule: { label: "自动评论", tab: "autocomment" },
+    runtime: { label: "系统组件", tab: "accounts" },
+    task: { label: "后台任务", tab: "queue" },
+  };
+  const STATUS_META = {
+    queued: { label: "排队中", tone: "neutral" },
+    running: { label: "执行中", tone: "info" },
+    waiting_user: { label: "需人工处理", tone: "warn" },
+    blocked: { label: "风控延后", tone: "warn" },
+    completed: { label: "已完成", tone: "ok" },
+    failed: { label: "失败", tone: "danger" },
+    canceled: { label: "已取消", tone: "neutral" },
+  };
+
+  const tasks = new Map();
+  const listeners = new Set();
+  const eventListeners = new Map();
+  let es = null;
+  let connected = false;
+  let reconnectTimer = null;
+  let fallbackTimer = null;
+  let tickTimer = null;
+  let drawerOpen = false;
+  let started = false;
+
+  function fmtBytes(bytes) {
+    let n = Number(bytes || 0);
+    if (!Number.isFinite(n) || n <= 0) return "0 B";
+    if (n < 1024) return `${Math.round(n)} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+    return `${n.toFixed(n >= 100 ? 0 : n >= 10 ? 1 : 2)} ${units[i]}`;
+  }
+
+  function fmtSpeed(bps) {
+    const n = Number(bps || 0);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    return `${fmtBytes(n)}/s`;
+  }
+
+  function fmtDuration(sec) {
+    const s = Math.max(0, Math.round(Number(sec || 0)));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    if (m < 60) return rem ? `${m}分${String(rem).padStart(2, "0")}秒` : `${m}分`;
+    const h = Math.floor(m / 60);
+    return `${h}小时${m % 60}分`;
+  }
+
+  function fmtEta(sec) {
+    const n = Number(sec);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    return `剩余约 ${fmtDuration(n)}`;
+  }
+
+  function fmtCountdown(iso) {
+    if (!iso) return "";
+    const ts = Date.parse(iso.endsWith("Z") ? iso : iso + "Z");
+    if (!Number.isFinite(ts)) return "";
+    const diff = Math.ceil((ts - Date.now()) / 1000);
+    if (diff <= 0) return "即将恢复";
+    const m = Math.floor(diff / 60);
+    const s = diff % 60;
+    if (m >= 60) return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${String(s).padStart(2, "0")} 后恢复`;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")} 后恢复`;
+  }
+
+  function elapsedSeconds(task) {
+    if (TERMINAL_STATES.has(task.status)) return Math.max(0, Number(task.elapsed_seconds || 0));
+    const startedTs = task.started_at ? Date.parse(task.started_at.endsWith("Z") ? task.started_at : task.started_at + "Z") : NaN;
+    if (Number.isFinite(startedTs)) return Math.max(0, Math.floor((Date.now() - startedTs) / 1000));
+    return Math.max(0, Number(task.elapsed_seconds || 0));
+  }
+
+  function renderProgressBar({ determinate = false, percent = null, tone = "info", label = "任务进度", compact = false } = {}) {
+    const hasPct = determinate && percent !== null && percent !== undefined && Number.isFinite(Number(percent));
+    const pct = hasPct ? Math.max(0, Math.min(100, Number(percent))) : 0;
+    const cls = [
+      "progress-track",
+      compact ? "is-compact" : "",
+      hasPct ? "" : "is-indeterminate",
+    ].filter(Boolean).join(" ");
+    const fillCls = ["progress-fill", tone && tone !== "info" ? `tone-${tone}` : ""].filter(Boolean).join(" ");
+    const widthStyle = hasPct ? `width:${pct.toFixed(1)}%` : "";
+    const ariaVal = hasPct ? ` aria-valuenow="${Math.round(pct)}"` : "";
+    return `<div class="${cls}" role="progressbar" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100"${ariaVal}><div class="${fillCls}" style="${widthStyle}"></div></div>`;
+  }
+
+  function sortedTasks() {
+    const rank = { waiting_user: 0, running: 1, queued: 2, blocked: 3, failed: 4, canceled: 5, completed: 6 };
+    return [...tasks.values()].sort((a, b) => {
+      const ra = rank[a.status] ?? 9;
+      const rb = rank[b.status] ?? 9;
+      if (ra !== rb) return ra - rb;
+      return String(b.updated_at || "").localeCompare(String(a.updated_at || ""));
+    });
+  }
+
+  function notify(changedTask = null, kind = "update") {
+    for (const fn of listeners) {
+      try { fn(changedTask, kind); } catch (_) {}
+    }
+    renderTrigger();
+    if (drawerOpen) renderDrawer();
+    ensureTickLoop();
+    try {
+      window.dispatchEvent(new CustomEvent("creatorhub:progress:update", { detail: { task: changedTask, kind } }));
+    } catch (_) {}
+  }
+
+  function emitBusinessEvent(name, payload) {
+    const set = eventListeners.get(name);
+    if (set) {
+      for (const fn of set) {
+        try { fn(payload); } catch (_) {}
+      }
+    }
+    try {
+      window.dispatchEvent(new CustomEvent(`creatorhub:sse:${name}`, { detail: payload }));
+    } catch (_) {}
+  }
+
+  function applyTask(task) {
+    if (!task || !task.task_key) return;
+    const prev = tasks.get(task.task_key);
+    tasks.set(task.task_key, task);
+    if (prev && ACTIVE_STATES.has(prev.status) && TERMINAL_STATES.has(task.status)) {
+      onTaskFinished(task);
+    }
+    if (task.category === "follow_sync") {
+      syncFollowUiFromTask(task);
+    }
+    notify(task, "task");
+  }
+
+  function syncFollowUiFromTask(task) {
+    if (typeof renderFollowSyncStatus !== "function") return;
+    const dir = task.extra?.direction;
+    if (!dir || String(task.account_id || "") !== String(typeof HUB_ACC !== "undefined" ? HUB_ACC : "")) return;
+    const stMap = { queued: "queued", running: "running", blocked: "deferred", completed: "completed", failed: "failed", canceled: "canceled" };
+    const view = {
+      id: task.extra?.job_id || "",
+      account_id: task.account_id,
+      direction: dir,
+      status: stMap[task.status] || task.status,
+      phase: task.phase,
+      pages: task.metrics?.pages || 0,
+      fetched: task.metrics?.fetched || 0,
+      saved: task.metrics?.saved || 0,
+      added: task.metrics?.added || 0,
+      expected_total: task.total || 0,
+      percent: task.percent,
+      capped: !!task.extra?.capped,
+      source: task.extra?.source || "",
+      error: task.error || "",
+      cancelable: !!task.cancelable,
+    };
+    renderFollowSyncStatus(dir, view);
+    if (TERMINAL_STATES.has(task.status) || task.status === "blocked") {
+      if (task.status === "completed" && typeof refreshFollows === "function") {
+        refreshFollows(dir, 1);
+        if (typeof refreshHubSummary === "function") refreshHubSummary();
+      }
+    }
+  }
+
+  function onTaskFinished(task) {
+    // 重要后台任务完成时刷新相关视图角标；避免与用户当前操作冲突。
+    if (typeof refreshTaskQueueBadge === "function") refreshTaskQueueBadge();
+    if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "queue" && typeof refreshTaskQueue === "function") {
+      refreshTaskQueue();
+    }
+    if (task.category === "share_download" && task.status === "completed") {
+      if (typeof refreshShareHistory === "function") refreshShareHistory();
+    } else if (task.category === "collection") {
+      if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "collections" && typeof refreshCollections === "function") {
+        refreshCollections();
+      }
+    } else if (task.category === "publish") {
+      if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "publish" && typeof refreshPublish === "function") {
+        refreshPublish();
+      }
+    } else if (task.category === "monitor_scan" || task.category === "monitor_download") {
+      if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "monitors") {
+        if (typeof refreshMonitors === "function") refreshMonitors();
+        if (typeof refreshContents === "function") refreshContents();
+      }
+    } else if (task.category === "works_sync") {
+      if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "hub") {
+        if (typeof refreshMyWorks === "function") refreshMyWorks();
+        if (typeof refreshHubSummary === "function") refreshHubSummary();
+      }
+    }
+  }
+
+  function applySnapshot(list) {
+    tasks.clear();
+    if (Array.isArray(list)) {
+      list.forEach(item => { if (item && item.task_key) tasks.set(item.task_key, item); });
+    }
+    notify(null, "snapshot");
+  }
+
+  function renderTrigger() {
+    const btn = $("activity-trigger");
+    if (!btn) return;
+    const all = [...tasks.values()];
+    const active = all.filter(t => ACTIVE_STATES.has(t.status));
+    const waiting = active.filter(t => t.status === "waiting_user");
+    const running = active.filter(t => t.status === "running" || t.status === "queued");
+    const failedRecent = all.filter(t => t.status === "failed");
+
+    const labelEl = $("activity-trigger-label");
+    const countEl = $("activity-trigger-count");
+    const barEl = $("activity-trigger-bar");
+
+    const isIdle = active.length === 0 && failedRecent.length === 0;
+    btn.classList.toggle("is-idle", isIdle);
+    btn.classList.toggle("is-active", active.length > 0);
+    btn.classList.toggle("is-warn", waiting.length > 0);
+    btn.classList.toggle("is-error", waiting.length === 0 && active.length === 0 && failedRecent.length > 0);
+    btn.title = active.length > 0
+      ? `活动任务中心 · ${active.length} 项进行中`
+      : (failedRecent.length > 0 ? `活动任务中心 · ${failedRecent.length} 项失败` : "活动任务中心 · 查看后台实时进度");
+
+    const detTasks = running.filter(t => t.determinate && Number.isFinite(Number(t.percent)));
+    const avgPct = detTasks.length
+      ? Math.round(detTasks.reduce((sum, t) => sum + Math.max(0, Math.min(100, Number(t.percent))), 0) / detTasks.length)
+      : null;
+
+    if (waiting.length > 0) {
+      if (labelEl) labelEl.textContent = `需处理 ${waiting.length}`;
+    } else if (running.length > 0) {
+      if (labelEl) labelEl.textContent = avgPct !== null ? `进行中 · ${avgPct}%` : `进行中`;
+    } else if (active.length > 0) {
+      if (labelEl) labelEl.textContent = `等待恢复 ${active.length}`;
+    } else if (failedRecent.length > 0) {
+      if (labelEl) labelEl.textContent = `失败 ${failedRecent.length}`;
+    } else {
+      if (labelEl) labelEl.textContent = "活动中心";
+    }
+
+    if (countEl) {
+      const badgeNum = active.length || all.length;
+      countEl.hidden = badgeNum <= 0;
+      countEl.textContent = String(badgeNum);
+    }
+
+    if (barEl) {
+      const inner = barEl.firstElementChild;
+      if (running.length > 0 && inner) {
+        barEl.classList.add("on");
+        barEl.classList.toggle("indeterminate", avgPct === null);
+        inner.style.width = avgPct !== null ? `${avgPct}%` : "";
+      } else {
+        barEl.classList.remove("on", "indeterminate");
+        if (inner) inner.style.width = "0%";
+      }
+    }
+  }
+
+  function taskMetaLine(task) {
+    const bits = [];
+    if (task.unit === "bytes" && Number(task.total) > 0) {
+      bits.push(`${fmtBytes(task.current)} / ${fmtBytes(task.total)}`);
+    } else if (task.unit === "bytes" && Number(task.current) > 0) {
+      bits.push(`已下载 ${fmtBytes(task.current)}`);
+    } else if (Number(task.total) > 0 && task.unit === "items") {
+      bits.push(`${fmtNum(task.current)} / ${fmtNum(task.total)}`);
+    }
+    const spd = fmtSpeed(task.speed_bps);
+    if (spd) bits.push(spd);
+    const eta = fmtEta(task.eta_seconds);
+    if (eta) bits.push(eta);
+    if (task.status === "blocked" && task.next_allowed_at) {
+      const cd = fmtCountdown(task.next_allowed_at);
+      if (cd) bits.push(cd);
+    }
+    const sec = elapsedSeconds(task);
+    if (sec > 0 && ACTIVE_STATES.has(task.status)) bits.push(`已用 ${fmtDuration(sec)}`);
+    return bits.join(" · ");
+  }
+
+  function renderDrawerItem(task) {
+    const cat = CATEGORY_META[task.category] || CATEGORY_META.task;
+    const st = STATUS_META[task.status] || STATUS_META.running;
+    const pfName = task.platform && typeof PF_NAME !== "undefined" ? (PF_NAME[task.platform] || task.platform) : "";
+    const barTone = st.tone === "danger" ? "danger" : st.tone === "warn" ? "warn" : st.tone === "ok" ? "ok" : "info";
+    const hasPct = task.determinate && task.percent !== null && task.percent !== undefined && Number.isFinite(Number(task.percent));
+    const pctText = hasPct ? `${Math.round(Number(task.percent))}%` : (ACTIVE_STATES.has(task.status) ? "进行中" : st.label);
+    const meta = taskMetaLine(task);
+    const showBar = ACTIVE_STATES.has(task.status) || task.status === "completed";
+    const actionBtn = task.action_required
+      ? `<button type="button" class="sm" onclick="window.CreatorHubProgress.handleTaskAction(${jsArg(task.task_key)})">${esc(task.action_required.label || "去处理")}</button>`
+      : "";
+    return `<article class="act-item tone-${st.tone}" data-task-key="${esc(task.task_key)}">
+      <div class="act-item-head">
+        <div class="act-item-badges">
+          <span class="pill bare">${esc(cat.label)}</span>
+          ${pfName ? `<span class="pill bare">${esc(pfName)}</span>` : ""}
+          <span class="pill ${st.tone === "ok" ? "done" : st.tone === "danger" ? "failed" : st.tone === "warn" ? "pending" : "downloading"} bare">${esc(st.label)}</span>
+        </div>
+        <span class="act-item-pct progress-num">${esc(pctText)}</span>
+      </div>
+      <div class="act-item-title" title="${esc(task.title)}">${esc(task.title)}</div>
+      <div class="act-item-phase">
+        <span>${esc(task.phase_label || st.label)}</span>
+        ${task.detail ? `<span class="mut"> · ${esc(task.detail)}</span>` : ""}
+      </div>
+      ${showBar ? renderProgressBar({ determinate: task.determinate, percent: task.percent, tone: barTone, label: task.title, compact: true }) : ""}
+      ${meta ? `<div class="act-item-meta progress-num">${esc(meta)}</div>` : ""}
+      ${task.error ? `<div class="act-item-err" title="${esc(task.error)}">${esc(task.error)}</div>` : ""}
+      <div class="act-item-actions">
+        ${actionBtn}
+        ${task.cancelable ? `<button type="button" class="ghost sm danger" onclick="window.CreatorHubProgress.cancelTask(${jsArg(task.task_key)}, this)">取消</button>` : ""}
+        <button type="button" class="ghost sm" onclick="window.CreatorHubProgress.jumpToTask(${jsArg(task.task_key)})">定位</button>
+      </div>
+    </article>`;
+  }
+
+  function renderDrawer() {
+    const body = $("activity-drawer-body");
+    const sub = $("activity-drawer-sub");
+    const clearBtn = $("activity-clear-btn");
+    if (!body) return;
+    const all = sortedTasks();
+    const active = all.filter(t => ACTIVE_STATES.has(t.status));
+    const finished = all.filter(t => TERMINAL_STATES.has(t.status));
+    if (clearBtn) clearBtn.hidden = finished.length === 0;
+    if (sub) {
+      const connHint = connected ? "实时推送已连接" : "自动重连中";
+      sub.textContent = active.length
+        ? `${active.length} 项进行中 · ${connHint}`
+        : (finished.length ? `近期 ${finished.length} 项已结束 · ${connHint}` : `当前无后台活动任务 · ${connHint}`);
+    }
+    if (!all.length) {
+      setHtmlIfChanged(body, `<div class="act-empty"><div class="empty-ic">${ic("i-check")}</div><b>一切空闲</b><span>发起采集、链接下载、发布或批量检测后，可在这里跨页查看实时进度。</span></div>`);
+      return;
+    }
+    const groups = [
+      ["需要处理", all.filter(t => t.status === "waiting_user" || t.status === "blocked")],
+      ["正在执行", all.filter(t => t.status === "running" || t.status === "queued")],
+      ["最近结束", finished],
+    ].filter(([, list]) => list.length > 0);
+    const html = groups.map(([title, list]) =>
+      `<section class="act-group"><h4 class="act-group-title">${esc(title)} <span>${list.length}</span></h4><div class="act-list">${list.map(renderDrawerItem).join("")}</div></section>`
+    ).join("");
+    setHtmlIfChanged(body, html);
+  }
+
+  function toggleDrawer(force) {
+    const drawer = $("activity-drawer");
+    const trigger = $("activity-trigger");
+    if (!drawer) return;
+    drawerOpen = typeof force === "boolean" ? force : !drawerOpen;
+    drawer.hidden = !drawerOpen;
+    if (trigger) trigger.setAttribute("aria-expanded", String(drawerOpen));
+    if (drawerOpen) {
+      renderDrawer();
+      ensureTickLoop();
+    }
+  }
+
+  function ensureTickLoop() {
+    const hasLive = [...tasks.values()].some(t => ACTIVE_STATES.has(t.status));
+    if (drawerOpen && hasLive) {
+      if (!tickTimer) {
+        tickTimer = setInterval(() => {
+          if (drawerOpen && !document.hidden) renderDrawer();
+        }, 1000);
+      }
+    } else if (tickTimer) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+  }
+
+  async function cancelTask(taskKey, btn = null) {
+    if (!taskKey) return;
+    const run = async () => {
+      try {
+        const res = await api(`/api/progress/tasks/${encodeURIComponent(taskKey)}/cancel`, { method: "POST" });
+        if (res && res.ok) toast("已发送取消请求", "info", 3000);
+      } catch (e) {
+        toast("取消失败：" + e.message, "err");
+      }
+    };
+    if (btn) await withBusy(btn, "取消中", run);
+    else await run();
+  }
+
+  async function clearFinished() {
+    try {
+      await api("/api/progress/clear-finished", { method: "POST" });
+      for (const [key, item] of [...tasks.entries()]) {
+        if (TERMINAL_STATES.has(item.status)) tasks.delete(key);
+      }
+      notify(null, "clear_finished");
+    } catch (e) {
+      toast("清理失败：" + e.message, "err");
+    }
+  }
+
+  function jumpToTask(taskKey) {
+    const task = tasks.get(taskKey);
+    if (!task) return;
+    const cat = CATEGORY_META[task.category] || CATEGORY_META.task;
+    const targetTab = task.source_tab || cat.tab || "queue";
+    if (task.platform && typeof PLATFORM !== "undefined" && task.platform !== PLATFORM && targetTab !== "share-download" && targetTab !== "accounts" && targetTab !== "queue") {
+      if (typeof switchPlatform === "function") switchPlatform(task.platform);
+    }
+    if (typeof switchTab === "function") switchTab(targetTab, true);
+    toggleDrawer(false);
+  }
+
+  function handleTaskAction(taskKey) {
+    const task = tasks.get(taskKey);
+    const act = task && task.action_required;
+    if (!act) { jumpToTask(taskKey); return; }
+    if (act.kind === "open_browser" && act.account_id && typeof openAccountBrowser === "function") {
+      openAccountBrowser(act.account_id, act.url || "");
+      return;
+    }
+    if (act.kind === "close_and_publish" && act.task_id && typeof runPublish === "function") {
+      toggleDrawer(false);
+      runPublish(act.task_id, true);
+      return;
+    }
+    jumpToTask(taskKey);
+  }
+
+  async function fetchSnapshotFallback() {
+    if (document.documentElement?.dataset?.preview === "true") return;
+    try {
+      const r = await apiFetch("/api/progress/tasks");
+      if (!r.ok) return;
+      const data = await r.json();
+      if (data && Array.isArray(data.tasks)) applySnapshot(data.tasks);
+    } catch (_) {}
+  }
+
+  function connect() {
+    if (document.documentElement?.dataset?.preview === "true") return;
+    if (typeof EventSource === "undefined") {
+      fetchSnapshotFallback();
+      if (!fallbackTimer) fallbackTimer = setInterval(fetchSnapshotFallback, 3000);
+      return;
+    }
+    if (es) { try { es.close(); } catch (_) {} es = null; }
+    clearTimeout(reconnectTimer);
+    try {
+      es = new EventSource("/api/progress/stream");
+      es.addEventListener("snapshot", e => {
+        connected = true;
+        if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
+        try {
+          const data = JSON.parse(e.data || "{}");
+          applySnapshot(data.tasks || []);
+        } catch (_) {}
+      });
+      es.addEventListener("task", e => {
+        connected = true;
+        try { applyTask(JSON.parse(e.data || "{}")); } catch (_) {}
+      });
+      es.addEventListener("remove", e => {
+        try {
+          const data = JSON.parse(e.data || "{}");
+          if (data.task_key && tasks.delete(data.task_key)) notify(null, "remove");
+        } catch (_) {}
+      });
+      es.addEventListener("clear_finished", e => {
+        try {
+          const data = JSON.parse(e.data || "{}");
+          (data.task_keys || []).forEach(k => tasks.delete(k));
+          notify(null, "clear_finished");
+        } catch (_) {}
+      });
+      es.addEventListener("event", e => {
+        try {
+          const data = JSON.parse(e.data || "{}");
+          if (data.name) emitBusinessEvent(data.name, data.payload || {});
+        } catch (_) {}
+      });
+      es.onerror = () => {
+        connected = false;
+        if (drawerOpen) renderDrawer();
+        if (es) { try { es.close(); } catch (_) {} es = null; }
+        if (!fallbackTimer) fallbackTimer = setInterval(fetchSnapshotFallback, 4000);
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 3500);
+      };
+    } catch (_) {
+      connected = false;
+      if (!fallbackTimer) fallbackTimer = setInterval(fetchSnapshotFallback, 4000);
+    }
+  }
+
+  function start() {
+    if (started) return;
+    started = true;
+    document.addEventListener("click", e => {
+      if (!drawerOpen) return;
+      const drawer = $("activity-drawer");
+      const trigger = $("activity-trigger");
+      if (drawer && !drawer.contains(e.target) && (!trigger || !trigger.contains(e.target))) {
+        toggleDrawer(false);
+      }
+    });
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape" && drawerOpen) toggleDrawer(false);
+    });
+    const spinner = $("busy-spinner");
+    if (spinner) {
+      spinner.style.cursor = "pointer";
+      spinner.title = "点击打开活动任务中心";
+      spinner.addEventListener("click", () => {
+        if (tasks.size > 0) toggleDrawer(true);
+      });
+    }
+    connect();
+  }
+
+  window.CreatorHubProgress = {
+    start,
+    isConnected: () => connected,
+    getTasks: sortedTasks,
+    getTask: key => tasks.get(key) || null,
+    getActiveCount: () => [...tasks.values()].filter(t => ACTIVE_STATES.has(t.status)).length,
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+    onEvent(name, fn) {
+      if (!eventListeners.has(name)) eventListeners.set(name, new Set());
+      eventListeners.get(name).add(fn);
+      return () => eventListeners.get(name)?.delete(fn);
+    },
+    toggleDrawer,
+    cancelTask,
+    clearFinished,
+    jumpToTask,
+    handleTaskAction,
+    fmtBytes,
+    fmtSpeed,
+    fmtDuration,
+    fmtEta,
+    fmtCountdown,
+    renderProgressBar,
+  };
+})();
+
 // 02-ui-controls.js — 渐进增强下拉框、自定义悬浮提示、日期时间选择器与总览趋势图。
 // ─── 自定义下拉:渐进增强原生 <select>(美化展开列表)───
 // 弹层挂到 body 以避开卡片 overflow；Tab 时显式回到文档顺序，避免焦点落到 body 末尾。
@@ -630,6 +1246,7 @@ function enhanceSelect(sel) {
     panel.setAttribute("role", "listbox");
     panel.setAttribute("aria-label", selectLabel.trim());
     Array.from(sel.options).forEach((o, i) => {
+      if (o.hidden || o.classList.contains("hidden")) return;
       const it = document.createElement("div");
       it.className = "cs-opt" + (i === sel.selectedIndex ? " sel" : "") + (o.disabled ? " dis" : "");
       const optionLabel = document.createElement("span");
@@ -929,7 +1546,7 @@ async function refreshOverviewChart() {
   box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="近 7 天每日新增作品与评论柱状图">${gl}${axt}${bars}${labels}</svg><details class="wb-chart-data"><summary>查看每日数据</summary><table><caption class="sr-only">每日新增作品与评论</caption><thead><tr><th>日期</th><th>作品</th><th>评论</th></tr></thead><tbody>${days.map((day, i) => `<tr><th>${esc(day)}</th><td>${Number(A[i]) || 0}</td><td>${Number(B[i]) || 0}</td></tr>`).join("")}</tbody></table></details>`;
 }
 
-// 03-navigation-platform.js — 十平台上下文切换、平台差异化表单显隐与工作台标签页导航。
+// 03-navigation-platform.js — 十一平台上下文切换、平台差异化表单显隐与工作台标签页导航。
 // ─── 平台切换(抖音 / 小红书) ───
 
 async function exportMonitorReport(explicitBtn = null) {
@@ -1113,14 +1730,14 @@ async function exportModuleReport(module, full = false, explicitBtn = null) {
 
 let PLATFORM = "douyin";
 let GLOBAL_MODE = true;
-const PF_NAME = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook" };
+const PF_NAME = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook", youtube: "YouTube" };
 let CURRENT_TAB = "overview";
 const PAGE_META = {
   overview: {
     title: "指挥概览", desc: "跨平台查看账号健康态势、高赞内容快览与今日发布排期。"
   },
   "media-hub": {
-    title: "汇总预览库", desc: "跨平台统一画廊预览监控作品、批量采集、自有作品与本地下载素材，支持右侧分栏快览。"
+    title: "汇总预览库", desc: "跨平台统一画廊预览主页作品监控、关键词采集、自有作品与本地下载素材，支持右侧分栏快览。"
   },
   accounts: {
     title: "账号矩阵", desc: "按跨平台人设组管理多账号，支持异常快筛、批量配代理与连续扫码补登。"
@@ -1129,10 +1746,10 @@ const PAGE_META = {
     title: "风控中心", desc: "统一管理风控规则，查看账号状态、触发原因、恢复进度与事件记录。"
   },
   monitors: {
-    title: "作品监控", desc: "追踪关注的创作者，检查采集进度与新作品。"
+    title: "主页作品监控", desc: "持续追踪关注的创作者主页新作品，检查采集进度与自动下载（单条作品请用「链接下载」）。"
   },
   collections: {
-    title: "批量作品采集", desc: "按平台支持的来源批量采集作品、评论与可用媒体。"
+    title: "关键词采集", desc: "按关键词批量搜索作品、抓取评论并按需下载媒体。"
   },
   comments: {
     title: "评论监控", desc: "订阅作品或账号评论，按来源、分组和标签筛选。"
@@ -1145,6 +1762,9 @@ const PAGE_META = {
   },
   "tiktok-tools": {
     title: "用户互动", desc: "搜索其他 TikTok 用户并创建关注、取关、私信、评论或回复任务。"
+  },
+  "youtube-tools": {
+    title: "互动与养号", desc: "执行 YouTube 视频/评论互动、按真实播放进度观看、关键词搜索养号、筛选发现与多品牌频道管理。"
   },
   publish: {
     title: "内容发布", desc: "支持单账号精细发布或跨平台多账号错峰矩阵群发。"
@@ -1165,28 +1785,46 @@ const PAGE_META = {
     title: "设置", desc: "管理外观、下载、AI 文案与采集运行配置。"
   },
 };
-const SINGLE_PF_ONLY_TABS = ["monitors", "collections", "comments", "danmaku", "tiktok-tools", "autocomment"];
+const SINGLE_PF_ONLY_TABS = ["monitors", "collections", "comments", "danmaku", "tiktok-tools", "youtube-tools", "autocomment"];
 function updatePageContext(name = CURRENT_TAB) {
   const meta = PAGE_META[name] || PAGE_META.overview;
   const showGlobalLabel = GLOBAL_MODE && !SINGLE_PF_ONLY_TABS.includes(name);
-  const effectiveTitle = (GLOBAL_MODE && name === "publish") ? "矩阵群发与排期" : meta.title;
-  const effectiveDesc = (GLOBAL_MODE && name === "publish")
-    ? "一次上传素材与主文案，按跨平台矩阵组一键错峰群发，并统一追踪全平台发布进度。"
-    : meta.desc;
+  const pfName = PF_NAME[PLATFORM] || "当前平台";
+  let effectiveTitle = meta.title;
+  let effectiveDesc = meta.desc;
+  if (GLOBAL_MODE) {
+    if (name === "publish") {
+      effectiveTitle = "矩阵群发与排期";
+      effectiveDesc = "一次上传素材与主文案，按跨平台矩阵组一键错峰群发，并统一追踪全平台发布进度。";
+    }
+  } else {
+    if (name === "overview") {
+      effectiveDesc = `查看 ${pfName} 账号健康态势、高赞内容快览与今日发布排期。`;
+    } else if (name === "media-hub") {
+      effectiveDesc = `统一画廊预览 ${pfName} 主页作品监控、关键词采集、自有作品与本地下载素材，支持右侧分栏快览。`;
+    } else if (name === "accounts") {
+      effectiveDesc = `管理 ${pfName} 账号登录态、分组归类、独立代理与浏览器指纹环境。`;
+    } else if (name === "hub") {
+      effectiveTitle = "数据与私信";
+      effectiveDesc = `对比 ${pfName} 各账号涨粉、播放、0播异常与聚合私信，或下钻单账号明细。`;
+    } else if (name === "publish") {
+      effectiveDesc = `支持 ${pfName} 单账号精细发布或同平台多账号错峰群发。`;
+    }
+  }
   if ($("page-title")) $("page-title").textContent = effectiveTitle;
   if ($("page-desc")) $("page-desc").textContent = effectiveDesc;
-  if ($("page-platform")) $("page-platform").textContent = showGlobalLabel ? "全平台矩阵" : (PF_NAME[PLATFORM] || "当前平台");
-  if ($("page-kicker")) $("page-kicker").textContent = showGlobalLabel ? "跨 10 大平台全局视角" : (pfIsChannels(PLATFORM) ? "本账号工作台" : "单平台精细工作台");
+  if ($("page-platform")) $("page-platform").textContent = showGlobalLabel ? "全平台矩阵" : pfName;
+  if ($("page-kicker")) $("page-kicker").textContent = showGlobalLabel ? "跨 11 大平台全局视角" : (pfIsChannels(PLATFORM) ? "本账号工作台" : "单平台精细工作台");
   document.title = `${effectiveTitle} · ${showGlobalLabel ? "全平台" : (PF_NAME[PLATFORM] || "")} | CreatorHub`;
   globalThis.CreatorHubWorkbench?.navigate?.();
 }
 // 是否支持「发布」面板
-function pfHasPublish(pf) { return ["xhs", "rednote", "kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(pf); }
+function pfHasPublish(pf) { return ["xhs", "rednote", "kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(pf); }
 // 视频号只有「本账号」数据(助手接口本账号),不支持监控他人作品/评论
 function pfIsChannels(pf) { return pf === "shipinhao"; }
 function switchPlatform(pf) {
   const wantGlobal = pf === "all";
-  if (!wantGlobal && !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(pf)) pf = "douyin";
+  if (!wantGlobal && !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(pf)) pf = "douyin";
   if (!wantGlobal) globalThis.CreatorHubWorkbench?.platformChanging?.(pf);
   GLOBAL_MODE = wantGlobal;
   if (!wantGlobal) PLATFORM = pf;
@@ -1219,16 +1857,19 @@ function switchPlatform(pf) {
     if (!wantGlobal) localStorage.setItem("dym-pf", pf);
   } catch (e) {}
   if ($("queue-platform")) {
-    $("queue-platform").value = wantGlobal ? "all" : "current";
+    $("queue-platform").value = wantGlobal ? "all" : PLATFORM;
     $("queue-platform")._csSync?.();
   }
+  if (typeof selShareHistory !== "undefined") selShareHistory.clear();
   applyPlatformUI();
   ["t-interval", "w-interval", "d-w-interval"].forEach(id => $(id)?._monitorIntervalSync?.());
   // 切换后立刻刷新对应数据
   refreshAccounts(); refreshMonitors(); refreshContents(); refreshWatches(); refreshComments(); refreshDanmakuWatches(); refreshDanmaku(); refreshCollections();
   updateTaskQueuePlatformLabel();
   if (CURRENT_TAB === "queue") refreshTaskQueue(true); else refreshTaskQueueBadge();
+  if (CURRENT_TAB === "share-download" && typeof renderShareHistoryRows === "function") renderShareHistoryRows(true);
   if (CURRENT_TAB === "risk-control") refreshRiskCenter(true, false);
+  resetAcReviewDefaultForPlatform(PLATFORM);
   populateAcAccount(); onAcMode(); refreshCommentRules(); refreshCommentTasks();
   if (pfHasPublish(PLATFORM)) refreshPublish();
   if (CURRENT_TAB === "overview") loop();
@@ -1245,6 +1886,7 @@ function applyPlatformUI() {
   document.body.classList.toggle("pf-instagram", !GLOBAL_MODE && PLATFORM === "instagram");
   document.body.classList.toggle("pf-twitter", !GLOBAL_MODE && PLATFORM === "twitter");
   document.body.classList.toggle("pf-facebook", !GLOBAL_MODE && PLATFORM === "facebook");
+  document.body.classList.toggle("pf-youtube", !GLOBAL_MODE && PLATFORM === "youtube");
   // 视频号:只有本账号数据,隐藏「监控他人作品/评论」相关入口(.notsh-only)
   document.body.classList.toggle("pf-channels", !GLOBAL_MODE && pfIsChannels(PLATFORM));
   if (!["douyin", "bilibili"].includes(PLATFORM) && CURRENT_TAB === "danmaku") switchTab("overview");
@@ -1253,7 +1895,15 @@ function applyPlatformUI() {
     b.classList.toggle("active", active);
     b.setAttribute("aria-selected", active ? "true" : "false");
     b.tabIndex = active ? 0 : -1;
+    if (active) {
+      try {
+        b.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+      } catch (_) {}
+    }
   });
+  if (typeof window._syncPlatformStripOverflow === "function") {
+    requestAnimationFrame(window._syncPlatformStripOverflow);
+  }
   document.querySelectorAll(".dy-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "douyin"));
   document.querySelectorAll(".xhs-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "xhs"));
   document.querySelectorAll(".ks-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "kuaishou"));
@@ -1271,6 +1921,8 @@ function applyPlatformUI() {
   document.querySelectorAll(".tw-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "twitter"));
   document.querySelectorAll(".fb-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "facebook"));
   document.querySelectorAll(".fb-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "facebook"));
+  document.querySelectorAll(".yt-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "youtube"));
+  document.querySelectorAll(".yt-hide").forEach(e => e.classList.toggle("hidden", PLATFORM === "youtube"));
   document.querySelectorAll(".danmaku-only").forEach(e => e.classList.toggle("hidden", !["douyin", "bilibili"].includes(PLATFORM)));
   document.querySelectorAll(".notsh-only").forEach(e => {
     const allowOnChannels = pfIsChannels(PLATFORM) && (
@@ -1278,11 +1930,11 @@ function applyPlatformUI() {
       || e.dataset?.tab === "comments"
       || (e.classList.contains("quick-action") && (e.getAttribute("onclick") || "").includes("'monitors'"))
     );
-    const hideByPlatform = (e.classList.contains("tk-hide") && PLATFORM === "tiktok") || (e.classList.contains("bili-hide") && PLATFORM === "bilibili") || (e.classList.contains("rn-hide") && PLATFORM === "rednote");
+    const hideByPlatform = (e.classList.contains("tk-hide") && PLATFORM === "tiktok") || (e.classList.contains("bili-hide") && PLATFORM === "bilibili") || (e.classList.contains("rn-hide") && PLATFORM === "rednote") || (e.classList.contains("yt-hide") && PLATFORM === "youtube");
     e.classList.toggle("hidden", hideByPlatform || (pfIsChannels(PLATFORM) && !allowOnChannels));
   });
   document.querySelectorAll(".collect-only").forEach(e => e.classList.toggle(
-    "hidden", !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM)));
+    "hidden", !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM)));
   // 全平台模式下隐藏所有单平台专属采集/监控/互动入口与分组标题
   if (GLOBAL_MODE) {
     document.querySelectorAll(".single-pf-only").forEach(e => e.classList.add("hidden"));
@@ -1297,16 +1949,16 @@ function applyPlatformUI() {
   // 发布面板入口
   document.querySelectorAll(".pub-only").forEach(e => e.classList.toggle("hidden", !GLOBAL_MODE && !pfHasPublish(PLATFORM)));
   // 发布面板文案随平台切换
-  const ks = PLATFORM === "kuaishou", dy = PLATFORM === "douyin", sph = PLATFORM === "shipinhao", tk = PLATFORM === "tiktok", bili = PLATFORM === "bilibili", rn = PLATFORM === "rednote", ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook";
+  const ks = PLATFORM === "kuaishou", dy = PLATFORM === "douyin", sph = PLATFORM === "shipinhao", tk = PLATFORM === "tiktok", bili = PLATFORM === "bilibili", rn = PLATFORM === "rednote", ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook", yt = PLATFORM === "youtube";
   const pubType = $("pub-type");
   if (pubType) {
     const before = pubType.value;
-    if (tk) pubType.innerHTML = '<option value="video">视频</option>';
+    if (tk || yt) pubType.innerHTML = '<option value="video">视频</option>';
     else if (![...pubType.options].some(o => o.value === "images")) {
       pubType.innerHTML = '<option value="images">图文（图集）</option><option value="video">视频</option>';
       pubType.value = before === "video" ? "video" : "images";
     }
-    if (tk) pubType.value = "video";
+    if (tk || yt) pubType.value = "video";
     if (pubType.value !== before) onPubType();
   }
   const pubSub = $("pub-head-sub");
@@ -1318,14 +1970,15 @@ function applyPlatformUI() {
     : ig ? "上传单图 / 轮播 / Reels / Story 到 Instagram"
     : tw ? "发布纯文本 / 图集（最多 4 图） / 视频推文到 X (Twitter)"
     : fb ? "发布纯文本 / 图集（最多 20 图） / 视频到 Facebook 个人主页、公共主页、群组或 Story"
+    : yt ? "通过 YouTube Studio 上传常规视频或 Shorts（支持品牌频道切换、标签/播单/缩略图与首评）"
     : rn ? "上传图集 / 视频到海外小红书 creator.rednote.com"
     : "上传图集 / 视频到小红书(实验性)";
-  if ($("pub-head-lead")) $("pub-head-lead").textContent = tw ? "发布推文" : fb ? "发布帖子" : (ks || dy || sph || tk || bili || ig) ? "发布作品" : "发布笔记";
-  const titleCap = fb ? 5000 : tw ? ($("pub-tw-long")?.value === "1" ? 4000 : 280) : ig ? 2200 : bili ? 80 : rn ? 40 : dy ? 30 : sph ? 16 : 20;
-  if ($("pub-title-label-text")) $("pub-title-label-text").textContent = fb ? `首行标题（可选，正文与话题合并 ≤${titleCap} 字）` : tw ? `推文首行标题（可选，合并总重 ≤${titleCap}）` : rn ? "标题(≤20 汉字 / 40 英文字符)" : `标题(≤${titleCap} 字)`;
+  if ($("pub-head-lead")) $("pub-head-lead").textContent = tw ? "发布推文" : fb ? "发布帖子" : yt ? "上传视频" : (ks || dy || sph || tk || bili || ig) ? "发布作品" : "发布笔记";
+  const titleCap = fb ? 5000 : tw ? ($("pub-tw-long")?.value === "1" ? 4000 : 280) : ig ? 2200 : yt ? 100 : bili ? 80 : rn ? 40 : dy ? 30 : sph ? 16 : 20;
+  if ($("pub-title-label-text")) $("pub-title-label-text").textContent = fb ? `首行标题（可选，正文与话题合并 ≤${titleCap} 字）` : tw ? `推文首行标题（可选，合并总重 ≤${titleCap}）` : yt ? `视频标题（必填，≤${titleCap} 字符）` : rn ? "标题(≤20 汉字 / 40 英文字符)" : `标题(≤${titleCap} 字)`;
   if ($("pub-title")) {
     $("pub-title").maxLength = titleCap;
-    $("pub-title").placeholder = fb ? "帖子首行标题（可选，正文与话题会自动合并，可纯文本发布）" : tw ? "推文首行（可选，直接填正文也可；URL 固定计 23 权重）" : ig ? "Caption 首行标题（可选，正文与话题自动合并）" : bili ? "填写视频稿件标题（图文动态可选）" : tk ? "视频说明的首行标题" : (ks || dy || sph) ? "给作品起个标题" : "给笔记起个标题";
+    $("pub-title").placeholder = fb ? "帖子首行标题（可选，正文与话题会自动合并，可纯文本发布）" : tw ? "推文首行（可选，直接填正文也可；URL 固定计 23 权重）" : yt ? "填写 YouTube 视频标题（最多 100 字符，Shorts 形态会自动追加 #Shorts）" : ig ? "Caption 首行标题（可选，正文与话题自动合并）" : bili ? "填写视频稿件标题（图文动态可选）" : tk ? "视频说明的首行标题" : (ks || dy || sph) ? "给作品起个标题" : "给笔记起个标题";
   }
   if ($("pub-dy-opts")) $("pub-dy-opts").classList.toggle("hidden", !["douyin", "xhs", "rednote", "kuaishou"].includes(PLATFORM));
   if (bili) { onBiliCopyrightChange(); if ($("pub-acc")?.value) loadBiliPartitions($("pub-acc").value); }
@@ -1345,6 +1998,8 @@ function applyPlatformUI() {
     ? "支持纯文本推文、最多 4 张图片或单个视频/GIF，可配置回复权限与首评自回复串推。通过独立可见浏览器窗口完成上传并拦截 CreateTweet 响应确认，提交只执行一次；若显示“结果待确认”，请先到 x.com 主页核对。"
     : fb
     ? "支持纯文本、最多 20 张图片或单个视频，可发布到个人动态、公共主页（自动通过 i_user 切换身份并在完成后恢复）、Facebook 群组或 Story，支持可见范围与发布后自动首评。提交只执行一次；若显示“结果待确认”，请先到 facebook.com 主页核对。"
+    : yt
+    ? "通过账号独立的可见浏览器窗口在 YouTube Studio 上传单个视频或 Shorts，支持切换品牌频道、设置标题/简介/Tags/播放列表/缩略图/儿童向声明/公开·不公开·私享·即时首映及发布后自动追加首评。提交只执行一次；若显示“结果待确认”，请先到 studio.youtube.com 核对。"
     : rn
     ? "发布通过海外小红书 creator.rednote.com 独立可见浏览器窗口完成（拦截 webapi.rednote.com/web_api/sns/v2/note 确认），不混用国内小红书会话。提交只点击一次；若显示“结果待确认”，请先到平台核对。"
     : "发布通过账号独立的可见 Chrome 页面完成。提交只点击一次；若显示“结果待确认”，请先到小红书核对，系统不会自动重发。";
@@ -1354,14 +2009,22 @@ function applyPlatformUI() {
     if (copy) copy.textContent = pubHintText;
     else pubHint.textContent = pubHintText;
   }
+  if (typeof updatePubCoverHelp === "function") updatePubCoverHelp();
+  if (typeof onPubActionChange === "function") onPubActionChange();
+  if (typeof syncPublishPlatformFields === "function") syncPublishPlatformFields();
   // 评论监控「类型」下拉随平台改写文案
   const wk = $("w-kind");
   if (wk) {
     const cur = wk.value;
-    wk.innerHTML = (PLATFORM === "xhs" || PLATFORM === "rednote")
-      ? '<option value="auto">类型:自动识别</option><option value="video">单条笔记</option><option value="user">创作者近期笔记</option>'
-      : '<option value="auto">类型:自动识别</option><option value="video">单条视频</option><option value="user">账号近期作品</option>';
+    const isNotePf = PLATFORM === "xhs" || PLATFORM === "rednote";
+    const isTweetPf = PLATFORM === "twitter";
+    const isPostPf = PLATFORM === "instagram" || PLATFORM === "facebook";
+    const isYtPf = PLATFORM === "youtube";
+    const videoText = isNotePf ? "单条笔记" : isTweetPf ? "单条推文" : isPostPf ? "单条帖子" : "单条视频";
+    const userText = isNotePf ? "创作者近期笔记" : isTweetPf ? "账号近期推文" : isPostPf ? "主页近期帖子" : isYtPf ? "频道近期视频" : "账号近期作品";
+    wk.innerHTML = `<option value="auto">自动识别（粘贴链接自动联动）</option><option value="video">${videoText}</option><option value="user">${userText}</option>`;
     if ([...wk.options].some(o => o.value === cur)) wk.value = cur;
+    wk._csSync?.();
   }
   const wl = $("w-url-label");
   if (wl) wl.textContent = (PLATFORM === "xhs" || PLATFORM === "rednote")
@@ -1372,6 +2035,7 @@ function applyPlatformUI() {
     : PLATFORM === "instagram" ? "帖子 /p/ / Reels /reel/ / 创作者 @username / 主页链接"
     : PLATFORM === "twitter" ? "推文 /status/ / 创作者 @username / x.com 主页链接"
     : PLATFORM === "facebook" ? "帖子 / Reel / Watch 链接或个人/公共主页/群组链接"
+    : PLATFORM === "youtube" ? "视频 watch / Shorts / youtu.be 或频道 /@handle 链接"
     : "视频 / 账号主页 / 完整分享文案 / ID";
   if ($("w-url")) $("w-url").placeholder = PLATFORM === "xhs"
     ? "直接粘贴整段小红书分享文案，将自动提取笔记或主页链接"
@@ -1383,8 +2047,10 @@ function applyPlatformUI() {
     : PLATFORM === "instagram" ? "粘贴 instagram.com/p/...、/reel/...、创作者主页链接或 @username"
     : PLATFORM === "twitter" ? "粘贴 x.com/.../status/...、创作者主页链接或 @username"
     : PLATFORM === "facebook" ? "粘贴 facebook.com 帖子/Reel/Watch 链接、fb.watch 短链、公共主页或群组链接"
+    : PLATFORM === "youtube" ? "粘贴 youtube.com/watch?v=...、youtu.be/...、/shorts/... 或频道 /@handle 链接"
     : "直接粘贴整段抖音分享文案，将自动提取视频或主页链接";
-  resetWatchTargetState();
+  if (typeof applyWatchForm === "function") applyWatchForm(true);
+  else resetWatchTargetState();
   const ckl = $("ck-label");
   if (ckl) ckl.textContent = PLATFORM === "xhs"
     ? "完整 Cookie(含 a1;发布需创作者会话)"
@@ -1394,6 +2060,7 @@ function applyPlatformUI() {
     : PLATFORM === "instagram" ? "完整 Cookie(含 sessionid、ds_user_id 与 csrftoken)"
     : PLATFORM === "twitter" ? "Token (auth_token) / 多字段凭证 / 完整 Cookie"
     : PLATFORM === "facebook" ? "完整 Facebook Cookie(必须含 c_user 与 xs)"
+    : PLATFORM === "youtube" ? "完整 YouTube Cookie(含 SAPISID / SID 等登录项)"
     : "完整 Cookie(含 sessionid)";
   if ($("ck-val")) $("ck-val").placeholder = PLATFORM === "xhs"
     ? "从 creator.xiaohongshu.com 登录后复制完整 Cookie"
@@ -1403,11 +2070,11 @@ function applyPlatformUI() {
     : PLATFORM === "instagram" ? "从 www.instagram.com 登录后复制完整 Cookie(含 sessionid)"
     : PLATFORM === "twitter" ? "可直接粘贴 40 位 auth_token、账号----密码----Token 文本、JSON 数组或 x.com 完整 Cookie"
     : PLATFORM === "facebook" ? "从 www.facebook.com 登录后复制完整 Cookie（含 c_user 与 xs）或粘贴 JSON Cookie 数组"
+    : PLATFORM === "youtube" ? "从 www.youtube.com 复制完整 Cookie（含 SAPISID 与 SID）、Netscape Cookie 文本或 JSON 数组"
     : "从浏览器开发者工具复制完整 Cookie";
   applyMonitorForm();
   applyCollectionForm();
-  if (["douyin", "bilibili"].includes(PLATFORM)) applyDanmakuForm();
-  if ($("t-kind") && !["xhs", "rednote"].includes(PLATFORM)) $("t-kind").value = "creator";
+  if (["douyin", "bilibili"].includes(PLATFORM)) applyDanmakuForm(true);
   // 全平台视角下不展示单平台专属面板：若当前停留在单平台页，自动回到指挥概览
   if (GLOBAL_MODE && SINGLE_PF_ONLY_TABS.includes(CURRENT_TAB)) {
     switchTab("overview");
@@ -1422,16 +2089,20 @@ function applyPlatformUI() {
   }
   if (!GLOBAL_MODE && PLATFORM === "tiktok" && CURRENT_TAB === "autocomment") switchTab("hub");
   if (!GLOBAL_MODE && PLATFORM !== "tiktok" && CURRENT_TAB === "tiktok-tools") switchTab("accounts");
+  if (!GLOBAL_MODE && PLATFORM !== "youtube" && CURRENT_TAB === "youtube-tools") switchTab("accounts");
   if (!GLOBAL_MODE && PLATFORM === "tiktok" && ["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
   if (!GLOBAL_MODE && PLATFORM === "rednote" && CURRENT_TAB === "autocomment") switchTab("hub");
   if (!GLOBAL_MODE && PLATFORM === "rednote" && ["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
-  if (!GLOBAL_MODE && !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && CURRENT_TAB === "collections") switchTab("overview");
-  // 不支持发布的平台:若正停在该面板则回到总览(当前十平台均支持,兜底保留)
+  if (!GLOBAL_MODE && PLATFORM === "youtube" && ["fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
+  if (!GLOBAL_MODE && !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM) && CURRENT_TAB === "collections") switchTab("overview");
+  // 不支持发布的平台:若正停在该面板则回到总览(当前十一平台均支持,兜底保留)
   if (!GLOBAL_MODE && !pfHasPublish(PLATFORM)) {
     const pub = document.querySelector('[data-panel="publish"]');
     if (pub && pub.style.display !== "none") switchTab("overview");
   }
   csSyncAll();   // 平台切换可能改了下拉选项/值,同步自定义下拉显示
+  if (typeof syncShareHistoryPlatformControl === "function") syncShareHistoryPlatformControl();
+  if (typeof updateTaskQueuePlatformLabel === "function") updateTaskQueuePlatformLabel();
   requestAnimationFrame(() => window.dispatchEvent(new Event("creatorhub:layout")));
   updatePageContext();
 }
@@ -1494,9 +2165,13 @@ async function copyTextValue(value, okMsg = "已复制", errMsg = "复制失败�
   }
 }
 
+const QUALITY_PLATFORMS = ["douyin", "kuaishou", "tiktok", "shipinhao", "bilibili", "youtube"];
+
 async function normalizePlatformShareTarget({
-  inputId, feedbackId, platform, button = null, quiet = false, resolveChannelsCreator = false,
+  inputId, feedbackId, platform, button = null, quiet = false, toastErrors = false,
+  resolveChannelsCreator = false, mode = "generic", accountSelectId = "",
 }) {
+  const showErrorToast = !quiet || toastErrors;
   const input = $(inputId);
   if (!input) return null;
   const raw = input.value.trim();
@@ -1510,43 +2185,37 @@ async function normalizePlatformShareTarget({
     button.innerHTML = `<span class="spin"></span><span>识别中</span>`;
   }
   input.removeAttribute("aria-invalid");
-  setSmartTargetFeedback(feedbackId, "正在清洗分享文案并识别链接…", "parsing");
+  setSmartTargetFeedback(feedbackId, "正在识别链接与对象类型…", "parsing");
   try {
-    const result = await api("/api/share-download/links", {
+    const accountId = accountSelectId && $(accountSelectId)?.value ? Number($(accountSelectId).value) : null;
+    const result = await api("/api/targets/detect", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ share_text: raw, limit: 20 }),
+      body: JSON.stringify({
+        raw_input: raw,
+        platform,
+        account_id: accountId || null,
+        expand_short_links: true,
+      }),
     });
     if (seq !== SMART_TARGET_PARSE_SEQ[inputId]) return input.value.trim();
-    const links = Array.isArray(result.links) ? result.links : [];
-    let candidate = raw;
-    let changed = false;
-    if (!links.length) {
-      if (platform === "shipinhao" && isChannelsCreatorId(raw)) {
-        setSmartTargetFeedback(feedbackId, "视频号创作者标识已识别 ✓", "success");
-        return raw;
-      }
-      if (!(platform === "shipinhao" && resolveChannelsCreator && isChannelsWorkUrl(raw))) {
-        setSmartTargetFeedback(feedbackId, "未发现链接，将按作品或用户 ID 直接解析");
-        if (!quiet) toast("没有发现链接；也可以直接填写作品或用户 ID", "err");
-        return raw;
-      }
-    } else {
-      const expectedPlatform = platform === "shipinhao" ? "wechat" : platform;
-      const matched = links.find(item => item && item.platform === expectedPlatform);
-      if (!matched) {
-        const names = [...new Set(links.map(item => smartTargetPlatformName(item.platform)))].join("、");
-        const message = `识别到${names}链接，与当前${smartTargetPlatformName(platform)}页面不匹配`;
-        input.setAttribute("aria-invalid", "true");
-        setSmartTargetFeedback(feedbackId, message, "error");
-        if (!quiet) toast(message, "err");
-        return null;
-      }
-      candidate = String(matched.url || "").trim() || raw;
-      changed = candidate !== raw;
-      if (changed) input.value = candidate;
+    if (result.mismatch) {
+      const message = result.error || `识别到其他平台链接，与当前${smartTargetPlatformName(platform)}页面不匹配`;
+      input.setAttribute("aria-invalid", "true");
+      setSmartTargetFeedback(feedbackId, message, "error");
+      if (showErrorToast) toast(message, "err");
+      return null;
     }
+    const links = Array.isArray(result.links) ? result.links : [];
+    const candidate = String(result.cleaned || raw).trim() || raw;
+    const changed = candidate !== raw;
+    if (changed) input.value = candidate;
+    const detectedKind = String(result.target_kind || "unknown");
+    const kindLabel = String(result.kind_label || "");
+    const canExtractCreator = Boolean(result.can_extract_creator);
+    const pfLabel = result.platform_name || smartTargetPlatformName(platform);
 
-    if (platform === "shipinhao" && resolveChannelsCreator && isChannelsWorkUrl(candidate)) {
+    // 1) 视频号单条作品在「主页作品监控」或「账号评论监控」里自动反查创作者
+    if (platform === "shipinhao" && resolveChannelsCreator && (isChannelsWorkUrl(candidate) || detectedKind === "video")) {
       if (quiet) {
         setSmartTargetFeedback(
           feedbackId,
@@ -1580,11 +2249,102 @@ async function normalizePlatformShareTarget({
       }
     }
 
+    // 2) 主页作品监控联动：误贴单条作品链接给出明确提醒与引导
+    if (mode === "monitor") {
+      if (detectedKind === "video" && !canExtractCreator) {
+        const msg = `检测到${pfLabel}${kindLabel || "单条作品"}链接，不是创作者主页；主页作品监控请粘贴创作者主页链接（单条作品下载请用「链接下载」，单条评论请用「评论监控」）`;
+        input.setAttribute("aria-invalid", "true");
+        setSmartTargetFeedback(feedbackId, msg, "error");
+        if (showErrorToast) toast(msg, "err", 5500);
+        return null;
+      }
+      if (detectedKind === "video" && canExtractCreator) {
+        setSmartTargetFeedback(
+          feedbackId,
+          `已识别${pfLabel}${kindLabel || "作品"}链接，提交后将自动提取创作者主页并监控 ✓`,
+          "success",
+        );
+        return candidate;
+      }
+      if (detectedKind === "user") {
+        setSmartTargetFeedback(
+          feedbackId,
+          `${changed ? "已清洗文案并" : ""}识别为${pfLabel}${kindLabel || "创作者主页"} ✓`,
+          "success",
+        );
+        return candidate;
+      }
+      if (!links.length) {
+        if (platform === "shipinhao" && isChannelsCreatorId(raw)) {
+          setSmartTargetFeedback(feedbackId, "视频号创作者标识已识别 ✓", "success");
+          return raw;
+        }
+        setSmartTargetFeedback(feedbackId, "未发现链接，将按创作者 ID 或主页标识直接解析");
+        if (!quiet) toast("未发现链接；也可以直接填写创作者 ID 或 @用户名", "info");
+        return raw;
+      }
+    }
+
+    // 3) 评论监控联动：按识别出的单条作品/创作者主页自动切换「监控对象类型」并联动相关表单项
+    if (mode === "watch") {
+      const wk = $("w-kind");
+      if (wk && (detectedKind === "video" || detectedKind === "user")) {
+        const prevKind = wk.value;
+        wk.value = detectedKind;
+        wk._csSync?.();
+        if (typeof applyWatchForm === "function") applyWatchForm(false);
+        const optText = wk.selectedOptions?.[0]?.textContent || (detectedKind === "video" ? "单条作品" : "账号近期作品");
+        const switchedHint = prevKind !== detectedKind ? `，已自动切换监控对象为「${optText}」` : `（${optText}）`;
+        setSmartTargetFeedback(
+          feedbackId,
+          `已识别为${pfLabel}${kindLabel || (detectedKind === "video" ? "单条作品" : "创作者主页")}${switchedHint} ✓`,
+          "success",
+        );
+        return candidate;
+      }
+      if (!links.length) {
+        setSmartTargetFeedback(feedbackId, "未发现链接，将按作品或用户 ID 自动解析");
+        if (!quiet) toast("没有发现链接；也可以直接填写作品或用户 ID", "info");
+        return raw;
+      }
+    }
+
+    // 4) 弹幕监控联动：按识别出的视频/账号自动切换「监控对象」，并拦截 B 站图文动态
+    if (mode === "danmaku") {
+      if (result.is_bili_opus) {
+        const msg = "检测到哔哩哔哩图文动态链接；弹幕监控仅支持 BV 视频或 UP 主空间主页";
+        input.setAttribute("aria-invalid", "true");
+        setSmartTargetFeedback(feedbackId, msg, "error");
+        if (showErrorToast) toast(msg, "err", 4500);
+        return null;
+      }
+      const dk = $("d-w-kind");
+      if (dk && (detectedKind === "video" || detectedKind === "user")) {
+        const prevKind = dk.value;
+        dk.value = detectedKind;
+        dk._csSync?.();
+        if (typeof applyDanmakuForm === "function") applyDanmakuForm(false);
+        const optText = dk.selectedOptions?.[0]?.textContent || (detectedKind === "video" ? "单条视频" : "账号近期作品");
+        const switchedHint = prevKind !== detectedKind ? `，已自动切换监控对象为「${optText}」` : `（${optText}）`;
+        setSmartTargetFeedback(
+          feedbackId,
+          `已识别为${pfLabel}${kindLabel || (detectedKind === "video" ? "单条视频" : "创作者主页")}${switchedHint} ✓`,
+          "success",
+        );
+        return candidate;
+      }
+      if (!links.length) {
+        setSmartTargetFeedback(feedbackId, "未发现链接，将按视频 BV/ID 或账号 UID 自动解析");
+        if (!quiet) toast("没有发现链接；也可以直接填写 BV 号、视频 ID 或账号 UID", "info");
+        return raw;
+      }
+    }
+
     setSmartTargetFeedback(
       feedbackId,
       changed
-        ? `已去除无关文案，提取出${smartTargetPlatformName(platform)}链接 ✓`
-        : `${smartTargetPlatformName(platform)}链接已识别 ✓`,
+        ? `已去除无关文案，提取出${pfLabel}链接 ✓`
+        : `${pfLabel}链接已识别 ✓`,
       "success",
     );
     return candidate || raw;
@@ -1602,20 +2362,22 @@ async function normalizePlatformShareTarget({
 }
 
 function resetMonitorTargetState() {
-  const keywordMode = ["xhs", "rednote"].includes(PLATFORM) && $("t-kind") && $("t-kind").value === "keyword";
-  resetSmartTargetState("t-url", "t-url-feedback", keywordMode
-    ? "输入要持续监控的搜索关键词"
-    : PLATFORM === "shipinhao"
+  resetSmartTargetState("t-url", "t-url-feedback",
+    PLATFORM === "shipinhao"
     ? "支持视频号主页链接、v2_...@finder、sph 标识，或单条视频 weixin.qq.com/sph/... 链接（自动反查作者）"
-    : "支持完整分享文案、主页长链、平台短链或用户 ID");
+    : PLATFORM === "tiktok"
+    ? "支持 TikTok 创作者主页链接、@username，或单条视频分享链接（自动提取作者）"
+    : PLATFORM === "bilibili"
+    ? "请粘贴 UP 主空间主页链接（space.bilibili.com/<mid>）、b23.tv 空间短链或纯数字 UID"
+    : "请粘贴创作者主页完整分享文案、主页长链、平台短链或用户 ID（单条作品请前往「链接下载」）");
 }
 
-async function normalizeMonitorTarget(button = null, { quiet = false } = {}) {
-  const keywordMode = ["xhs", "rednote"].includes(PLATFORM) && $("t-kind") && $("t-kind").value === "keyword";
-  if (keywordMode) return $("t-url").value.trim();
+async function normalizeMonitorTarget(button = null, { quiet = false, toastErrors = false } = {}) {
   return normalizePlatformShareTarget({
-    inputId: "t-url", feedbackId: "t-url-feedback", platform: PLATFORM, button, quiet,
+    inputId: "t-url", feedbackId: "t-url-feedback", platform: PLATFORM, button, quiet, toastErrors,
     resolveChannelsCreator: PLATFORM === "shipinhao",
+    mode: "monitor",
+    accountSelectId: "t-acc",
   });
 }
 
@@ -1629,42 +2391,22 @@ function handleMonitorTargetKeydown(event) {
   addMonitor();
 }
 
-function resetCollectionCreatorState() {
-  resetSmartTargetState(
-    "col-source-ref", "col-source-ref-feedback",
-    PLATFORM === "shipinhao"
-      ? "可粘贴视频号 v2_...@finder、主页链接，或直接粘贴单条视频 weixin.qq.com/sph/... 链接（自动反查作者）"
-      : PLATFORM === "kuaishou"
-      ? "使用公开主页作品列表；可粘贴完整分享文案、主页链接、v.kuaishou.com 短链或 user_id"
-      : "使用公开主页作品列表，评论和下载继续沿用下方设置",
-  );
-}
-
-async function normalizeCollectionCreatorTarget(button = null, { quiet = false } = {}) {
-  return normalizePlatformShareTarget({
-    inputId: "col-source-ref", feedbackId: "col-source-ref-feedback", platform: PLATFORM,
-    button, quiet, resolveChannelsCreator: PLATFORM === "shipinhao",
-  });
-}
-
-function handleCollectionCreatorPaste() {
-  setTimeout(() => normalizeCollectionCreatorTarget(null, { quiet: true }), 0);
-}
-
 function resetWatchTargetState() {
   resetSmartTargetState(
     "w-url", "w-url-feedback",
     PLATFORM === "shipinhao" && $("w-kind")?.value === "user"
       ? "已选「账号近期作品」：可粘贴 v2_...@finder、主页链接或单条视频 weixin.qq.com/sph/...（自动反查作者）"
-      : "支持完整分享文案、作品链接、创作者主页、平台短链或 ID",
+      : "粘贴单条作品或创作者主页链接，将自动识别并联动下方「监控对象类型」",
   );
 }
 
 function normalizeWatchTarget(button = null, options = {}) {
   return normalizePlatformShareTarget({
     inputId: "w-url", feedbackId: "w-url-feedback", platform: PLATFORM,
-    button, quiet: !!options.quiet,
+    button, quiet: !!options.quiet, toastErrors: !!options.toastErrors,
     resolveChannelsCreator: PLATFORM === "shipinhao" && $("w-kind")?.value === "user",
+    mode: "watch",
+    accountSelectId: "w-acc",
   });
 }
 
@@ -1682,15 +2424,17 @@ function resetDanmakuTargetState() {
   resetSmartTargetState(
     "d-w-url", "d-w-url-feedback",
     PLATFORM === "bilibili"
-      ? "支持完整哔哩哔哩分享文案、BV/av 号、视频链接、空间主页或短链"
-      : "支持完整抖音分享文案、视频链接、账号主页、短链或 ID",
+      ? "粘贴哔哩哔哩 BV 视频链接或 UP 主空间链接，将自动联动下方「监控对象」"
+      : "粘贴抖音视频或账号主页分享文案，将自动联动下方「监控对象」",
   );
 }
 
 function normalizeDanmakuTarget(button = null, options = {}) {
   return normalizePlatformShareTarget({
     inputId: "d-w-url", feedbackId: "d-w-url-feedback", platform: PLATFORM,
-    button, quiet: !!options.quiet,
+    button, quiet: !!options.quiet, toastErrors: !!options.toastErrors,
+    mode: "danmaku",
+    accountSelectId: "d-w-acc",
   });
 }
 
@@ -1706,7 +2450,24 @@ function handleDanmakuTargetKeydown(event) {
 
 let _LAST_MONITOR_PLATFORM = "";
 
-function applyMonitorForm() {
+function applyMonitorDownloadLinkage() {
+  const dlMode = $("t-download")?.value || "all";
+  const recMedia = $("t-record-media")?.value || "all";
+  const isNone = dlMode === "none";
+  const showQuality = QUALITY_PLATFORMS.includes(PLATFORM) && !isNone && dlMode !== "images";
+  if ($("t-dir-wrap")) $("t-dir-wrap").style.display = isNone ? "none" : "";
+  if ($("t-quality-wrap")) $("t-quality-wrap").style.display = showQuality ? "" : "none";
+  const conflictEl = $("t-download-conflict");
+  if (conflictEl) {
+    const conflict = !isNone && ((recMedia === "video" && dlMode === "images") || (recMedia === "images" && dlMode === "video"));
+    conflictEl.hidden = !conflict;
+    conflictEl.textContent = conflict
+      ? `提示：高级筛选设为「${recMedia === "video" ? "仅视频入库" : "仅图文入库"}」，与自动下载范围「${dlMode === "images" ? "仅图集" : "仅视频"}」互斥，将不会下载任何媒体。`
+      : "";
+  }
+}
+
+function applyMonitorForm(resetFeedback = true) {
   const title = $("mon-add-title");
   const lbl = $("t-url-label");
   const parseButton = document.querySelector('[data-panel="monitors"] .smart-target-action');
@@ -1716,66 +2477,64 @@ function applyMonitorForm() {
   const supportsBackfill = !["xhs", "rednote"].includes(PLATFORM);
   if ($("t-backfill-wrap")) $("t-backfill-wrap").style.display = supportsBackfill ? "" : "none";
   if ($("t-backfill") && _LAST_MONITOR_PLATFORM !== PLATFORM) {
-    $("t-backfill").value = ["shipinhao", "kuaishou", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) ? "5" : "";
+    $("t-backfill").value = ["shipinhao", "kuaishou", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM) ? "5" : "";
     $("t-backfill")._csSync?.();
   }
   _LAST_MONITOR_PLATFORM = PLATFORM;
-  if (["douyin", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM)) {
-    const isKs = PLATFORM === "kuaishou";
-    const isTikTok = PLATFORM === "tiktok";
-    const isBili = PLATFORM === "bilibili";
-    const isIg = PLATFORM === "instagram";
-    const isTw = PLATFORM === "twitter";
-    const isFb = PLATFORM === "facebook";
-    if (title) title.innerHTML = (isKs || isSph || isBili || isIg || isTw || isFb ? '添加创作者监控' : '添加作品监控')
-      + ' <span class="sub">监控并下载新作品</span>';
-    if (lbl) lbl.textContent = isTikTok
-      ? "创作者主页 / 完整分享文案 / @username"
-      : isIg
-      ? "Instagram 主页链接 / @username / 数字 UID"
-      : isTw
-      ? "Twitter (X) 主页链接 / @username / 数字 UID"
-      : isFb
-      ? "Facebook 个人主页 / 公共主页 / 群组链接或数字 ID"
-      : isSph
-      ? "创作者主页 / v2_...@finder / 单条视频分享链接"
-      : isKs
-      ? "创作者主页 / 完整分享文案 / user_id"
-      : isBili
-      ? "UP 主空间主页 / 完整分享文案 / mid"
-      : "创作者主页 / 完整分享文案 / sec_uid";
-    $("t-url").placeholder = isTikTok
-      ? "直接粘贴整段 TikTok 主页或作品分享文案，将自动提取 @username"
-      : isIg
-      ? "粘贴 https://www.instagram.com/<username>/ 或填写 @username"
-      : isTw
-      ? "粘贴 https://x.com/<username> 或填写 @username"
-      : isFb
-      ? "粘贴 https://www.facebook.com/<page>、/groups/<id> 或 profile.php?id=..."
+
+  const isKs = PLATFORM === "kuaishou";
+  const isTikTok = PLATFORM === "tiktok";
+  const isBili = PLATFORM === "bilibili";
+  const isIg = PLATFORM === "instagram";
+  const isTw = PLATFORM === "twitter";
+  const isFb = PLATFORM === "facebook";
+  const isYt = PLATFORM === "youtube";
+  const isXhs = PLATFORM === "xhs";
+  const isRn = PLATFORM === "rednote";
+  if (title) title.innerHTML = '添加主页作品监控 <span class="sub">持续追踪创作者主页新作品，单条作品请用「链接下载」</span>';
+  if (lbl) lbl.textContent = isTikTok
+    ? "创作者主页 / 完整分享文案 / @username"
+    : isIg
+    ? "Instagram 主页链接 / @username / 数字 UID"
+    : isTw
+    ? "Twitter (X) 主页链接 / @username / 数字 UID"
+    : isFb
+    ? "Facebook 个人主页 / 公共主页 / 群组链接或数字 ID"
+    : isYt
+    ? "YouTube 频道链接 / @handle / UC... 频道 ID"
+    : isSph
+    ? "创作者主页 / v2_...@finder / 单条视频分享链接"
+    : isKs
+    ? "创作者主页 / 完整分享文案 / user_id"
+    : isBili
+    ? "UP 主空间主页 / mid"
+    : (isXhs || isRn)
+    ? "创作者主页 / 完整分享文案 / user_id"
+    : "创作者主页 / 完整分享文案 / sec_uid";
+  $("t-url").placeholder = isTikTok
+    ? "粘贴 TikTok 主页或作品分享文案，将自动提取 @username"
+    : isIg
+    ? "粘贴 https://www.instagram.com/<username>/ 或填写 @username"
+    : isTw
+    ? "粘贴 https://x.com/<username> 或填写 @username"
+    : isFb
+    ? "粘贴 https://www.facebook.com/<page>、/groups/<id> 或 profile.php?id=..."
+    : isYt
+      ? "粘贴 https://www.youtube.com/@handle、/channel/UC... 或填写 @handle"
       : isSph
       ? "粘贴视频号主页链接、v2_...@finder、sph 标识或单条视频 weixin.qq.com/sph/... 链接"
       : isKs
       ? "直接粘贴整段快手主页分享文案，将自动提取有效链接"
       : isBili
-      ? "直接粘贴整段哔哩哔哩空间或视频分享文案，或填写 UP 主 mid"
+      ? "粘贴 https://space.bilibili.com/<mid> 空间主页链接、b23.tv 空间短链或填写数字 mid"
+      : isRn
+      ? "粘贴 www.rednote.com/zh/user/profile/... 主页链接或 24 位 user_id"
+      : isXhs
+      ? "直接粘贴整段小红书主页分享文案，将自动提取有效链接"
       : "直接粘贴整段抖音主页分享文案，将自动提取有效链接";
-    if (parseButton) parseButton.classList.remove("hidden");
-    resetMonitorTargetState();
-    return;
-  }
-  const kind = $("t-kind") ? $("t-kind").value : "creator";
-  if (kind === "keyword") {
-    if (title) title.innerHTML = '添加关键词监控 <span class="sub">盯一个搜索词的新笔记</span>';
-    if (lbl) lbl.textContent = "搜索关键词";
-    $("t-url").placeholder = "例如:口红试色 / 露营装备";
-    if (parseButton) parseButton.classList.add("hidden");
-  } else {
-    if (title) title.innerHTML = '添加创作者监控 <span class="sub">监控并下载新笔记</span>';
-    if (lbl) lbl.textContent = "创作者主页 / 完整分享文案 / user_id";
-    $("t-url").placeholder = PLATFORM === "rednote" ? "粘贴 www.rednote.com/zh/user/profile/... 主页链接或 24 位 user_id" : "直接粘贴整段小红书主页分享文案，将自动提取有效链接";
-    if (parseButton) parseButton.classList.remove("hidden");
-  }
-  resetMonitorTargetState();
+  if (parseButton) parseButton.classList.remove("hidden");
+  applyMonitorDownloadLinkage();
+  if (resetFeedback) resetMonitorTargetState();
 }
 
 // ─── 标签页切换 ───
@@ -1834,10 +2593,199 @@ function switchTab(name, pushHistory = false) {
   }
   if (name === "collections") { populateCollectionAccount(); refreshCollections(); }
   if (name === "tiktok-tools") populateTikTokAccounts();
+  if (name === "youtube-tools") populateYouTubeToolsAccounts();
   if (name === "queue") refreshTaskQueue();
   if (name === "risk-control") refreshRiskCenter();
   if (changed && !["hub", "share-download", "collections", "queue", "risk-control"].includes(name)) loop();
 }
+
+
+// ── 单行自适应 Priority+ 平台栏：空间充足全展开，窄屏自动折叠尾部到「+N ▾」并始终保留当前平台可见 ──
+(() => {
+  const host = document.getElementById("pswitch-host");
+  const list = host ? host.querySelector(".pswitch") : document.querySelector(".pswitch");
+  const moreBtn = document.getElementById("pswitch-more-btn");
+  const moreLabel = document.getElementById("pswitch-more-label");
+  const moreDot = document.getElementById("pswitch-more-dot");
+  const popover = document.getElementById("pswitch-popover");
+  if (!host || !list || !moreBtn) return;
+
+  let popOpen = false;
+  let rafId = 0;
+  let lastLayoutSig = "";
+  const moOpts = { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class"] };
+  const mo = new MutationObserver(() => { lastLayoutSig = ""; scheduleLayout(); });
+
+  function tabButtons() {
+    return [...list.querySelectorAll('button[role="tab"][data-pf]')];
+  }
+
+  function layoutPriority() {
+    rafId = 0;
+    const available = Math.floor(host.clientWidth);
+    if (available <= 0) return;
+    const allBtns = tabButtons();
+    const activePf = allBtns.find(b => b.classList.contains("active"))?.dataset.pf || "";
+    const sig = `${available}:${activePf}:${allBtns.map(b => b.classList.contains("ps-idle-hidden") ? "0" : b.textContent.trim()).join("|")}`;
+    if (sig === lastLayoutSig) return;
+    lastLayoutSig = sig;
+
+    mo.disconnect();
+    try {
+      const candidates = allBtns.filter(b => !b.classList.contains("ps-idle-hidden"));
+      // 1. 先恢复全部可见以便准确测量自然宽度
+      allBtns.forEach(b => b.classList.remove("ps-overflow-hidden"));
+      moreBtn.hidden = true;
+
+      const widths = candidates.map(b => Math.ceil(b.getBoundingClientRect().width));
+      const gap = 2;
+      const pad = 8;
+      const totalW = pad + widths.reduce((sum, w) => sum + w, 0) + Math.max(0, candidates.length - 1) * gap;
+
+      if (totalW <= available) {
+        if (popOpen) togglePopover(false);
+        window.dispatchEvent(new Event("creatorhub:layout"));
+        return;
+      }
+
+      // 2. 空间不足：按 Priority+ 折叠，保留「全平台」+ 尽可能多的平台 + 当前选中平台 + 「+N ▾」
+      moreBtn.hidden = false;
+      if (moreLabel) moreLabel.textContent = `+${candidates.length}`;
+      const moreW = Math.max(54, Math.ceil(moreBtn.getBoundingClientRect().width) + gap);
+      const budget = Math.max(120, available - pad - moreW);
+
+      const activeIdx = candidates.findIndex(b => b.classList.contains("active"));
+      const keep = new Set();
+      let used = 0;
+
+      if (candidates.length > 0) {
+        keep.add(0);
+        used += widths[0];
+      }
+      if (activeIdx > 0 && used + gap + widths[activeIdx] <= budget) {
+        keep.add(activeIdx);
+        used += gap + widths[activeIdx];
+      }
+      for (let i = 1; i < candidates.length; i++) {
+        if (keep.has(i)) continue;
+        if (used + gap + widths[i] <= budget) {
+          keep.add(i);
+          used += gap + widths[i];
+        } else {
+          break;
+        }
+      }
+
+      let hiddenCount = 0;
+      let hiddenDanger = false;
+      let hiddenWarn = false;
+      candidates.forEach((b, idx) => {
+        const hide = !keep.has(idx);
+        b.classList.toggle("ps-overflow-hidden", hide);
+        if (hide) {
+          hiddenCount++;
+          const cnt = b.querySelector(".ps-cnt");
+          if (cnt?.classList.contains("danger")) hiddenDanger = true;
+          else if (cnt?.classList.contains("warn")) hiddenWarn = true;
+        }
+      });
+
+      if (hiddenCount <= 0) {
+        moreBtn.hidden = true;
+        if (popOpen) togglePopover(false);
+      } else {
+        moreBtn.hidden = false;
+        if (moreLabel) moreLabel.textContent = `+${hiddenCount}`;
+        moreBtn.title = `展开其余 ${hiddenCount} 个平台`;
+        if (moreDot) {
+          moreDot.hidden = !(hiddenDanger || hiddenWarn);
+          moreDot.className = "ps-more-dot" + (hiddenDanger ? " danger" : hiddenWarn ? " warn" : "");
+        }
+      }
+      if (popOpen) renderPopover();
+      window.dispatchEvent(new Event("creatorhub:layout"));
+    } finally {
+      mo.observe(list, moOpts);
+    }
+  }
+
+  function scheduleLayout() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(layoutPriority);
+  }
+
+  function renderPopover() {
+    if (!popover) return;
+    const btns = tabButtons().filter(b => !b.classList.contains("ps-idle-hidden"));
+    const items = btns.map(b => {
+      const pf = b.dataset.pf || "";
+      const active = b.classList.contains("active");
+      const folded = b.classList.contains("ps-overflow-hidden");
+      const label = b.querySelector(".ps-lbl")?.textContent?.trim() || b.dataset.baseLabel || b.textContent.trim();
+      const cntEl = b.querySelector(".ps-cnt");
+      const cntHtml = cntEl ? cntEl.outerHTML : "";
+      return `<button type="button" class="pswitch-pop-item${active ? " active" : ""}${folded ? " is-folded" : ""}" data-pf="${esc(pf)}"><span class="pswitch-pop-name">${esc(label)}</span>${cntHtml}</button>`;
+    }).join("");
+    popover.innerHTML = `<div class="pswitch-pop-head"><b>全部平台</b><span class="mut">共 ${btns.length} 项</span></div><div class="pswitch-pop-grid">${items}</div>`;
+    popover.querySelectorAll(".pswitch-pop-item").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const pf = btn.dataset.pf;
+        togglePopover(false);
+        if (pf && typeof switchPlatform === "function") switchPlatform(pf);
+      });
+    });
+  }
+
+  function positionPopover() {
+    if (!popover || !moreBtn) return;
+    const rect = moreBtn.getBoundingClientRect();
+    const popW = Math.min(420, window.innerWidth - 24);
+    const left = Math.max(12, Math.min(window.innerWidth - popW - 12, rect.right - popW));
+    popover.style.left = `${left}px`;
+    popover.style.right = "auto";
+    popover.style.top = `${Math.round(rect.bottom + 8)}px`;
+  }
+
+  function togglePopover(force) {
+    if (!popover) return;
+    popOpen = typeof force === "boolean" ? force : !popOpen;
+    popover.hidden = !popOpen;
+    moreBtn.setAttribute("aria-expanded", String(popOpen));
+    if (popOpen) {
+      renderPopover();
+      positionPopover();
+    }
+  }
+
+  moreBtn.addEventListener("click", e => {
+    e.stopPropagation();
+    togglePopover();
+  });
+
+  document.addEventListener("click", e => {
+    if (!popOpen) return;
+    if (popover && !popover.contains(e.target) && !moreBtn.contains(e.target)) {
+      togglePopover(false);
+    }
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && popOpen) togglePopover(false);
+  });
+
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(scheduleLayout);
+    ro.observe(host);
+  }
+  window.addEventListener("resize", () => {
+    scheduleLayout();
+    if (popOpen) positionPopover();
+  }, { passive: true });
+  // 当 syncHeaderPlatformBadges 更新计数徽标后重新计算一次折叠
+  mo.observe(list, moOpts);
+
+  window._syncPlatformStripOverflow = () => { lastLayoutSig = ""; scheduleLayout(); };
+  scheduleLayout();
+})();
 
 // 04-auth-login.js — 多平台浏览器扫码登录、预登录指纹选择与 Cookie/Token 凭证导入。
 // ─── 扫码登录(真实浏览器窗口) ───
@@ -1879,7 +2827,7 @@ function browserChoiceOptions(catalog, { localOnly = false } = {}) {
 }
 // 新账号尚未落库，扫码前先确定浏览器内核；成功后该选择随账号持久化。
 function isDomesticPlatform(pf) {
-  return !["tiktok", "rednote", "instagram", "twitter", "facebook"].includes(pf || "douyin");
+  return !["tiktok", "rednote", "instagram", "twitter", "facebook", "youtube"].includes(pf || "douyin");
 }
 function isMainlandGeoClient(country, region, city) {
   const c = String(country || "").trim().toUpperCase();
@@ -2959,6 +3907,21 @@ async function startFacebookLogin() {
   } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("Facebook 登录启动失败:" + e.message, "err"); }
 }
 
+// ─── YouTube 独立浏览器登录（含 Google 账户与品牌频道会话） ───
+async function startYouTubeLogin() {
+  const session = await preparePreLoginEnvironment({ platform: "youtube" });
+  if (!session) return;
+  const { browserBackend, proxy, fingerprint } = session;
+  $("cookiebox").style.display = "none";
+  $("qrbox").style.display = "block";
+  $("qrstatus").textContent = "正在打开 YouTube / Google 登录窗口…";
+  try {
+    const res = await api(loginStartUrl("/api/login/youtube/start", proxy, browserBackend), loginStartOptions(fingerprint));
+    $("qrstatus").innerHTML = `${ic("i-eye")} <b>YouTube 窗口已打开</b>，请在该窗口完成 Google 账号登录及两步验证/通行密钥。<br>登录成功后会自动同步 <code>SAPISID</code> / <code>SID</code> 会话，支持频道采集、视频下载、Studio 上传发布、多频道切换与互动养号。`;
+    pollLogin(res.task_id);
+  } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("YouTube 登录启动失败:" + e.message, "err"); }
+}
+
 // ─── Cookie 登录 ───
 function toggleCookie() {
   $("qrbox").style.display = "none";
@@ -2976,7 +3939,7 @@ async function saveCookie() {
     });
     $("ck-val").value = ""; $("cookiebox").style.display = "none";
     if (res && res.warning) toast(`账号已保存(${res.nickname || ""})，但状态异常：${res.warning}`, "err");
-    else toast((PLATFORM === "twitter" || PLATFORM === "facebook") && res && res.nickname ? `Cookie 已导入：${res.nickname}` : "Cookie 已保存", "ok");
+    else toast((PLATFORM === "twitter" || PLATFORM === "facebook" || PLATFORM === "youtube") && res && res.nickname ? `Cookie 已导入：${res.nickname}` : "Cookie 已保存", "ok");
     if (res && res.proxy_warning) setTimeout(() => toast("⚠️ " + res.proxy_warning, "info", 6500), 300);
     refreshAccounts();
   } catch (e) { toast("保存失败:" + e.message, "err"); }
@@ -2995,7 +3958,6 @@ let MONITORS = [], WATCHES = [], CONTENTS = [];
 let COLLECTION_JOBS = [], COLLECTION_JOB_ID = 0, COLLECTION_PAGE = 1;
 let COLLECTION_COMMENT_CONTENT_ID = 0, COLLECTION_COMMENT_PAGE = 1;
 let COLLECTION_COMMENT_TIMER = null, COLLECTION_COMMENT_REQUEST = 0;
-let COLLECTION_FAVORITE_BOARDS = [];
 let DANMAKU_WATCHES = [];
 let CHANNELS = [], PUBLISH_TASKS = [], WEBHOOKS = [], WEBHOOK_EDIT_ID = 0;
 let CONTENT_SRC = "", CONTENT_GROUP = "", CONTENT_TAG = "";
@@ -3317,7 +4279,7 @@ function contentSource(r) {
 }
 function contentSourceMarkup(r) {
   const source = contentSource(r), id = Number(source.id);
-  const kind = source.deleted ? "原任务已删除，历史记录保留" : source.target_kind === "keyword" ? "关键词监控" : "作品监控";
+  const kind = source.deleted ? "原任务已删除，历史记录保留" : source.target_kind === "keyword" ? "历史关键词监控（已下线）" : "主页作品监控";
   const label = esc(source.name || `任务 #${id}`);
   return `<div class="content-origin"><span class="content-origin-label">来源任务</span>
     ${Number.isSafeInteger(id) && id > 0 ? `<button type="button" class="content-source-link" onclick="showMonitorRecords(${id})" title="查看此任务的记录">${label}</button>` : `<span>${label}</span>`}
@@ -3436,7 +4398,7 @@ function backToWatchTasks(kind) {
 function watchRecordSourceMarkup(kind, row) {
   const view = watchRecordConfig(kind), source = watchRecordSource(kind, row), id = Number(source.id);
   const label = esc(source.name), linked = Number.isSafeInteger(id) && id >= 0;
-  const detail = source.unassigned ? "来源监控信息未记录" : `${view.label}任务 #${id}${source.deleted ? " · 原任务已删除，历史记录保留" : source.kind === "user" ? " · 账号监控" : " · 作品监控"}`;
+  const detail = source.unassigned ? "来源监控信息未记录" : `${view.label}任务 #${id}${source.deleted ? " · 原任务已删除，历史记录保留" : source.kind === "user" ? " · 账号监控" : " · 单条作品"}`;
   return `<div class="content-origin"><span class="content-origin-label">来源任务</span>
     ${linked ? `<button type="button" class="content-source-link" onclick="showWatchRecords('${kind}',${id})" title="查看此来源的记录">${label}</button>` : `<span>${label}</span>`}
     <span class="content-origin-meta">${esc(detail)}</span>
@@ -3557,8 +4519,9 @@ async function refreshAccounts() {
     const isIg = a.platform === "instagram";
     const isTw = a.platform === "twitter";
     const isFb = a.platform === "facebook";
-    const idName = isXhs ? "小红书号 " : isKs ? "快手号 " : isChannels ? "视频号 " : isTikTok ? "TikTok号 " : isBili ? "UID " : (isIg || isTw) ? "@ " : isFb ? "FB " : "抖音号 ";
-    const secName = isChannels ? "finder_id " : isKs ? "主页ID " : isXhs ? "user_id " : isTikTok ? "unique_id " : isBili ? "mid " : isIg ? "pk " : isTw ? "screen_name " : isFb ? "UID " : "sec_uid ";
+    const isYt = a.platform === "youtube";
+    const idName = isXhs ? "小红书号 " : isKs ? "快手号 " : isChannels ? "视频号 " : isTikTok ? "TikTok号 " : isBili ? "UID " : (isIg || isTw || isYt) ? "@ " : isFb ? "FB " : "抖音号 ";
+    const secName = isChannels ? "finder_id " : isKs ? "主页ID " : isXhs ? "user_id " : isTikTok ? "unique_id " : isBili ? "mid " : isIg ? "pk " : isTw ? "screen_name " : isFb ? "UID " : isYt ? "频道ID " : "sec_uid ";
     const rawSecUid = String(a.sec_uid || "");
     const shortSecUid = rawSecUid.length > 18 ? rawSecUid.slice(0, 18) + "…" : rawSecUid;
     const idline = [
@@ -3670,14 +4633,16 @@ async function refreshAccounts() {
   globalThis.CreatorHubWorkbench?.accountsUpdated?.();
   if ($("tb-acc")) $("tb-acc").textContent = accs.length;
   populateAccountSelect();
-  populateWatchAccount();
+  if (typeof applyWatchForm === "function") applyWatchForm(false);
+  else populateWatchAccount();
   populateCollectionAccount();
-  if (PLATFORM === "douyin") applyDanmakuForm();
+  if (["douyin", "bilibili"].includes(PLATFORM)) applyDanmakuForm(false);
   else populateDanmakuAccount();
   populatePubAcc();
   populateAcAccount();
   populateHubAccounts();
   populateTikTokAccounts();
+  populateYouTubeToolsAccounts();
   const at = document.querySelector('.navitem.active');
   if (at && at.dataset.tab === "hub") refreshHubPanel();
 }
@@ -3829,6 +4794,443 @@ async function createTikTokCommentTask() {
       refreshCommentTasks();
       refreshTaskQueueBadge();
     } catch (e) { toast("TikTok 评论任务创建失败：" + e.message, "err"); }
+  });
+}
+
+// ── YouTube 互动、真实观看、养号与多频道工具 ──
+let YT_SEARCH_ITEMS = [];
+let YT_SEARCH_SCOPE = "videos";
+let YT_MANAGED_CHANNELS = [];
+let YT_WARMUP_ITEMS = [];
+
+function populateYouTubeToolsAccounts() {
+  const accounts = ACCOUNTS.filter(a => a.platform === "youtube" && a.status !== "invalid" && a.has_storage);
+  const options = accOptions(accounts, accounts.length ? "请选择 YouTube 账号" : "暂无可用 YouTube 账号");
+  for (const id of ["yt-act-account", "yt-watch-account", "yt-warmup-account", "yt-search-account"]) {
+    const select = $(id);
+    if (!select) continue;
+    const previous = select.value;
+    select.innerHTML = options;
+    if (accounts.some(account => String(account.id) === previous)) select.value = previous;
+    else if (accounts.length) select.value = String(accounts[0].id);
+    select._csSync?.();
+  }
+  syncYouTubeInteractForm();
+  syncYouTubeWatchForm();
+  syncYouTubeSearchForm();
+  if (!YT_SEARCH_ITEMS.length) renderYouTubeSearchResults();
+  if (!YT_MANAGED_CHANNELS.length) renderYouTubeManagedChannels();
+  if (!YT_WARMUP_ITEMS.length) renderYouTubeWarmupResults();
+}
+
+function syncYouTubeInteractForm() {
+  const act = $("yt-act-type")?.value || "like";
+  const isRename = act === "change_profile_name";
+  const isComment = act === "comment" || act === "reply_comment";
+  const isReply = act === "reply_comment";
+  const isBatchLike = act === "like_video_comments";
+  const isSub = act === "subscribe" || act === "unsubscribe";
+  const isCommentLike = act === "like_comment" || act === "unlike_comment";
+
+  $("yt-act-target-row")?.classList.toggle("hidden", isRename);
+  $("yt-act-cid-row")?.classList.toggle("hidden", !isReply);
+  $("yt-act-comment-row")?.classList.toggle("hidden", !isComment);
+  $("yt-act-batch-row")?.classList.toggle("hidden", !isBatchLike);
+  $("yt-act-name-row")?.classList.toggle("hidden", !isRename);
+
+  const lbl = $("yt-act-target-label");
+  const inp = $("yt-act-target");
+  if (lbl && inp) {
+    if (isSub) {
+      lbl.textContent = "目标频道或视频链接";
+      inp.placeholder = "https://www.youtube.com/@handle、/channel/UC... 或该频道任一视频链接";
+    } else if (isCommentLike || isReply) {
+      lbl.textContent = "目标评论链接或视频链接";
+      inp.placeholder = "含 ?lc=... 的评论直链，或粘贴视频链接并在下方填入目标评论 ID";
+    } else {
+      lbl.textContent = "目标视频 / Shorts 链接或 11 位 ID";
+      inp.placeholder = "https://www.youtube.com/watch?v=...、youtu.be/...、/shorts/... 或 11 位视频 ID";
+    }
+  }
+}
+
+function syncYouTubeWatchForm() {
+  const pctMode = ($("yt-watch-mode")?.value || "seconds") === "percentage";
+  $("yt-watch-sec-row")?.classList.toggle("hidden", pctMode);
+  $("yt-watch-pct-row")?.classList.toggle("hidden", !pctMode);
+  $("yt-watch-limit-row")?.classList.toggle("hidden", !pctMode);
+}
+
+function syncYouTubeSearchForm() {
+  const isVideos = ($("yt-search-scope")?.value || "videos") === "videos";
+  for (const id of ["yt-search-date-row", "yt-search-dur-row", "yt-search-sort-row"]) {
+    $(id)?.classList.toggle("hidden", !isVideos);
+  }
+}
+
+async function runYouTubeInteract() {
+  const accountId = Number($("yt-act-account")?.value || 0);
+  const action = $("yt-act-type")?.value || "like";
+  const targetUrl = $("yt-act-target")?.value.trim() || "";
+  const commentText = $("yt-act-comment")?.value.trim() || "";
+  const targetCommentId = $("yt-act-cid")?.value.trim() || "";
+  const likeCount = Math.max(1, Math.min(20, Number($("yt-act-like-count")?.value || 3)));
+  const isRandom = Boolean($("yt-act-random")?.checked);
+  const newName = $("yt-act-new-name")?.value.trim() || "";
+  const channelName = $("yt-act-channel")?.value.trim() || "";
+
+  let valid = true;
+  valid = setFieldError($("yt-act-account"), !accountId ? "请选择可用的 YouTube 账号" : "") && valid;
+  if (action !== "change_profile_name") {
+    valid = setFieldError($("yt-act-target"), !targetUrl ? "请输入目标链接或 ID" : "") && valid;
+  } else {
+    setFieldError($("yt-act-target"), "");
+    valid = setFieldError($("yt-act-new-name"), !newName ? "请输入新的频道展示名称" : "") && valid;
+  }
+  if (action === "comment" || action === "reply_comment") {
+    valid = setFieldError($("yt-act-comment"), !commentText ? "请输入评论或回复内容" : "") && valid;
+  } else {
+    setFieldError($("yt-act-comment"), "");
+  }
+  if (!valid) return;
+
+  const actionLabels = {
+    like: "视频点赞", unlike: "取消点赞", dislike: "视频点踩", undislike: "取消点踩",
+    subscribe: "订阅频道", unsubscribe: "取消订阅",
+    comment: "发表评论", reply_comment: "回复评论",
+    like_comment: "点赞评论", unlike_comment: "取消评论点赞",
+    like_video_comments: "批量点赞评论", change_profile_name: "修改频道名称",
+  };
+  const label = actionLabels[action] || action;
+  const status = $("yt-act-status");
+  if (status) status.textContent = `正在打开隔离浏览器执行「${label}」…`;
+
+  await withBusy(evtBtn(), "执行中", async () => {
+    try {
+      const res = await api("/api/youtube/interact", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: accountId, action, target_url: targetUrl,
+          comment_text: commentText, target_comment_id: targetCommentId,
+          like_count: likeCount, is_random: isRandom,
+          new_name: newName, channel_name: channelName,
+        }),
+      });
+      let extra = "";
+      if (res.result && typeof res.result === "object") {
+        if (typeof res.result.liked_count === "number") extra = `（共点赞 ${res.result.liked_count} 条评论）`;
+        else if (res.result.comment_id) extra = `（评论链接/ID：${res.result.comment_id}）`;
+        else if (res.result.new_name) extra = `（新名称：${res.result.new_name}）`;
+      }
+      if (status) status.textContent = `${label}执行成功${extra}`;
+      toast(`YouTube ${label}成功${extra}`, "ok", 6000);
+      if (action === "comment" || action === "reply_comment") $("yt-act-comment").value = "";
+      refreshTaskQueueBadge();
+    } catch (e) {
+      if (status) status.textContent = `${label}失败：${e.message}`;
+      toast(`YouTube ${label}失败：${e.message}`, "err", 7000);
+    }
+  });
+}
+
+async function runYouTubeWatch() {
+  const accountId = Number($("yt-watch-account")?.value || 0);
+  const videoUrl = $("yt-watch-url")?.value.trim() || "";
+  const usePercentage = ($("yt-watch-mode")?.value || "seconds") === "percentage";
+  const durationSeconds = Math.max(5, Math.min(600, Number($("yt-watch-seconds")?.value || 35)));
+  const percentage = Math.max(5, Math.min(100, Number($("yt-watch-pct")?.value || 50)));
+  const percentageLimit = Math.max(10, Math.min(600, Number($("yt-watch-pct-limit")?.value || 120)));
+  const skipAds = Boolean($("yt-watch-skip-ads")?.checked);
+  const likeVideo = Boolean($("yt-watch-like")?.checked);
+  const subscribeChannel = Boolean($("yt-watch-sub")?.checked);
+  const commentText = $("yt-watch-comment")?.value.trim() || "";
+  const channelName = $("yt-watch-channel")?.value.trim() || "";
+
+  let valid = true;
+  valid = setFieldError($("yt-watch-account"), !accountId ? "请选择可用的 YouTube 账号" : "") && valid;
+  valid = setFieldError($("yt-watch-url"), !videoUrl ? "请输入视频/Shorts 链接或 11 位 ID" : "") && valid;
+  if (!valid) return;
+
+  const status = $("yt-watch-status");
+  const resultBox = $("yt-watch-result");
+  if (status) status.textContent = "正在隔离浏览器中真实播放视频，请勿提前关闭窗口…";
+  if (resultBox) { resultBox.classList.add("hidden"); resultBox.innerHTML = ""; }
+
+  await withBusy(evtBtn(), "观看中", async () => {
+    try {
+      const res = await api("/api/youtube/watch", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: accountId, video_url: videoUrl,
+          duration_seconds: durationSeconds, use_percentage: usePercentage,
+          percentage, percentage_limit: percentageLimit,
+          like_video: likeVideo, subscribe_channel: subscribeChannel,
+          comment_text: commentText, skip_ads: skipAds, channel_name: channelName,
+        }),
+      });
+      const st = res.stats || {};
+      const pctText = st.view_percentage != null ? `${st.view_percentage}%` : "—";
+      const durText = st.video_duration ? `${st.video_duration}s` : "未知";
+      if (status) status.textContent = `观看完成：已看 ${st.view_time || 0} 秒（约 ${pctText}）`;
+      if (resultBox) {
+        resultBox.classList.remove("hidden");
+        resultBox.innerHTML =
+          `<div class="platform-callout" role="status"><svg aria-hidden="true"><use href="#i-check"/></svg>`
+          + `<div><b>真实观看完成 · ${esc(res.video_id || "")}</b>`
+          + `<p>实际观看 <b>${esc(String(st.view_time || 0))} 秒</b>（完播占比 ${esc(pctText)} / 视频总长 ${esc(durText)}）`
+          + ` · 点赞：${st.liked ? "已赞" : "未执行"} · 订阅：${st.subscribed ? "已订阅" : "未执行"} · 评论：${st.commented ? "已发布" : "未执行"}</p></div></div>`;
+      }
+      toast("YouTube 视频观看完成", "ok", 6000);
+      refreshTaskQueueBadge();
+    } catch (e) {
+      if (status) status.textContent = "观看失败：" + e.message;
+      toast("YouTube 视频观看失败：" + e.message, "err", 7000);
+    }
+  });
+}
+
+function renderYouTubeWarmupResults() {
+  const body = $("yt-warmup-results");
+  if (!body) return;
+  body.innerHTML = YT_WARMUP_ITEMS.map(item => {
+    const url = String(item.url || "");
+    const safe = safeUrl(url);
+    const linkHtml = safe
+      ? `<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`
+      : esc(url || "—");
+    return `<tr><td class="wrap">${linkHtml}</td>`
+      + `<td>${esc(String(item.watched_seconds || 0))} 秒</td>`
+      + `<td><span class="pill ${item.liked ? "ok" : ""}">${item.liked ? "已随机点赞" : "仅观看"}</span></td></tr>`;
+  }).join("") || empty(3, "暂无养号记录", "i-sparkles", "输入兴趣关键词后点击「启动养号浏览」执行");
+}
+
+async function runYouTubeWarmup() {
+  const accountId = Number($("yt-warmup-account")?.value || 0);
+  const keyword = $("yt-warmup-keyword")?.value.trim() || "";
+  const maxVideos = Math.max(1, Math.min(8, Number($("yt-warmup-count")?.value || 2)));
+  const watchSeconds = Math.max(5, Math.min(180, Number($("yt-warmup-sec")?.value || 20)));
+  const likeProbability = Math.max(0, Math.min(100, Number($("yt-warmup-prob")?.value || 50))) / 100;
+
+  let valid = true;
+  valid = setFieldError($("yt-warmup-account"), !accountId ? "请选择可用的 YouTube 账号" : "") && valid;
+  valid = setFieldError($("yt-warmup-keyword"), !keyword ? "请输入养号搜索关键词" : "") && valid;
+  if (!valid) return;
+
+  const status = $("yt-warmup-status");
+  if (status) status.textContent = `正在搜索「${keyword}」并模拟浏览观看（共 ${maxVideos} 条）…`;
+
+  await withBusy(evtBtn(), "养号中", async () => {
+    try {
+      const res = await api("/api/youtube/warmup", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: accountId, keyword,
+          max_videos: maxVideos, watch_seconds: watchSeconds, like_probability: likeProbability,
+        }),
+      });
+      const sum = res.summary || {};
+      YT_WARMUP_ITEMS = Array.isArray(sum.videos) ? sum.videos : [];
+      renderYouTubeWarmupResults();
+      const likedN = sum.liked_count != null ? sum.liked_count : YT_WARMUP_ITEMS.filter(v => v.liked).length;
+      if (status) status.textContent = `养号完成：观看 ${sum.watched_count || YT_WARMUP_ITEMS.length} 条视频，随机点赞 ${likedN} 条`;
+      toast(`YouTube 养号完成（观看 ${sum.watched_count || YT_WARMUP_ITEMS.length} 条 / 点赞 ${likedN} 条）`, "ok", 6000);
+      refreshTaskQueueBadge();
+    } catch (e) {
+      if (status) status.textContent = "养号失败：" + e.message;
+      toast("YouTube 养号失败：" + e.message, "err", 7000);
+    }
+  });
+}
+
+function renderYouTubeSearchResults() {
+  const body = $("yt-search-results");
+  if (!body) return;
+  if (YT_SEARCH_SCOPE === "channels") {
+    body.innerHTML = YT_SEARCH_ITEMS.map((ch, idx) => {
+      const handle = String(ch.unique_id || ch.sec_uid || ch.uid || "");
+      const url = String(ch.url || (handle ? `https://www.youtube.com/${handle.startsWith("@") ? handle : "channel/" + handle}` : ""));
+      const safe = safeUrl(url);
+      const av = ch.avatar
+        ? `<img class="avatar" src="${esc(safeMediaUrl(ch.avatar))}" alt="" referrerpolicy="no-referrer">`
+        : `<span class="wb-avatar-fallback" aria-hidden="true">${esc((ch.nickname || "Y").slice(0, 1))}</span>`;
+      return `<tr><td><div class="user-cell">${av}<div><b>${esc(ch.nickname || handle || "未命名频道")}</b><div class="mut">${esc((ch.signature || "").slice(0, 80))}</div></div></div></td>`
+        + `<td><code>${esc(handle || "—")}</code></td>`
+        + `<td>${fmtNum(ch.follower_count || 0)} 订阅<div class="mut">${fmtNum(ch.aweme_count || 0)} 视频</div></td>`
+        + `<td class="acttd"><button class="ghost sm" onclick="quickYouTubeResultAction(${idx},'subscribe')">订阅</button>`
+        + (safe ? `<a class="btn ghost sm" href="${esc(safe)}" target="_blank" rel="noopener noreferrer">主页</a>` : "")
+        + `</td></tr>`;
+    }).join("") || empty(4, "暂无频道搜索结果", "i-search", "输入关键词并选择「频道」范围搜索");
+    return;
+  }
+
+  body.innerHTML = YT_SEARCH_ITEMS.map((v, idx) => {
+    const vid = String(v.video_id || "");
+    const title = String(v.title || v.desc || vid || "未命名视频");
+    const author = String(v.author_name || "");
+    const handle = String(v.channel_handle || v.channel_id || "");
+    const url = String(v.source_url || (vid ? `https://www.youtube.com/watch?v=${vid}` : ""));
+    const safe = safeUrl(url);
+    const dur = v.duration ? `${Math.floor(v.duration / 60)}:${String(v.duration % 60).padStart(2, "0")}` : "";
+    return `<tr><td class="wrap" style="max-width:340px"><b>${esc(title.slice(0, 96))}</b><div class="mut">${esc(vid)}${dur ? " · " + esc(dur) : ""}${v.published_text ? " · " + esc(v.published_text) : ""}</div></td>`
+      + `<td>${esc(author || "—")}<div class="mut"><code>${esc(handle || "—")}</code></div></td>`
+      + `<td>${fmtNum(v.play_count || 0)} 播放</td>`
+      + `<td class="acttd">`
+      + `<button class="ghost sm" onclick="quickYouTubeResultAction(${idx},'like')">点赞</button>`
+      + `<button class="ghost sm" onclick="quickYouTubeResultAction(${idx},'watch')">观看</button>`
+      + `<button class="ghost sm" onclick="quickYouTubeResultAction(${idx},'comment')">评论</button>`
+      + (safe ? `<a class="btn ghost sm" href="${esc(safe)}" target="_blank" rel="noopener noreferrer">打开</a>` : "")
+      + `</td></tr>`;
+  }).join("") || empty(4, "暂无 YouTube 搜索结果", "i-search", "输入关键词可筛选搜索视频或频道，并一键带入点赞 / 观看 / 评论");
+}
+
+async function searchYouTubeTools() {
+  const accountId = Number($("yt-search-account")?.value || 0);
+  const keyword = $("yt-search-query")?.value.trim() || "";
+  const scope = $("yt-search-scope")?.value || "videos";
+  const uploadDate = $("yt-search-date")?.value || "";
+  const duration = $("yt-search-dur")?.value || "";
+  const sortBy = $("yt-search-sort")?.value || "";
+  const limit = Math.max(1, Math.min(120, Number($("yt-search-limit")?.value || 20)));
+
+  let valid = true;
+  valid = setFieldError($("yt-search-account"), !accountId ? "请选择可用的 YouTube 账号" : "") && valid;
+  valid = setFieldError($("yt-search-query"), !keyword ? "请输入搜索关键词" : "") && valid;
+  if (!valid) return;
+
+  const status = $("yt-search-status");
+  if (status) status.textContent = "正在搜索 YouTube…";
+
+  await withBusy(evtBtn(), "搜索中", async () => {
+    try {
+      const res = await api("/api/youtube/search", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: accountId, keyword, scope,
+          upload_date: scope === "videos" ? uploadDate : "",
+          duration: scope === "videos" ? duration : "",
+          sort_by: scope === "videos" ? sortBy : "",
+          limit, max_pages: Math.max(1, Math.min(6, Math.ceil(limit / 15))),
+        }),
+      });
+      YT_SEARCH_SCOPE = scope;
+      YT_SEARCH_ITEMS = Array.isArray(res.items) ? res.items : [];
+      renderYouTubeSearchResults();
+      if (status) {
+        status.textContent = res.error
+          ? `返回 ${YT_SEARCH_ITEMS.length} 条（${res.source || "api"}）；${res.error}`
+          : `共找到 ${YT_SEARCH_ITEMS.length} 条${scope === "channels" ? "频道" : "视频"}（通道：${res.source || "api"}）`;
+      }
+    } catch (e) {
+      YT_SEARCH_ITEMS = [];
+      renderYouTubeSearchResults();
+      if (status) status.textContent = "搜索失败：" + e.message;
+      toast("YouTube 搜索失败：" + e.message, "err");
+    }
+  });
+}
+
+async function quickYouTubeResultAction(index, mode) {
+  const item = YT_SEARCH_ITEMS[index];
+  if (!item) return;
+  const accountId = Number($("yt-search-account")?.value || 0);
+  if (!accountId) { toast("请先选择 YouTube 执行账号", "err"); return; }
+  const isCh = YT_SEARCH_SCOPE === "channels";
+  const targetUrl = isCh
+    ? String(item.url || (item.unique_id ? `https://www.youtube.com/${item.unique_id}` : item.sec_uid || ""))
+    : String(item.source_url || (item.video_id ? `https://www.youtube.com/watch?v=${item.video_id}` : ""));
+  if (!targetUrl) { toast("该条目缺少有效链接", "err"); return; }
+
+  if (mode === "watch") {
+    if ($("yt-watch-account")) { $("yt-watch-account").value = String(accountId); $("yt-watch-account")._csSync?.(); }
+    if ($("yt-watch-url")) $("yt-watch-url").value = targetUrl;
+    globalThis.CreatorHubWorkbench?.showSection?.("youtube-tools", "yt-watch");
+    toast("已带入「真实观看」表单，可调整时长后开始观看", "info");
+    return;
+  }
+  if (mode === "comment") {
+    if ($("yt-act-account")) { $("yt-act-account").value = String(accountId); $("yt-act-account")._csSync?.(); }
+    if ($("yt-act-type")) { $("yt-act-type").value = "comment"; $("yt-act-type")._csSync?.(); }
+    syncYouTubeInteractForm();
+    if ($("yt-act-target")) $("yt-act-target").value = targetUrl;
+    globalThis.CreatorHubWorkbench?.showSection?.("youtube-tools", "yt-interact");
+    $("yt-act-comment")?.focus();
+    toast("已带入「互动操作 → 发表主评论」，填写内容后执行", "info");
+    return;
+  }
+  const label = mode === "subscribe" ? "订阅该频道" : "点赞该视频";
+  const okConfirm = await uiConfirm({
+    title: `确认${label}`,
+    message: `确认使用当前所选 YouTube 账号对「${item.title || item.nickname || targetUrl}」执行${label}？`,
+  });
+  if (!okConfirm) return;
+  try {
+    await api("/api/youtube/interact", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        account_id: accountId,
+        action: mode === "subscribe" ? "subscribe" : "like",
+        target_url: targetUrl,
+        channel_name: $("yt-act-channel")?.value.trim() || "",
+      }),
+    });
+    toast(`YouTube ${label}成功`, "ok", 5000);
+    refreshTaskQueueBadge();
+  } catch (e) {
+    toast(`YouTube ${label}失败：${e.message}`, "err", 7000);
+  }
+}
+
+function renderYouTubeManagedChannels() {
+  const body = $("yt-channel-results");
+  if (!body) return;
+  body.innerHTML = YT_MANAGED_CHANNELS.map((ch, idx) => {
+    const name = String(ch.name || ch.title || "");
+    const handle = String(ch.handle || ch.channel_id || "");
+    const av = ch.avatar
+      ? `<img class="avatar" src="${esc(safeMediaUrl(ch.avatar))}" alt="" referrerpolicy="no-referrer">`
+      : `<span class="wb-avatar-fallback" aria-hidden="true">${esc((name || "C").slice(0, 1))}</span>`;
+    return `<tr><td><div class="user-cell">${av}<div><b>${esc(name || "未命名频道")}</b></div></div></td>`
+      + `<td><code>${esc(handle || "—")}</code></td>`
+      + `<td>${esc(ch.subscribers_text || (ch.subscribers_count ? fmtNum(ch.subscribers_count) : "—"))}</td>`
+      + `<td><span class="pill ${ch.is_selected ? "ok" : ""}">${ch.is_selected ? "当前默认" : "可切换"}</span></td>`
+      + `<td class="acttd"><button class="ghost sm" onclick="applyYouTubeBrandChannel(${idx})">设为操作频道</button></td></tr>`;
+  }).join("") || empty(5, "尚未同步多频道列表", "i-user", "点击「同步账号下多频道」读取该 Google 账号下全部个人与品牌频道");
+}
+
+function applyYouTubeBrandChannel(index) {
+  const ch = YT_MANAGED_CHANNELS[index];
+  if (!ch) return;
+  const name = String(ch.name || ch.title || ch.handle || "").trim();
+  if (!name) return;
+  for (const id of ["yt-act-channel", "yt-watch-channel", "pub-yt-channel"]) {
+    if ($(id)) $(id).value = name;
+  }
+  toast(`已将「${name}」设为当前操作品牌频道（互动 / 观看 / 发布已同步填入）`, "ok", 5000);
+}
+
+async function syncYouTubeManagedChannels() {
+  const accountId = Number($("yt-search-account")?.value || $("yt-act-account")?.value || 0);
+  if (!accountId) { toast("请先选择可用的 YouTube 账号", "err"); return; }
+  const status = $("yt-search-status");
+  if (status) status.textContent = "正在读取当前 Google 账号下的可管理频道列表…";
+  await withBusy(evtBtn(), "同步中", async () => {
+    try {
+      const res = await api("/api/youtube/channels", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_id: accountId }),
+      });
+      YT_MANAGED_CHANNELS = Array.isArray(res.items) ? res.items : [];
+      renderYouTubeManagedChannels();
+      if (status) {
+        status.textContent = res.error
+          ? `已读取 ${YT_MANAGED_CHANNELS.length} 个频道；${res.error}`
+          : `已同步 ${YT_MANAGED_CHANNELS.length} 个可管理频道（通道：${res.source || "api"}）`;
+      }
+      toast(`已同步 ${YT_MANAGED_CHANNELS.length} 个 YouTube 频道`, "ok");
+    } catch (e) {
+      if (status) status.textContent = "同步多频道失败：" + e.message;
+      toast("同步多频道失败：" + e.message, "err");
+    }
   });
 }
 
@@ -4844,6 +6246,7 @@ function onHubAcc() {
 // 面板内子标签(我的作品/关注/粉丝/私信)切换
 function switchHubTab(name) {
   if (PLATFORM === "tiktok" && ["following", "fans", "dm"].includes(name)) name = "myworks";
+  if (PLATFORM === "youtube" && ["fans", "dm"].includes(name)) name = "myworks";
   HUB_TAB = name;
   try { localStorage.setItem("dym-hubtab", name); } catch (e) {}
   document.querySelectorAll("[data-hubpanel]").forEach(p => { p.style.display = p.dataset.hubpanel === name ? "" : "none"; });
@@ -4967,6 +6370,11 @@ function workLink(platform, id) {
     if (/^https?:\/\//i.test(raw)) return raw;
     return "https://www.facebook.com/" + id;
   }
+  if (platform === "youtube") {
+    const raw = decodeURIComponent(id);
+    if (/^https?:\/\//i.test(raw)) return raw;
+    return "https://www.youtube.com/watch?v=" + id;
+  }
   if (platform === "instagram") {
     return "https://www.instagram.com/p/" + id + "/";
   }
@@ -5029,20 +6437,45 @@ async function deleteRednoteWork(workId) {
     refreshMyWorks();
   } catch (e) { toast("删除失败:" + e.message, "err"); }
 }
-async function syncMyWorks() {
-  if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
-  await withBusy(evtBtn(), "同步中", async () => {
-    try {
-      const r = await api("/api/accounts/" + HUB_ACC + "/works/sync", { method: "POST" });
-      if (r.skipped) { toast(`同步暂缓:${r.reason || "操作间隔尚未结束"}`, "info", 5000); return; }
-      toast(`同步完成:抓到 ${Number(r.fetched) || 0} 条,新增 ${Number(r.added) || 0}${transportSourceSuffix(r.source)}`, "ok");
-    }
-    catch (e) { toast("同步失败:" + e.message, "err"); }
-  });
+const _WATCHED_WORKS_SYNCS = new Set();
+window.addEventListener("creatorhub:progress:update", e => {
+  const task = e?.detail?.task;
+  if (!task || task.category !== "works_sync") return;
+  if (!_WATCHED_WORKS_SYNCS.has(task.task_key)) return;
+  if (!["completed", "failed", "canceled"].includes(task.status)) return;
+  _WATCHED_WORKS_SYNCS.delete(task.task_key);
+  const r = task.extra?.result;
+  if (task.status === "failed") {
+    toast("同步失败:" + (task.error || task.phase_label || "未知错误"), "err", 7000);
+  } else if (r && r.skipped) {
+    toast(`同步暂缓:${r.reason || "操作间隔尚未结束"}`, "info", 5000);
+  } else if (r) {
+    toast(`同步完成:抓到 ${Number(r.fetched) || 0} 条,新增 ${Number(r.added) || 0}${transportSourceSuffix(r.source)}`, "ok");
+  }
   refreshMyWorks();
   refreshHubSummary();
   if (typeof refreshAccounts === "function") refreshAccounts();
   window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
+});
+async function syncMyWorks() {
+  if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
+  await withBusy(evtBtn(), "发起中", async () => {
+    try {
+      const r = await api("/api/accounts/" + HUB_ACC + "/works/sync?async_mode=true", { method: "POST" });
+      if (r.async && r.queued) {
+        if (r.task_key) _WATCHED_WORKS_SYNCS.add(r.task_key);
+        toast("已开始后台同步本账号作品，可在右上角「活动中心」查看进度", "info", 4500);
+        return;
+      }
+      if (r.skipped) { toast(`同步暂缓:${r.reason || "操作间隔尚未结束"}`, "info", 5000); return; }
+      toast(`同步完成:抓到 ${Number(r.fetched) || 0} 条,新增 ${Number(r.added) || 0}${transportSourceSuffix(r.source)}`, "ok");
+      refreshMyWorks();
+      refreshHubSummary();
+      if (typeof refreshAccounts === "function") refreshAccounts();
+      window.dispatchEvent(new Event("creatorhub:matrix:refresh"));
+    }
+    catch (e) { toast("同步失败:" + e.message, "err"); }
+  });
 }
 
 // ── 作品评论(弹窗:抖音直连分页 / 小红书客户端 / 快手拦截,落库后展示)──
@@ -5583,41 +7016,66 @@ async function sendDm() {
     } catch (e) { toast("发送失败:" + e.message, "err"); }
   });
 }
-function accOptions(list, ph) {
+const MONITOR_ACCOUNT_REQUIRED = ["douyin", "xhs", "rednote", "tiktok", "instagram", "twitter", "facebook", "youtube"];
+const WATCH_ACCOUNT_REQUIRED = ["xhs", "rednote", "tiktok", "instagram", "twitter", "facebook", "youtube"];
+
+function _accountRoleTag(a, showCrawlWarn = false) {
+  const role = String(a?.account_role || "hybrid").toLowerCase();
+  if (role === "publish") return showCrawlWarn ? " · 发布主号(禁外采)" : " · 发布主号";
+  if (role === "crawler") return " · 仅采集号";
+  return "";
+}
+function _preferCrawlAccounts(list) {
+  return [...list].sort((a, b) => {
+    const aPub = String(a?.account_role || "hybrid").toLowerCase() === "publish" ? 1 : 0;
+    const bPub = String(b?.account_role || "hybrid").toLowerCase() === "publish" ? 1 : 0;
+    if (aPub !== bPub) return aPub - bPub;
+    const aAct = a?.status === "active" ? 0 : 1;
+    const bAct = b?.status === "active" ? 0 : 1;
+    return aAct - bAct;
+  });
+}
+function accOptions(list, ph, opts = {}) {
+  const ordered = opts.preferCrawler ? _preferCrawlAccounts(list) : list;
   return `<option value="">${ph}</option>` +
-    list.map(a => `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`).join("");
+    ordered.map(a => `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}${_accountRoleTag(a, !!opts.preferCrawler)}${a.status === "invalid" ? "（登录失效）" : ""}</option>`).join("");
 }
 function populateAccountSelect() {
   const sel = $("t-acc"); if (!sel) return;
-  const required = ["xhs", "douyin", "tiktok"].includes(PLATFORM);
+  const current = sel.value;
+  const required = MONITOR_ACCOUNT_REQUIRED.includes(PLATFORM);
   const channels = PLATFORM === "shipinhao";
   const platformName = PF_NAME[PLATFORM] || "当前平台";
-  const list = PLATFORM === "tiktok"
-    ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
-    : ACCOUNTS;
+  const list = required
+    ? _preferCrawlAccounts(ACCOUNTS.filter(a => a.status === "active" && (a.has_storage || a.has_creator)))
+    : _preferCrawlAccounts(ACCOUNTS);
   sel.innerHTML = accOptions(
     list,
-    required ? `请选择${platformName}账号(必选)` : channels ? "默认走本机微信客户端（无需账号）" : "不指定账号",
+    required ? (list.length ? `请选择${platformName}账号(必选)` : `暂无可用${platformName}账号`) : channels ? "默认走本机微信客户端（无需账号）" : "不指定账号（匿名抓取）",
+    { preferCrawler: true },
   );
-  // 抖音匿名主页可能返回风控后的旧快照；作品监控与小红书一样必须使用登录态。
-  if (required && list.length) sel.value = String(list[0].id);
-  else if (channels) sel.value = "";
+  // 需登录平台默认优先选中非 publish 角色的活跃账号
+  if (channels) sel.value = "";
+  else if (list.some(a => String(a.id) === current)) sel.value = current;
+  else if (required && list.length) sel.value = String(list[0].id);
+  else sel.value = "";
   if ($("t-acc-wrap")) $("t-acc-wrap").style.display = channels ? "none" : "";
+  if (sel._csSync) sel._csSync();
 }
-function collectionRequiresAccount(platform = PLATFORM, source = collectionSourceValue()) {
-  return !(platform === "shipinhao" && ["keyword", "creator"].includes(source));
+function collectionRequiresAccount(platform = PLATFORM) {
+  return platform !== "shipinhao";
 }
 function populateCollectionAccount() {
   const sel = $("col-account"); if (!sel) return;
   const current = sel.value;
   const platformName = PF_NAME[PLATFORM] || "平台";
-  const requiresAccount = collectionRequiresAccount(PLATFORM, collectionSourceValue());
+  const requiresAccount = collectionRequiresAccount(PLATFORM);
   const channels = PLATFORM === "shipinhao";
-  const list = ACCOUNTS.filter(a => a.platform === PLATFORM && a.status !== "invalid" && a.has_storage);
+  const list = _preferCrawlAccounts(ACCOUNTS.filter(a => a.platform === PLATFORM && a.status !== "invalid" && a.has_storage));
   const placeholder = requiresAccount
     ? (list.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`)
     : "使用本机微信通道（无需网页账号）";
-  sel.innerHTML = accOptions(list, placeholder);
+  sel.innerHTML = accOptions(list, placeholder, { preferCrawler: true });
   sel.required = requiresAccount;
   if ($("col-account-wrap")) $("col-account-wrap").style.display = (channels && !requiresAccount) ? "none" : "";
   if (!requiresAccount) {
@@ -5628,44 +7086,79 @@ function populateCollectionAccount() {
   else sel.value = "";
   if (sel._csSync) sel._csSync();
 }
+function onWatchKindChange() {
+  applyWatchForm(true);
+}
+function onWatchModeChange() {
+  if (PLATFORM === "douyin" && $("w-mode")?.value === "creator" && $("w-kind")?.value === "video") {
+    $("w-kind").value = "user";
+    $("w-kind")._csSync?.();
+  }
+  applyWatchForm(false);
+}
+function applyWatchForm(resetFeedback = false) {
+  const kind = $("w-kind")?.value || "auto";
+  const isVideo = kind === "video";
+  const isDouyin = PLATFORM === "douyin";
+  if ($("w-recent-wrap")) $("w-recent-wrap").hidden = isVideo;
+  if ($("w-days-wrap")) $("w-days-wrap").hidden = isVideo;
+  // 抖音创作中心模式只支持「账号」类型；切为单条视频时自动回退到公开评论区并隐藏来源切换
+  if (isDouyin && isVideo && $("w-mode") && $("w-mode").value === "creator") {
+    $("w-mode").value = "public";
+    $("w-mode")._csSync?.();
+  }
+  if ($("w-mode-wrap")) {
+    $("w-mode-wrap").style.display = (isDouyin && !isVideo) ? "" : "none";
+  }
+  populateWatchAccount();
+  if (resetFeedback && typeof resetWatchTargetState === "function") resetWatchTargetState();
+}
 function populateWatchAccount() {
   const sel = $("w-acc"); if (!sel) return;
-  const xhs = PLATFORM === "xhs";
-  const tiktok = PLATFORM === "tiktok";
+  const current = sel.value;
   const channels = PLATFORM === "shipinhao";
-  const required = xhs || PLATFORM === "rednote" || tiktok;
+  const required = WATCH_ACCOUNT_REQUIRED.includes(PLATFORM);
   const creatorOnly = PLATFORM === "douyin" && $("w-mode") && $("w-mode").value === "creator";
-  const list = tiktok
-    ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
+  const baseList = required
+    ? ACCOUNTS.filter(a => a.status === "active" && (a.has_storage || a.has_creator))
     : creatorOnly ? ACCOUNTS.filter(a => a.has_creator) : ACCOUNTS;
-  const ph = required ? "请选择" + PF_NAME[PLATFORM] + "账号(必选)"
-    : (creatorOnly && list.length === 0 ? "无创作者账号,请先创作者登录" : channels ? "默认走本机微信客户端（无需账号）" : "不指定账号");
-  sel.innerHTML = accOptions(list, ph);
-  if (required && list.length) sel.value = String(list[0].id);
-  else if (channels) sel.value = "";
+  const list = creatorOnly ? baseList : _preferCrawlAccounts(baseList);
+  const ph = required
+    ? (list.length ? `请选择${PF_NAME[PLATFORM] || "当前平台"}账号(必选)` : `暂无可用${PF_NAME[PLATFORM] || "当前平台"}账号`)
+    : (creatorOnly ? (list.length ? "请选择创作者账号(必选)" : "无创作者账号,请先创作者登录") : channels ? "默认走本机微信客户端（无需账号）" : "不指定账号");
+  sel.innerHTML = accOptions(list, ph, { preferCrawler: !creatorOnly });
+  if (channels) sel.value = "";
+  else if (list.some(a => String(a.id) === current)) sel.value = current;
+  else if ((required || creatorOnly) && list.length) sel.value = String(list[0].id);
+  else sel.value = "";
   if ($("w-acc-wrap")) $("w-acc-wrap").style.display = channels ? "none" : "";
   if (sel._csSync) sel._csSync();
 }
 function populateDanmakuAccount() {
   const sel = $("d-w-acc"); if (!sel) return;
+  const current = sel.value;
   const pf = PLATFORM === "bilibili" ? "bilibili" : "douyin";
   const creatorOnly = pf === "douyin" && $("d-w-mode") && $("d-w-mode").value === "creator";
-  const list = creatorOnly
+  const baseList = creatorOnly
     ? ACCOUNTS.filter(a => a.platform === "douyin" && a.has_creator)
     : ACCOUNTS.filter(a => a.platform === pf);
-  const ph = creatorOnly && !list.length ? "无创作者账号,请先创作者登录" : "不指定账号";
-  sel.innerHTML = accOptions(list, ph);
-  if (creatorOnly && list.length) sel.value = String(list[0].id);
+  const list = creatorOnly ? baseList : _preferCrawlAccounts(baseList);
+  const ph = creatorOnly ? (list.length ? "请选择创作者账号(必选)" : "无创作者账号,请先创作者登录") : "不指定账号";
+  sel.innerHTML = accOptions(list, ph, { preferCrawler: !creatorOnly });
+  if (list.some(a => String(a.id) === current)) sel.value = current;
+  else if (creatorOnly && list.length) sel.value = String(list[0].id);
+  else sel.value = "";
   if (sel._csSync) sel._csSync();
 }
-function applyDanmakuForm() {
+function applyDanmakuForm(resetFeedback = false) {
   const isBili = PLATFORM === "bilibili";
   if (isBili && $("d-w-mode") && $("d-w-mode").value === "creator") {
     $("d-w-mode").value = "public";
     $("d-w-mode")._csSync?.();
   }
+  if ($("d-w-mode-wrap")) $("d-w-mode-wrap").style.display = isBili ? "none" : "";
   const kind = $("d-w-kind") ? $("d-w-kind").value : "auto";
-  const mode = $("d-w-mode") ? $("d-w-mode").value : "public";
+  const mode = !isBili && $("d-w-mode") ? $("d-w-mode").value : "public";
   const isVideo = kind === "video";
   const recentWrap = $("d-w-recent-wrap");
   const daysWrap = $("d-w-days-wrap");
@@ -5678,7 +7171,7 @@ function applyDanmakuForm() {
   if ($("d-w-url")) $("d-w-url").placeholder = isBili
     ? (isVideo ? "粘贴哔哩哔哩视频分享文案、链接或 BV/av 号" : kind === "user" ? "粘贴空间主页链接或 UP 主 mid" : "直接粘贴整段哔哩哔哩分享文案，将自动识别视频或 UP 主")
     : (isVideo ? "粘贴视频分享文案、作品链接或 aweme_id" : kind === "user" ? "粘贴主页分享文案、账号主页或 sec_uid" : "直接粘贴整段抖音分享文案，将自动识别视频或账号");
-  resetDanmakuTargetState();
+  if (resetFeedback) resetDanmakuTargetState();
   const accLabel = $("d-w-acc-label");
   if (accLabel) accLabel.textContent = mode === "creator"
     ? "创作中心账号（必选）" : "播放页账号（可选）";
@@ -6857,7 +8350,7 @@ function pollReloginTask(tid) {
 }
 async function delAccount(id) {
   const a = findAnyAccount(id);
-  const warn = a && a.monitor_count > 0 ? `\n关联的 ${a.monitor_count} 个作品监控也会暂停。` : "";
+  const warn = a && a.monitor_count > 0 ? `\n关联的 ${a.monitor_count} 个主页作品监控也会暂停。` : "";
   if (!await uiConfirm({ title: "删除账号", message: "删除该账号将取消未执行任务、停用关联规则并清理独占登录环境；历史内容保留。执行中的操作需要先结束。" + warn, okText: "删除并停止关联任务", danger: true })) return;
   try {
     const result = await api("/api/accounts/" + id, { method: "DELETE" });
@@ -6896,7 +8389,7 @@ function transportSourceSuffix(source) {
 function renderTransportMatrix(data) {
   const body = $("transport-matrix-body"), isolation = $("transport-isolation-body");
   if (!body || !isolation) return;
-  const platformNames = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook" };
+  const platformNames = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook", youtube: "YouTube" };
   const rows = Array.isArray(data?.rows) ? data.rows : [];
   body.innerHTML = rows.length ? rows.map(row => `<tr>
     <td><b>${esc(platformNames[row.platform] || row.platform)}</b></td>
@@ -6952,6 +8445,18 @@ function openAiChannelsManager() {
 function openAiSettingsSection() {
   if (typeof switchTab === "function") switchTab("settings", true);
   globalThis.CreatorHubWorkbench?.showSection?.("settings", "ai");
+}
+function openEngineSettingsSection(focusFieldId = "") {
+  if (typeof switchTab === "function") switchTab("settings", true);
+  globalThis.CreatorHubWorkbench?.showSection?.("settings", "engine");
+  if (focusFieldId) {
+    setTimeout(() => {
+      const el = $(focusFieldId);
+      if (!el) return;
+      for (let d = el.closest("details"); d; d = d.parentElement?.closest("details")) d.open = true;
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 140);
+  }
 }
 function _aiSelectedChannel() {
   const cid = $("ai-channel-id")?.value || AI_CHANNELS_STATE.active_channel_id || "default";
@@ -8713,7 +10218,7 @@ function filterShareAccounts() {
   const old = sel.value;
   const platform = shareAccountPlatform();
   const hasDetectedLink = !!SHARE_LINKS.length;
-  const knownAccountPlatform = ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(platform);
+  const knownAccountPlatform = ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(platform);
   const rows = knownAccountPlatform
     ? SHARE_ACCOUNTS.filter(a => a.platform === platform)
     : [];
@@ -8760,12 +10265,24 @@ function renderShareLinks(links) {
   box.innerHTML = `<b>已识别 ${SHARE_LINKS.length} 条候选链接</b>${labels}`;
 }
 
-async function parseShareLinks(button = null) {
+let _SD_PASTE_TIMER = null;
+function handleShareTextPaste() {
+  clearTimeout(_SD_PASTE_TIMER);
+  _SD_PASTE_TIMER = setTimeout(() => {
+    const val = ($("sd-text")?.value || "").trim();
+    if (val && /https?:\/\/|[a-z0-9-]+\.(com|cn|tv|be|co|watch|me)\//i.test(val)) {
+      parseShareLinks(null, { quiet: true });
+    }
+  }, 60);
+}
+
+async function parseShareLinks(button = null, options = {}) {
+  const quiet = !!options.quiet;
   const text = $("sd-text").value.trim();
-  if (!text) { toast("请粘贴分享链接或完整分享文案", "err"); return null; }
-  const btn = button || evtBtn();
+  if (!text) { if (!quiet) toast("请粘贴分享链接或完整分享文案", "err"); return null; }
+  const btn = button || (quiet ? null : evtBtn());
   $("sd-msg").textContent = "正在清洗文案并识别链接…";
-  return await withBusy(btn, "识别中", async () => {
+  const work = async () => {
     try {
       const result = await api("/api/share-download/links", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -8773,15 +10290,16 @@ async function parseShareLinks(button = null) {
       });
       SHARE_SOURCE = text;
       renderShareLinks(result.links);
-      $("sd-msg").textContent = result.count ? `已识别 ${result.count} 条链接 ✓` : "未识别到链接";
-      if (!result.count) toast("没有识别到 http(s) 链接", "err");
+      $("sd-msg").textContent = result.count ? `已自动识别 ${result.count} 条链接 ✓` : "未识别到链接";
+      if (!result.count && !quiet) toast("没有识别到 http(s) 链接", "err");
       return result;
     } catch (e) {
       $("sd-msg").textContent = "识别失败：" + e.message;
-      toast("识别失败：" + e.message, "err");
+      if (!quiet) toast("识别失败：" + e.message, "err");
       return null;
     }
-  });
+  };
+  return btn ? await withBusy(btn, "识别中", work) : await work();
 }
 
 function shareRequestBody(download) {
@@ -8877,6 +10395,27 @@ function shareHistoryQuality(row) {
 function shareHistoryPlatform(row) {
   return String((row && row.platform) || shareHistoryMetadata(row).platform || "generic");
 }
+function normalizeShareHistoryPlatform(platform) {
+  const p = String(platform || "").trim().toLowerCase();
+  if (p === "wechat" || p === "channels") return "shipinhao";
+  if (p === "x") return "twitter";
+  return p || "generic";
+}
+function shareHistoryScopedRows() {
+  if (GLOBAL_MODE) return SHARE_HISTORY;
+  return SHARE_HISTORY.filter(row => normalizeShareHistoryPlatform(shareHistoryPlatform(row)) === PLATFORM);
+}
+function syncShareHistoryPlatformControl(notify = true) {
+  const select = $("sd-history-platform");
+  if (!select) return;
+  const host = select.closest(".cs") || select;
+  host.classList.toggle("hidden", !GLOBAL_MODE);
+  if (!GLOBAL_MODE && select.value) {
+    select.value = "";
+    if (select._csSync) select._csSync();
+    if (notify) select.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+}
 function shareHistoryFiles(row) {
   return Array.isArray(row && row.files) ? row.files.filter(file => file && typeof file === "object") : [];
 }
@@ -8913,15 +10452,16 @@ function populateShareHistoryFacets() {
   const sharePf = { wechat: "视频号", channels: "视频号", youtube: "YouTube", weibo: "微博", twitter: "X", x: "X", facebook: "Facebook", generic: "通用站点" };
   select.innerHTML = `<option value="">全部平台</option>` + platforms.map(platform =>
     `<option value="${esc(platform)}">${esc(PF_NAME[platform] || sharePf[platform] || platform)}</option>`).join("");
-  select.value = platforms.includes(old) ? old : "";
+  select.value = GLOBAL_MODE && platforms.includes(old) ? old : "";
   if (select._csSync) select._csSync();
+  syncShareHistoryPlatformControl(false);
 }
 function shareHistoryFilteredRows() {
   const query = (($('sd-history-search') && $('sd-history-search').value) || "").trim().toLocaleLowerCase();
-  const platform = ($('sd-history-platform') && $('sd-history-platform').value) || "";
+  const platform = GLOBAL_MODE ? (($('sd-history-platform') && $('sd-history-platform').value) || "") : "";
   const type = ($('sd-history-type') && $('sd-history-type').value) || "";
   const status = ($('sd-history-status') && $('sd-history-status').value) || "";
-  return SHARE_HISTORY.filter(row => {
+  return shareHistoryScopedRows().filter(row => {
     if (platform && shareHistoryPlatform(row) !== platform) return false;
     if (type && shareHistoryType(row) !== type) return false;
     if (status && (row.status || row.download_status) !== status) return false;
@@ -9008,15 +10548,22 @@ function renderShareHistoryRows(resetPage = false) {
   if (resetPage) SHARE_HISTORY_PAGE = 1;
   const body = $("sd-history-body");
   if (!body) return;
+  syncShareHistoryPlatformControl(false);
+  const scoped = shareHistoryScopedRows();
   const rows = shareHistoryFilteredRows();
   const pages = Math.max(1, Math.ceil(rows.length / SHARE_HISTORY_PAGE_SIZE));
   if (SHARE_HISTORY_PAGE > pages) { SHARE_HISTORY_PAGE = pages; return renderShareHistoryRows(); }
   SHARE_HISTORY_TOTAL = rows.length;
   const start = (SHARE_HISTORY_PAGE - 1) * SHARE_HISTORY_PAGE_SIZE;
   const pageRows = rows.slice(start, start + SHARE_HISTORY_PAGE_SIZE);
-  $("sd-history-count").textContent = `${SHARE_HISTORY.length} 条`;
-  if ($("sd-history-filter-count")) $("sd-history-filter-count").textContent = `显示 ${rows.length} / ${SHARE_HISTORY.length}`;
-  body.innerHTML = pageRows.map(shareHistoryRow).join("") || empty(8, rows.length ? "暂无下载历史" : (SHARE_HISTORY.length ? "没有匹配的下载历史" : "暂无下载历史"), "i-download", SHARE_HISTORY.length ? "调整筛选条件" : "开始下载后会自动记录；旧下载会从元数据文件补录");
+  $("sd-history-count").textContent = `${scoped.length} 条`;
+  if ($("sd-history-filter-count")) $("sd-history-filter-count").textContent = `显示 ${rows.length} / ${scoped.length}`;
+  body.innerHTML = pageRows.map(shareHistoryRow).join("") || empty(
+    8,
+    rows.length ? "暂无下载历史" : (scoped.length ? "没有匹配的下载历史" : (GLOBAL_MODE ? "暂无下载历史" : `暂无 ${PF_NAME[PLATFORM] || PLATFORM} 链接下载历史`)),
+    "i-download",
+    scoped.length ? "调整筛选条件" : "开始下载后会自动记录；旧下载会从元数据文件补录"
+  );
   updateShareHistorySelBar();
   renderShareHistoryPager(rows.length);
 }
@@ -9039,7 +10586,8 @@ async function refreshShareHistory() {
 }
 
 function _shareHistoryReportParams(full) {
-  const params = new URLSearchParams({ platform: PLATFORM });
+  const params = new URLSearchParams();
+  if (!GLOBAL_MODE) params.set("platform", PLATFORM);
   if (full) {
     params.set("full", "true");
     return params;
@@ -9050,7 +10598,7 @@ function _shareHistoryReportParams(full) {
     }
   };
   put("q", $("sd-history-search") && $("sd-history-search").value);
-  put("platform", $("sd-history-platform") && $("sd-history-platform").value);
+  if (GLOBAL_MODE) put("platform", $("sd-history-platform") && $("sd-history-platform").value);
   put("media_type", $("sd-history-type") && $("sd-history-type").value);
   put("status", $("sd-history-status") && $("sd-history-status").value);
   return params;
@@ -9189,6 +10737,102 @@ function renderShareResult(response, download) {
   card.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+const SHARE_LAST_SHOWN_RESULT = new Set();
+
+function renderShareLiveJobs() {
+  const card = $("sd-live-card");
+  const box = $("sd-live-list");
+  const summaryEl = $("sd-live-summary");
+  if (!card || !box || !window.CreatorHubProgress) return;
+  const P = window.CreatorHubProgress;
+  const jobs = P.getTasks().filter(t => t.category === "share_download");
+  if (!jobs.length) {
+    card.style.display = "none";
+    setHtmlIfChanged(box, "");
+    return;
+  }
+  const activeCount = jobs.filter(j => ["queued", "running"].includes(j.status)).length;
+  card.style.display = "block";
+  if (summaryEl) {
+    summaryEl.textContent = activeCount ? `${activeCount} 项进行中 · 共 ${jobs.length} 项` : `近期 ${jobs.length} 项`;
+  }
+  const html = jobs.map(task => {
+    const items = Array.isArray(task.extra?.items) ? task.extra.items : [];
+    const jobId = task.extra?.job_id || "";
+    const tone = task.status === "completed" ? "ok" : task.status === "failed" ? "danger" : task.status === "canceled" ? "neutral" : "info";
+    const statusText = { queued: "排队中", running: "下载中", completed: "已完成", failed: "失败", canceled: "已取消" }[task.status] || task.status;
+    const speedTxt = P.fmtSpeed(task.speed_bps);
+    const etaTxt = P.fmtEta(task.eta_seconds);
+    const bytesTxt = task.unit === "bytes" && Number(task.total) > 0
+      ? `${P.fmtBytes(task.current)} / ${P.fmtBytes(task.total)}`
+      : (task.unit === "bytes" && Number(task.current) > 0 ? `已下载 ${P.fmtBytes(task.current)}` : "");
+    const meta = [bytesTxt, speedTxt, etaTxt].filter(Boolean).join(" · ");
+    const subHtml = items.length > 1 ? `<div class="share-live-items">${items.map(it => {
+      const itTone = it.status === "completed" ? "ok" : it.status === "failed" ? "danger" : "info";
+      const itPct = it.determinate && Number.isFinite(Number(it.percent)) ? `${Math.round(Number(it.percent))}%` : (it.phase_label || it.status);
+      const itMeta = [
+        it.total_bytes > 0 ? `${P.fmtBytes(it.downloaded_bytes)} / ${P.fmtBytes(it.total_bytes)}` : "",
+        P.fmtSpeed(it.speed_bps),
+        P.fmtEta(it.eta_seconds),
+      ].filter(Boolean).join(" · ");
+      return `<div class="share-live-subitem">
+        <div class="share-live-subitem-row">
+          <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><b>${esc(it.title || it.host || it.url)}</b></span>
+          <span class="mut progress-num" style="flex:0 0 auto">${esc(itPct)}</span>
+        </div>
+        ${["queued", "running", "completed"].includes(it.status) ? P.renderProgressBar({ determinate: it.determinate, percent: it.percent, tone: itTone, label: it.title || it.url, compact: true }) : ""}
+        ${itMeta ? `<div class="mut progress-num" style="font-size:11px">${esc(itMeta)}</div>` : ""}
+        ${it.error ? `<div style="font-size:11px;color:var(--danger)">${esc(it.error)}</div>` : ""}
+      </div>`;
+    }).join("")}</div>` : "";
+    const firstHistoryId = items.find(it => it.history_id)?.history_id;
+    const hasResults = Array.isArray(task.extra?.results) && task.extra.results.length > 0;
+    return `<article class="share-live-card${task.status === "failed" ? " is-failed" : ""}" data-share-job="${esc(jobId)}">
+      <div class="share-live-head">
+        <div class="share-live-title">${esc(task.title)}</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+          <span class="pill ${tone === "ok" ? "done" : tone === "danger" ? "failed" : tone === "info" ? "downloading" : "skipped"} bare">${esc(statusText)}</span>
+          ${task.determinate && Number.isFinite(Number(task.percent)) ? `<b class="progress-num" style="font-size:12px">${Math.round(Number(task.percent))}%</b>` : ""}
+          ${task.cancelable ? `<button type="button" class="ghost sm danger" onclick="window.CreatorHubProgress.cancelTask(${jsArg(task.task_key)}, this)">${ic("i-x")}取消</button>` : ""}
+          ${firstHistoryId ? `<button type="button" class="ghost sm" onclick="openShareHistoryPreview(${Number(firstHistoryId)})">${ic("i-eye")}预览</button><button type="button" class="ghost sm" onclick="revealShareHistoryPath(${Number(firstHistoryId)}, this)">${ic("i-folder")}文件夹</button>` : ""}
+          ${hasResults ? `<button type="button" class="ghost sm" onclick="showShareJobResult(${jsArg(task.task_key)})">查看结果</button>` : ""}
+        </div>
+      </div>
+      <div class="share-live-sub">
+        <span>${esc(task.phase_label || statusText)}${task.detail ? ` · ${esc(task.detail)}` : ""}</span>
+        ${meta ? `<span class="progress-num">${esc(meta)}</span>` : ""}
+      </div>
+      ${["queued", "running", "completed"].includes(task.status) ? P.renderProgressBar({ determinate: task.determinate, percent: task.percent, tone, label: task.title }) : ""}
+      ${task.error ? `<div style="font-size:12px;color:var(--danger)">${esc(task.error)}</div>` : ""}
+      ${subHtml}
+    </article>`;
+  }).join("");
+  setHtmlIfChanged(box, html);
+
+  // 最新完成且未自动展示过的任务自动刷新结果区与历史列表
+  for (const task of jobs) {
+    if (["completed", "failed"].includes(task.status) && Array.isArray(task.extra?.results) && task.extra.results.length && !SHARE_LAST_SHOWN_RESULT.has(task.task_key)) {
+      SHARE_LAST_SHOWN_RESULT.add(task.task_key);
+      renderShareResult({ results: task.extra.results }, task.extra?.download !== false);
+      if (task.extra?.download !== false) refreshShareHistory();
+    }
+  }
+}
+
+function showShareJobResult(taskKey) {
+  const task = window.CreatorHubProgress?.getTask(taskKey);
+  if (task && Array.isArray(task.extra?.results)) {
+    renderShareResult({ results: task.extra.results }, task.extra?.download !== false);
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("creatorhub:progress:update", e => {
+    const task = e.detail?.task;
+    if (!task || task.category === "share_download") renderShareLiveJobs();
+  });
+}
+
 async function runShareDownload(download, button = null) {
   const btn = button || evtBtn();
   const text = $("sd-text").value.trim();
@@ -9198,18 +10842,35 @@ async function runShareDownload(download, button = null) {
     const parsed = await parseShareLinks(null);
     if (!parsed || !parsed.count) return;
   }
-  $("sd-msg").textContent = download ? "正在解析并下载，较大视频需要等待…" : "正在读取远端作品信息…";
-  await withBusy(btn, download ? "下载中" : "读取中", async () => {
+  if (download) {
+    $("sd-msg").textContent = "正在提交后台下载任务…";
+    await withBusy(btn, "提交中", async () => {
+      try {
+        const job = await api("/api/share-download/jobs", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(shareRequestBody(true)),
+        });
+        $("sd-msg").textContent = `已提交后台下载（#${job.id}），可继续添加链接或切换页面 ✓`;
+        toast("已加入后台下载队列，实时进度可在当前页或右上角活动中心查看", "ok", 4500);
+        renderShareLiveJobs();
+      } catch (e) {
+        $("sd-msg").textContent = "提交失败：" + e.message;
+        toast("提交失败：" + e.message, "err", 7000);
+      }
+    });
+    return;
+  }
+  $("sd-msg").textContent = "正在读取远端作品信息…";
+  await withBusy(btn, "读取中", async () => {
     try {
       const response = await api("/api/share-download", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(shareRequestBody(download)),
+        body: JSON.stringify(shareRequestBody(false)),
       });
-      renderShareResult(response, download);
-      if (download) refreshShareHistory();
+      renderShareResult(response, false);
       if (response.ok) {
-        $("sd-msg").textContent = download ? "下载完成 ✓" : "作品信息读取完成 ✓";
-        toast(download ? "链接作品下载完成" : "作品信息读取完成", "ok");
+        $("sd-msg").textContent = "作品信息读取完成 ✓";
+        toast("作品信息读取完成", "ok");
       } else {
         const first = (response.results || []).find(x => !x.ok);
         $("sd-msg").textContent = "处理完成，但有失败项：" + ((first && first.error) || "");
@@ -9376,9 +11037,8 @@ async function testChannel(id) {
 async function toggleChannel(id, enabled) { try { await api("/api/notifications/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }); refreshChannels(); } catch (e) { toast("操作失败:" + e.message, "err"); } }
 async function delChannel(id) { if (await uiConfirm({ title: "删除渠道", message: "删除该通知渠道?", okText: "删除", danger: true })) { try { await api("/api/notifications/" + id, { method: "DELETE" }); toast("渠道已删除", "ok"); refreshChannels(); } catch (e) { toast("删除失败:" + e.message, "err"); } } }
 
-// 12-collections.js — 关键词与创作者批量作品采集任务管理、结果筛选与报表导出。
-// ─── 监控 ───
-// ═══════════ 抖音 / 小红书关键词批量采集 ═══════════
+// 12-collections.js — 十一平台关键词采集任务管理、结果筛选与报表导出。
+// ═══════════ 关键词采集 ═══════════
 function parseCollectionKeywords(raw) {
   const seen = new Set();
   return String(raw || "")
@@ -9391,143 +11051,87 @@ function parseCollectionKeywords(raw) {
 function collectionKeywords() {
   return parseCollectionKeywords($("col-keywords") ? $("col-keywords").value : "");
 }
-function collectionSourceValue() {
-  return $("col-source") ? ($("col-source").value || "keyword") : "keyword";
-}
-async function loadCollectionFavoriteBoards() {
-  const accountId = Number($("col-account")?.value || 0);
-  const select = $("col-board");
-  if (!select || !accountId || !["xhs", "rednote"].includes(PLATFORM)) return;
-  const requestedAccount = accountId;
-  select.disabled = true;
-  select.innerHTML = '<option value="">正在加载收藏夹…</option>';
-  $("col-board-help").textContent = "";
-  try {
-    const boards = await api(`/api/accounts/${accountId}/${PLATFORM === "rednote" ? "rednote" : "xhs"}/favorite-boards`);
-    if (Number($("col-account")?.value || 0) !== requestedAccount) return;
-    COLLECTION_FAVORITE_BOARDS = boards || [];
-    select.innerHTML = '<option value="">请选择收藏夹</option>' + COLLECTION_FAVORITE_BOARDS.map(board =>
-      `<option value="${esc(board.id)}">${esc(board.name)}${Number(board.total) ? `（${fmtNum(board.total)}）` : ""}</option>`).join("");
-    $("col-board-help").textContent = boards.length ? `已读取 ${boards.length} 个收藏夹` : "当前账号没有可用收藏夹";
-  } catch (e) {
-    COLLECTION_FAVORITE_BOARDS = [];
-    select.innerHTML = '<option value="">加载失败，请重新选择账号</option>';
-    $("col-board-help").textContent = e.message;
-  } finally {
-    select.disabled = false;
-    select._csSync?.();
-  }
-}
-function collectionAccountChanged() {
-  if (collectionSourceValue() === "favorite_board") loadCollectionFavoriteBoards();
-}
-function collectionSourceChanged() {
-  applyCollectionForm();
-  if (collectionSourceValue() === "favorite_board") loadCollectionFavoriteBoards();
-}
-// 采集来源下拉按平台重建:不适用当前平台的选项直接移除(而非 disabled/hidden),
-// 部分浏览器(如 Firefox)对 <option hidden> 不生效,仍会显示灰色禁用项。
-const COL_SOURCE_DEFS = [
-  { value: "keyword", label: "关键词搜索" },
-  { value: "creator", label: "创作者主页" },
-  { value: "favorite_all", label: "全部收藏", xhs: true },
-  { value: "favorite_board", label: "指定收藏夹", xhs: true },
-  { value: "account_works", label: "本账号作品", channels: true },
-];
-function rebuildCollectionSources(xhs, channels, tiktok) {
-  const sel = $("col-source");
-  if (!sel) return;
-  const current = sel.value;
-  const bilibili = PLATFORM === "bilibili";
-  const rednote = PLATFORM === "rednote";
-  const instagram = PLATFORM === "instagram";
-  const twitter = PLATFORM === "twitter";
-  const facebook = PLATFORM === "facebook";
-  sel.innerHTML = "";
-  for (const o of COL_SOURCE_DEFS) {
-    let keep;
-    if (o.channels) keep = channels || bilibili || instagram || twitter || facebook;
-    else if (o.xhs) keep = xhs || rednote;
-    else keep = !(tiktok && o.value !== "keyword");
-    if (!keep) continue;
-    const opt = document.createElement("option");
-    opt.value = o.value;
-    opt.textContent = o.label;
-    sel.appendChild(opt);
-  }
-  const hasActiveChannelsAccount = channels && ACCOUNTS.some(
-    a => a.platform === "shipinhao" && a.status !== "invalid" && a.has_storage
-  );
-  if ([...sel.options].some(o => o.value === current)) sel.value = current;
-  else if (channels) sel.value = hasActiveChannelsAccount ? "account_works" : "keyword";
-  else if (tiktok) sel.value = "keyword";
-  else sel.value = "keyword";
-}
 function applyCollectionForm() {
-  const enabled = !!($("col-download") && $("col-download").checked);
-  if ($("col-dir-wrap")) $("col-dir-wrap").style.display = enabled ? "" : "none";
+  const downloadOn = !!($("col-download") && $("col-download").checked);
+  const contentType = $("col-content-type")?.value || "all";
+  const commentLimit = Number($("col-comment-limit")?.value ?? 20);
   const xhs = PLATFORM === "xhs";
   const channels = PLATFORM === "shipinhao";
   const tiktok = PLATFORM === "tiktok";
   const platformName = PF_NAME[PLATFORM] || "平台";
-  rebuildCollectionSources(xhs, channels, tiktok);
   populateCollectionAccount();
-  const source = collectionSourceValue();
-  const channelsAccountOnly = channels && source === "account_works";
-  const biliAccountOnly = PLATFORM === "bilibili" && source === "account_works";
-  const igAccountOnly = PLATFORM === "instagram" && source === "account_works";
-  const twAccountOnly = PLATFORM === "twitter" && source === "account_works";
-  const fbAccountOnly = PLATFORM === "facebook" && source === "account_works";
-  const accountWorksOnly = channelsAccountOnly || biliAccountOnly || igAccountOnly || twAccountOnly || fbAccountOnly;
-  const favorite = ["favorite_all", "favorite_board"].includes(source);
-  const alternate = source !== "keyword";
-  if ($("col-keywords-wrap")) $("col-keywords-wrap").style.display = alternate ? "none" : "";
-  if ($("col-board-wrap")) $("col-board-wrap").style.display = source === "favorite_board" ? "" : "none";
-  if ($("col-source-ref-wrap")) $("col-source-ref-wrap").style.display = source === "creator" ? "" : "none";
-  if ($("collection-create-title")) {
-    $("collection-create-title").textContent = channelsAccountOnly
-      ? "新建视频号本账号作品采集"
-      : biliAccountOnly
-      ? "新建哔哩哔哩本账号作品采集"
-      : igAccountOnly
-      ? "新建 Instagram 本账号作品采集"
-      : twAccountOnly
-      ? "新建 Twitter 本账号作品采集"
-      : fbAccountOnly
-      ? "新建 Facebook 本账号作品采集"
-      : favorite
-      ? `新建${platformName}收藏采集`
-      : source === "creator"
-        ? `新建${platformName}创作者采集`
-        : `新建${platformName}关键词采集`;
+  if ($("col-dir-wrap")) $("col-dir-wrap").style.display = downloadOn ? "" : "none";
+  if ($("col-quality-wrap")) {
+    const showQuality = QUALITY_PLATFORMS.includes(PLATFORM) && downloadOn && contentType !== "images";
+    $("col-quality-wrap").style.display = showQuality ? "" : "none";
   }
-  if ($("collection-create-sub")) $("collection-create-sub").textContent = channelsAccountOnly ? "同步当前登录账号的视频与图文，并按需采集评论与解密媒体" : biliAccountOnly ? "同步当前登录账号的投稿稿件，并按需采集评论与下载视频" : igAccountOnly ? "同步当前登录账号的帖子与 Reels，并按需采集评论与下载原图/视频" : twAccountOnly ? "同步当前登录账号的推文与媒体，并按需采集回复与下载高清原图/视频" : fbAccountOnly ? "同步当前登录账号的 Facebook 动态与媒体，并按需采集评论与下载图片/视频" : channels ? "通过微信原生 Finder 协议采集作品、解密视频并拉取全量评论线程" : favorite ? "导入收藏笔记并继续抓取详情与评论" : source === "creator" ? "导入创作者公开作品并抓取评论" : xhs ? "批量搜索笔记并抓取评论" : tiktok ? "通过离线签名 API 批量搜索 TikTok 视频并抓取评论" : PLATFORM === "bilibili" ? "通过离线 WBI 签名接口批量搜索视频并抓取评论" : PLATFORM === "instagram" ? "通过 Instagram 双栈协议接口批量搜索话题/帖子并抓取评论" : PLATFORM === "twitter" ? "通过 Twitter 混合协议搜索推文并采集回复线程" : PLATFORM === "facebook" ? "通过 Facebook 隔离浏览器拦截 GraphQL 搜索帖子、群组或主页并采集评论" : "批量搜索视频并抓取评论";
-  if ($("nav-collections-label")) $("nav-collections-label").textContent = channels ? "作品批量采集" : "关键词采集";
-  if ($("col-content-limit-label")) $("col-content-limit-label").textContent = accountWorksOnly ? "作品上限" : "每词作品上限";
-  if ($("col-page-limit-label")) $("col-page-limit-label").innerHTML = accountWorksOnly ? '作品页采集深度 <span class="field-scope">1–40 页</span>' : '每词采集深度 <span class="field-scope">1–40 页</span>';
-  if ($("col-sort-wrap")) $("col-sort-wrap").style.display = (accountWorksOnly || source === "creator") ? "none" : "";
-  if ($("col-page-help")) $("col-page-help").textContent = channelsAccountOnly ? "依次读取视频与图文管理页(或复用微信原生 Finder 主页协议)。" : biliAccountOnly ? "依次读取创作中心稿件列表接口分页。" : igAccountOnly ? "依次读取 Instagram 用户时间线 feed/user 分页。" : twAccountOnly ? "依次读取当前账号时间线 UserTweets 分页。" : fbAccountOnly ? "依次读取当前 Facebook 账号主页时间线滚动分页。" : channels ? "一页对应一次微信原生 Finder 搜索或主页翻页请求。" : (xhs || PLATFORM === "rednote") ? "一页对应一次搜索结果下滑或接口翻页。" : PLATFORM === "bilibili" ? "一页对应一次 WBI 搜索或 UP 主空间投稿接口翻页。" : PLATFORM === "instagram" ? "一页对应一次 tags/sections 或 feed/user 接口翻页。" : PLATFORM === "twitter" ? "一页对应一次 SearchTimeline 或 UserTweets 时间线翻页。" : PLATFORM === "facebook" ? "一页对应一次 Facebook 搜索或主页/群组时间线滚动拦截。" : "一页对应一次搜索结果下滑。";
-  if ($("col-source-ref")) $("col-source-ref").placeholder = PLATFORM === "douyin" ? "抖音 sec_uid" : PLATFORM === "xhs" ? "小红书 user_id" : PLATFORM === "rednote" ? "海外小红书 user_id / www.rednote.com 主页链接" : PLATFORM === "shipinhao" ? "视频号 v2_...@finder / sph 标识 / 主页链接" : PLATFORM === "bilibili" ? "哔哩哔哩 UP 主 mid / space 主页链接 / 视频分享文案" : PLATFORM === "instagram" ? "Instagram @username / 主页链接 / 数字 UID" : PLATFORM === "twitter" ? "Twitter @username / x.com 主页链接 / 数字 UID" : PLATFORM === "facebook" ? "Facebook 个人主页 / 公共主页 / 群组链接或数字 ID" : "快手 user_id / 主页链接 / 短链 / 分享文案";
-  resetCollectionCreatorState();
-  if ($("col-replies-help")) $("col-replies-help").textContent = `采集${platformName}当前可返回的回复`;
-  if ($("collection-callout-title")) $("collection-callout-title").textContent = channelsAccountOnly ? "支持创作者助手本账号同步与微信原生 Finder 协议增强" : channels ? "连接本机已登录微信即可搜索、采主页、抓全量评论与解密下载（无需网页账号）" : "作品上限、采集深度和停止条件任一满足即结束";
-  if ($("collection-callout-copy")) $("collection-callout-copy").textContent = channels
-    ? "视频号采用双通道架构：「关键词搜索 / 创作者主页」直接走「设置 → 视频号微信通道」一键连接的本机微信，无需登录创作者助手；「本账号作品」则读取创作者助手中已登录的本账号视频与图文。"
+  const repliesCb = $("col-replies");
+  const repliesRow = $("col-replies-row");
+  const commentsOff = !(Number.isFinite(commentLimit) && commentLimit > 0);
+  if (repliesCb) {
+    repliesCb.disabled = commentsOff;
+    if (commentsOff) repliesCb.checked = false;
+  }
+  if (repliesRow) repliesRow.style.opacity = commentsOff ? "0.55" : "";
+  if ($("col-replies-help")) {
+    $("col-replies-help").textContent = commentsOff
+      ? "当前每作品评论上限为 0，已自动跳过二级评论"
+      : `采集${platformName}当前可返回的回复`;
+  }
+  if ($("collection-create-title")) {
+    $("collection-create-title").textContent = `新建${platformName}关键词采集`;
+  }
+  if ($("collection-create-sub")) $("collection-create-sub").textContent = channels
+    ? "通过微信原生 Finder 协议按关键词搜索作品、解密视频并拉取评论线程"
+    : xhs || PLATFORM === "rednote"
+    ? "按关键词批量搜索笔记并抓取评论"
     : tiktok
-    ? "TikTok 当前默认 native：关键词、评论和二级回复均由离线签名 API 直连，全程不打开浏览器；只有在设置中手动选择 auto/browser 才会使用页面。直播不在采集范围；视频发布请使用独立发布入口。"
+    ? "通过离线签名 API 按关键词批量搜索 TikTok 视频并抓取评论"
     : PLATFORM === "bilibili"
-    ? "哔哩哔哩默认使用离线 WBI 签名 API 直连搜索视频、读取 UP 主空间与本账号稿件、抓取主评论与楼中楼回复，并携带 Referer 下载渐进式 MP4 媒体；仅在普通接口兼容失败时按设置回退浏览器。"
+    ? "通过离线 WBI 签名接口按关键词批量搜索视频并抓取评论"
     : PLATFORM === "instagram"
-    ? "Instagram 默认使用 Mobile v1 / Web API 直连搜索标签与关键词、读取创作者主页与 Reels、通过 stream_comments 抓取评论与回复，并按序号保存单帖或混合轮播原图/视频；普通兼容失败时自动回退独立浏览器。"
+    ? "通过 Instagram 双栈协议按关键词/话题批量搜索帖子并抓取评论"
     : PLATFORM === "twitter"
-    ? "Twitter 默认结合轻量 Syndication/REST 与独立浏览器拦截 GraphQL 时间线，支持关键词搜索、创作者主页、本账号推文及回复线程采集，并自动选取最高码率 MP4 与 ?name=orig 原图下载。"
+    ? "通过 Twitter 混合协议按关键词搜索推文并采集回复线程"
     : PLATFORM === "facebook"
-    ? "Facebook 采用独立隔离浏览器拦截原生 GraphQL 与 DOM 双层提取，支持关键词帖子搜索、个人/公共主页、公开或已加入群组及本账号动态采集与评论抓取；纯文字帖子将自动标记跳过媒体下载。"
-    : xhs
-    ? "小红书采集复用所选账号的可见浏览器或显式 API 读取模式；最新、类型、时间和数据门槛会在入库前复核；任务串行执行，可随时取消，已入库结果会保留。"
+    ? "通过 Facebook 协议/隔离浏览器按关键词搜索帖子并采集评论"
+    : PLATFORM === "youtube"
+    ? "通过 YouTube SSR + Innertube 协议按关键词批量搜索视频并抓取评论，下载自动无损合流"
+    : "按关键词批量搜索视频并抓取评论";
+  if ($("nav-collections-label")) $("nav-collections-label").textContent = "关键词采集";
+  if ($("col-content-limit-label")) $("col-content-limit-label").textContent = "每词作品上限";
+  if ($("col-page-limit-label")) $("col-page-limit-label").innerHTML = '每词采集深度 <span class="field-scope">1–40 页</span>';
+  if ($("col-page-help")) $("col-page-help").textContent = channels
+    ? "一页对应一次微信原生 Finder 关键词搜索翻页请求。"
+    : (xhs || PLATFORM === "rednote") ? "一页对应一次搜索结果下滑或接口翻页。"
+    : PLATFORM === "bilibili" ? "一页对应一次 WBI 搜索接口翻页。"
+    : PLATFORM === "instagram" ? "一页对应一次 tags/sections 搜索接口翻页。"
+    : PLATFORM === "twitter" ? "一页对应一次 SearchTimeline 翻页。"
+    : PLATFORM === "facebook" ? "一页对应一次 Facebook 关键词搜索分页。"
+    : PLATFORM === "youtube" ? "一页对应一次 Innertube 搜索翻页请求。"
+    : "一页对应一次搜索结果下滑。";
+  if ($("collection-callout-title")) $("collection-callout-title").textContent = channels
+    ? "连接本机已登录微信即可按关键词搜索、抓评论与解密下载（无需网页账号）"
+    : "作品上限、采集深度和停止条件任一满足即结束";
+  if ($("collection-callout-copy")) $("collection-callout-copy").textContent = channels
+    ? "视频号关键词搜索直接走「设置 → 视频号微信通道」一键连接的本机微信，无需登录创作者助手；如需追踪创作者主页请前往「主页作品监控」，查看自有作品请前往「数据与私信」。"
+    : tiktok
+    ? "TikTok 当前默认 native：关键词、评论和二级回复均由离线签名 API 直连，全程不打开浏览器；只有在设置中手动选择 auto/browser 才会使用页面。持续追踪博主请前往「主页作品监控」。"
+    : PLATFORM === "bilibili"
+    ? "哔哩哔哩默认使用离线 WBI 签名 API 直连搜索视频、抓取主评论与楼中楼回复，并携带 Referer 下载渐进式 MP4 媒体；持续追踪 UP 主请前往「主页作品监控」。"
+    : PLATFORM === "instagram"
+    ? "Instagram 默认使用 Mobile v1 / Web API 直连搜索标签与关键词、抓取评论与回复，并按序号保存单帖或混合轮播原图/视频；持续追踪创作者请前往「主页作品监控」。"
+    : PLATFORM === "twitter"
+    ? "Twitter 默认结合轻量 Syndication/REST 与独立浏览器拦截 GraphQL 时间线，支持关键词搜索与回复线程采集，并自动选取最高码率 MP4 与 ?name=orig 原图下载；持续追踪创作者请前往「主页作品监控」。"
+    : PLATFORM === "facebook"
+    ? "Facebook 采用 SSR/RelayModern 协议优先与独立隔离浏览器回退，支持关键词帖子搜索与评论抓取；纯文字帖子将自动标记跳过媒体下载。持续追踪主页/群组请前往「主页作品监控」。"
+    : PLATFORM === "youtube"
+    ? "YouTube 优先通过 SSR ytInitialData 与 Innertube Web (/youtubei/v1/*) 协议批量采集关键词视频及评论区，勾选下载后使用 yt-dlp + 内置 FFmpeg 无损合流保存 MP4；持续追踪频道请前往「主页作品监控」。"
+    : xhs || PLATFORM === "rednote"
+    ? `${platformName}关键词采集复用所选账号的可见浏览器或 API 读取模式；最新、类型、时间和数据门槛会在入库前复核；持续追踪博主请前往「主页作品监控」。`
     : PLATFORM === "kuaishou"
-      ? "快手采集复用所选账号的登录浏览器，拦截页面签名后的搜索、主页和评论响应；类型、时间和数据门槛会在入库前复核。"
-      : "抖音采集会临时打开可见浏览器窗口；平台筛选后还会在本地复核类型、时间和数据门槛；任务串行执行，可随时取消，已入库结果会保留。";
+      ? "快手关键词采集复用所选账号的登录浏览器，拦截页面签名后的搜索和评论响应；类型、时间和数据门槛会在入库前复核；持续追踪博主请前往「主页作品监控」。"
+      : "抖音关键词采集优先按全局读取模式执行，平台筛选后会在本地复核类型、时间和数据门槛；任务串行执行，可随时取消，已入库结果会保留。";
 }
 function collectionStatus(status) {
   const labels = { pending: "等待中", running: "采集中", done: "已完成", partial: "部分完成", failed: "失败", canceled: "已取消" };
@@ -9545,16 +11149,8 @@ function collectionDate(value) {
 }
 async function createCollection() {
   const keywords = collectionKeywords();
-  const sourceType = collectionSourceValue();
-  const board = $("col-board");
-  if (sourceType === "creator") {
-    const normalizedCreator = await normalizeCollectionCreatorTarget(null, { quiet: true });
-    if (normalizedCreator === null) return;
-  }
-  const sourceRef = sourceType === "favorite_board" ? (board?.value || "") : sourceType === "creator" ? ($("col-source-ref")?.value.trim() || "") : "";
-  const sourceName = sourceType === "account_works" ? "本账号作品" : sourceType === "favorite_all" ? "全部收藏" : sourceType === "favorite_board" ? (board?.selectedOptions?.[0]?.textContent || "").replace(/（[\d,.万亿]+）$/, "") : sourceType === "creator" ? `创作者 ${sourceRef}` : "";
-  const requiresAccount = collectionRequiresAccount(PLATFORM, sourceType);
-  const accountId = requiresAccount || PLATFORM !== "shipinhao" ? Number($("col-account").value || 0) : 0;
+  const requiresAccount = collectionRequiresAccount(PLATFORM);
+  const accountId = requiresAccount ? Number($("col-account").value || 0) : 0;
   const contentLimit = Number($("col-content-limit").value || 0);
   const commentLimit = Number($("col-comment-limit").value || 0);
   const pageLimit = Number($("col-page-limit").value || 0);
@@ -9562,9 +11158,7 @@ async function createCollection() {
   const minLikes = Number($("col-min-likes").value || 0);
   const minComments = Number($("col-min-comments").value || 0);
   let valid = true;
-  valid = setFieldError($("col-keywords"), sourceType === "keyword" && !keywords.length ? "请至少填写一个关键词" : keywords.length > 20 ? "单个任务最多 20 个关键词" : "") && valid;
-  if (sourceType === "favorite_board") valid = setFieldError(board, !sourceRef ? "请选择收藏夹" : "") && valid;
-  if (sourceType === "creator") valid = setFieldError($("col-source-ref"), !sourceRef ? "请填写创作者用户 ID" : "") && valid;
+  valid = setFieldError($("col-keywords"), !keywords.length ? "请至少填写一个关键词" : keywords.length > 20 ? "单个任务最多 20 个关键词" : "") && valid;
   valid = requiresAccount
     ? setFieldError($("col-account"), !accountId ? "请选择一个已登录账号" : "") && valid
     : setFieldError($("col-account"), "") && valid;
@@ -9587,7 +11181,7 @@ async function createCollection() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           platform: PLATFORM, account_id: accountId, keywords,
-          source_type: sourceType, source_ref: sourceRef, source_name: sourceName,
+          source_type: "keyword", source_ref: "", source_name: "",
           max_contents_per_keyword: contentLimit,
           max_pages_per_keyword: pageLimit,
           stagnant_pages: stagnantPages,
@@ -9597,15 +11191,15 @@ async function createCollection() {
           min_likes: minLikes,
           min_comments: minComments,
           max_comments_per_content: commentLimit,
-          include_replies: $("col-replies").checked,
+          include_replies: commentLimit > 0 && $("col-replies").checked,
           download_media: $("col-download").checked,
-          video_quality: $("col-quality").value || "highest",
-          download_dir: $("col-download-dir").value.trim(),
+          video_quality: QUALITY_PLATFORMS.includes(PLATFORM) ? ($("col-quality").value || "highest") : "highest",
+          download_dir: $("col-download").checked ? $("col-download-dir").value.trim() : "",
         }),
       });
       $("col-create-msg").textContent = `任务 #${job.id} 已进入队列`;
-      if (sourceType === "keyword") $("col-keywords").value = "";
-      toast(`${sourceType === "account_works" ? "本账号作品" : sourceType === "keyword" ? "关键词" : sourceType === "creator" ? "创作者" : "收藏"}采集任务已创建`, "ok");
+      $("col-keywords").value = "";
+      toast("关键词采集任务已创建", "ok");
       globalThis.CreatorHubWorkbench?.completed?.("collections");
       await refreshCollections();
     } catch (e) {
@@ -9622,7 +11216,7 @@ function collectionTaskSkeleton(count = 3) {
 }
 function collectionTaskEmpty() {
   return `<div class="empty collection-task-empty"><div class="empty-ic">${ic("i-hash")}</div>
-    <div class="empty-t">还没有采集任务</div><div class="empty-sub">可按平台支持的来源创建作品采集任务。</div><button class="ghost sm" data-open-composer="collections">新建采集任务</button></div>`;
+    <div class="empty-t">还没有关键词采集任务</div><div class="empty-sub">输入搜索关键词即可批量采集作品、评论与媒体。</div><button class="ghost sm" data-open-composer="collections">新建关键词采集</button></div>`;
 }
 function collectionProgress(job) {
   if (job.status === "done") return 100;
@@ -9759,16 +11353,17 @@ function renderCollectionJobs() {
   const html = COLLECTION_JOBS.map(job => {
     const status = collectionStatus(job.status);
     const percent = collectionProgress(job);
-    const sourceLabel = job.source_type === "keyword" ? "关键词" : "来源";
-    const keywordProgress = `${Number(job.processed_keyword_count || 0)}/${Number(job.total_keyword_count || 0)} ${sourceLabel}`;
+    const isLegacySource = (job.source_type || "keyword") !== "keyword";
+    const sourceLabel = isLegacySource ? "历史来源（已下线）" : "关键词";
+    const keywordProgress = `${Number(job.processed_keyword_count || 0)}/${Number(job.total_keyword_count || 0)} ${isLegacySource ? "来源" : "关键词"}`;
     const itemProgress = Number(job.current_item_total || 0) > 0
       ? ` · 当前作品 ${Number(job.current_item_index || 0)}/${Number(job.current_item_total || 0)}` : "";
-    const sourceValues = job.source_type === "keyword" ? (job.keywords || []) : [job.source_name || (job.source_type === "account_works" ? "本账号作品" : job.source_type === "favorite_all" ? "全部收藏" : "收藏夹")];
+    const sourceValues = !isLegacySource ? (job.keywords || []) : [job.source_name || "历史采集来源"];
     const keywords = sourceValues.slice(0, 5).map(k => `<span class="meta-chip">${esc(k)}</span>`).join("") +
       (sourceValues.length > 5 ? `<span class="meta-chip more">+${sourceValues.length - 5}</span>` : "");
     const canCancel = ["pending", "running"].includes(job.status);
-    const canRetry = ["done", "partial", "failed", "canceled"].includes(job.status);
-    const canEdit = canRetry && ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(job.platform);
+    const canRetry = !isLegacySource && ["done", "partial", "failed", "canceled"].includes(job.status);
+    const canEdit = canRetry && ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(job.platform);
     const isRunning = job.status === "running";
     const isSelected = !isRunning && selCollection.has(job.id);
     const needsManualClear = !!(job.manual_review_required && Number(job.account_id) > 0);
@@ -9777,11 +11372,28 @@ function renderCollectionJobs() {
     const timeLabel = { all: "不限时间", day: "一天内", week: "一周内", half_year: "半年内" }[job.publish_time] || "不限时间";
     const typeLabel = { all: "全部类型", video: "视频", images: "图文" }[job.content_type] || "全部类型";
     const threshold = [Number(job.min_likes) > 0 ? `≥${fmtNum(job.min_likes)} 赞` : "", Number(job.min_comments) > 0 ? `≥${fmtNum(job.min_comments)} 评` : ""].filter(Boolean).join(" · ");
+    const live = window.CreatorHubProgress?.getTask?.("collection:" + job.id);
+    const useLive = live && ["queued", "running", "blocked", "waiting_user"].includes(live.status) && ["pending", "running"].includes(job.status);
+    const livePct = useLive && live.determinate && live.percent !== null && live.percent !== undefined && Number.isFinite(Number(live.percent))
+      ? Math.max(0, Math.min(100, Math.round(Number(live.percent))))
+      : null;
+    const isIndeterminate = isRunning && (useLive ? !live.determinate : (percent === 0 && !Number(job.current_item_total || 0)));
+    const displayPercent = livePct !== null ? livePct : percent;
+    const stepText = (useLive && live.phase_label) ? live.phase_label : (job.current_step || "等待执行");
+    const liveEta = useLive && live.eta_seconds ? (window.CreatorHubProgress?.fmtEta?.(live.eta_seconds) || "") : "";
+    const dlInfo = (useLive && live.metrics && Number(live.metrics.dl_total || 0) > 0)
+      ? ` · 媒体 ${Number(live.metrics.dl_done || 0)}/${Number(live.metrics.dl_total || 0)}` : "";
+    const liveMetaParts = [
+      keywordProgress + itemProgress,
+      `已采 ${fmtNum(useLive && live.metrics ? live.metrics.content_count : job.content_count)} 作品 / ${fmtNum(useLive && live.metrics ? live.metrics.comment_count : job.comment_count)} 评论`,
+      dlInfo ? dlInfo.slice(3) : "",
+      liveEta,
+    ].filter(Boolean).join(" · ");
     return `<article class="collection-task${isSelected ? " is-selected" : ""}" role="listitem" data-job-id="${job.id}" aria-label="任务 ${job.id}，${status.label}">
       <div class="collection-task-meta"><div class="collection-task-meta-head"><label class="collection-task-check${isRunning ? " is-disabled" : ""}" title="${isRunning ? "正在执行中的任务需先取消后再删除" : `选择采集任务 #${job.id}`}"><input type="checkbox" data-id="${job.id}" aria-label="选择采集任务 #${job.id}" onchange="collectionToggleOne(${job.id}, this.checked)"${isSelected ? " checked" : ""}${isRunning ? " disabled" : ""}></label><div><span class="collection-task-label">任务状态</span><span class="pill ${status.cls}">${status.label}</span></div></div><time class="collection-task-created" datetime="${esc(job.created_at || "")}">${collectionDate(job.created_at)}</time></div>
-      <div class="collection-task-keywords"><span class="collection-task-label">${sourceLabel}</span><div class="keyword-stack">${keywords}</div>${job.current_keyword ? `<div class="collection-step">当前：${esc(job.current_keyword)}</div>` : ""}</div>
+      <div class="collection-task-keywords"><span class="collection-task-label">${sourceLabel}</span><div class="keyword-stack">${keywords}</div>${job.current_keyword ? `<div class="collection-step" data-col-kw>当前：${esc(job.current_keyword)}</div>` : ""}</div>
       <div class="collection-task-config"><span class="collection-task-label">采集配置</span><div class="collection-task-config-main">${job.max_contents_per_keyword} 作品/${job.source_type === "keyword" ? "词" : "来源"} · ${job.max_pages_per_keyword || 12} 深度页${job.source_type === "keyword" ? ` · ${sortLabel}` : ""}</div><div class="collection-task-config-sub">${timeLabel} · ${typeLabel}${threshold ? ` · ${threshold}` : ""} · ${job.max_comments_per_content} 评论/作品<br>${job.include_replies ? "含二级评论 · " : ""}${job.download_media ? "下载媒体" : "仅采数据"} · 连续 ${job.stagnant_pages || 3} 页无新增停止</div></div>
-      <div class="collection-task-progress"><span class="collection-task-label">执行进度</span><div class="job-progress"><div class="job-progress-head"><span>${esc(job.current_step || "等待执行")}</span><b>${percent}%</b></div><div class="progress-track" role="progressbar" aria-label="任务 ${job.id} 进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><div class="progress-fill" style="width:${percent}%"></div></div><div class="collection-step">${keywordProgress}${itemProgress} · 已采 ${fmtNum(job.content_count)} 作品 / ${fmtNum(job.comment_count)} 评论</div></div></div>
+      <div class="collection-task-progress"><span class="collection-task-label">执行进度</span><div class="job-progress"><div class="job-progress-head"><span data-col-step>${esc(stepText)}</span><b class="progress-num" data-col-pct>${isIndeterminate ? "进行中" : `${displayPercent}%`}</b></div><div class="progress-track${isIndeterminate ? " is-indeterminate" : ""}" data-col-track role="progressbar" aria-label="任务 ${job.id} 进度" aria-valuemin="0" aria-valuemax="100"${isIndeterminate ? "" : ` aria-valuenow="${displayPercent}"`}><div class="progress-fill" data-col-fill style="${isIndeterminate ? "" : `width:${displayPercent}%`}"></div></div><div class="collection-step progress-num" data-col-meta>${esc(liveMetaParts)}</div></div></div>
       ${job.error_count ? `<button type="button" class="collection-task-error" onclick="openCollectionResults(${job.id})" title="${esc(errorText)}">${ic("i-info")}<span class="collection-task-error-text">${job.error_count} 条异常 · ${esc(errorText)}</span><span class="collection-task-error-link">查看详情</span></button>` : ""}
       <div class="collection-task-actions" aria-label="任务 ${job.id} 操作">
         <button type="button" class="sm collection-task-primary" onclick="openCollectionResults(${job.id})">${ic("i-eye")}查看结果</button>
@@ -9797,9 +11409,53 @@ function renderCollectionJobs() {
   setHtmlIfChanged(body, html);
   updateCollectionSelBar();
 }
+window.addEventListener("creatorhub:progress:update", e => {
+  const task = e?.detail?.task;
+  if (!task || task.category !== "collection") return;
+  if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB !== "collections") return;
+  const jobId = Number(task.extra?.job_id || String(task.task_key || "").split(":")[1] || 0);
+  if (!jobId) return;
+  const card = document.querySelector(`#collection-job-table .collection-task[data-job-id="${jobId}"]`);
+  if (!card) return;
+  const job = COLLECTION_JOBS.find(j => j.id === jobId);
+  const isRunning = task.status === "running" || task.status === "queued";
+  const hasPct = task.determinate && task.percent !== null && task.percent !== undefined && Number.isFinite(Number(task.percent));
+  const pct = hasPct ? Math.max(0, Math.min(100, Math.round(Number(task.percent)))) : 0;
+  const indet = isRunning && !hasPct;
+  const stepEl = card.querySelector("[data-col-step]");
+  if (stepEl && task.phase_label) stepEl.textContent = task.phase_label;
+  const pctEl = card.querySelector("[data-col-pct]");
+  if (pctEl) pctEl.textContent = indet ? "进行中" : `${pct}%`;
+  const trackEl = card.querySelector("[data-col-track]");
+  const fillEl = card.querySelector("[data-col-fill]");
+  if (trackEl) {
+    trackEl.classList.toggle("is-indeterminate", indet);
+    if (indet) trackEl.removeAttribute("aria-valuenow");
+    else trackEl.setAttribute("aria-valuenow", String(pct));
+  }
+  if (fillEl) fillEl.style.width = indet ? "" : `${pct}%`;
+  const metaEl = card.querySelector("[data-col-meta]");
+  if (metaEl && task.metrics) {
+    const m = task.metrics;
+    const sourceLabel = job?.source_type === "keyword" ? "关键词" : "来源";
+    const kwStr = `${Number(m.processed_keyword_count || 0)}/${Number(m.total_keyword_count || 1)} ${sourceLabel}`;
+    const itemStr = Number(m.current_item_total || 0) > 0
+      ? ` · 当前作品 ${Number(m.current_item_index || 0)}/${Number(m.current_item_total || 0)}` : "";
+    const dlStr = Number(m.dl_total || 0) > 0 ? `媒体 ${Number(m.dl_done || 0)}/${Number(m.dl_total || 0)}` : "";
+    const etaStr = task.eta_seconds ? (window.CreatorHubProgress?.fmtEta?.(task.eta_seconds) || "") : "";
+    metaEl.textContent = [
+      kwStr + itemStr,
+      `已采 ${fmtNum(m.content_count || 0)} 作品 / ${fmtNum(m.comment_count || 0)} 评论`,
+      dlStr,
+      etaStr,
+    ].filter(Boolean).join(" · ");
+  }
+  const kwEl = card.querySelector("[data-col-kw]");
+  if (kwEl && task.extra?.current_keyword) kwEl.textContent = "当前：" + task.extra.current_keyword;
+});
 async function refreshCollections() {
   const isCurrent = beginViewRequest("collections");
-  if (!$("collection-job-table") || !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM)) return;
+  if (!$("collection-job-table") || !["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM)) return;
   try {
     const requestedPlatform = PLATFORM;
     const jobs = await api("/api/collections?platform=" + encodeURIComponent(requestedPlatform));
@@ -9829,13 +11485,15 @@ async function refreshCollections() {
 async function editCollection(jobId, draft = null) {
   const job = COLLECTION_JOBS.find(item => item.id === Number(jobId));
   if (!job) return;
+  if ((job.source_type || "keyword") !== "keyword") {
+    toast("历史非关键词采集任务已下线，请新建关键词采集或前往「主页作品监控」", "info", 4500);
+    return;
+  }
   const platformName = PF_NAME[job.platform] || "平台";
-  const accounts = ACCOUNTS.filter(a => a.platform === job.platform && a.status !== "invalid" && a.has_storage);
+  const accounts = _preferCrawlAccounts(ACCOUNTS.filter(a => a.platform === job.platform && a.status !== "invalid" && a.has_storage));
+  const supportsQuality = QUALITY_PLATFORMS.includes(job.platform);
   const initial = draft || {
     account_id: job.account_id,
-    source_type: job.source_type || "keyword",
-    source_ref: job.source_ref || "",
-    source_name: job.source_name || "",
     keywords: (job.keywords || []).join("\n"),
     max_contents_per_keyword: job.max_contents_per_keyword,
     max_pages_per_keyword: job.max_pages_per_keyword || 12,
@@ -9851,17 +11509,32 @@ async function editCollection(jobId, draft = null) {
     video_quality: job.video_quality || "highest",
     download_dir: job.download_dir || "",
   };
+  const syncEditCollectionLinkage = () => {
+    const dlOn = !!$("ecol-download")?.checked;
+    const cType = $("ecol-content-type")?.value || "all";
+    const cmtLimit = Number($("ecol-comment-limit")?.value ?? 0);
+    if ($("ecol-dir-wrap")) $("ecol-dir-wrap").style.display = dlOn ? "" : "none";
+    if ($("ecol-quality-wrap")) $("ecol-quality-wrap").style.display = (supportsQuality && dlOn && cType !== "images") ? "" : "none";
+    const rep = $("ecol-replies");
+    const repRow = $("ecol-replies-row");
+    const cmtOff = !(Number.isFinite(cmtLimit) && cmtLimit > 0);
+    if (rep) {
+      rep.disabled = cmtOff;
+      if (cmtOff) rep.checked = false;
+    }
+    if (repRow) repRow.style.opacity = cmtOff ? "0.55" : "";
+  };
   const value = await new Promise(resolve => {
     _uiResolve = resolve; _uiCancelVal = null;
     $("ui-body").innerHTML = `
-      <fieldset class="ui-form-group"><legend>采集范围</legend>
-      ${initial.source_type === "keyword" ? `<div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
-        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>` : `<div class="form-note"><svg aria-hidden="true"><use href="#i-library"/></svg><span>采集来源：<b>${esc(initial.source_name || (initial.source_type === "account_works" ? "本账号作品" : initial.source_type === "favorite_all" ? "全部收藏" : "收藏夹"))}</b>。来源不可在续跑时切换，可新建任务选择其他来源。</span></div>`}
+      <fieldset class="ui-form-group"><legend>关键词与账号</legend>
+      <div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
+        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>
       <div class="form-grid">
-        ${collectionRequiresAccount(job.platform, initial.source_type) || job.platform !== "shipinhao"
-          ? `<div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, !collectionRequiresAccount(job.platform, initial.source_type) ? "使用本机微信通道（无需网页账号）" : (accounts.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`))}</select></div>`
+        ${collectionRequiresAccount(job.platform)
+          ? `<div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, accounts.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`, { preferCrawler: true })}</select></div>`
           : ""}
-        ${job.platform === "douyin" ? '<div class="form-field"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>' : ""}
+        ${supportsQuality ? '<div class="form-field" id="ecol-quality-wrap"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>' : ""}
         <div class="form-field"><label for="ecol-content-limit">每词作品上限</label><input id="ecol-content-limit" type="number" min="1" max="100" value="${Number(initial.max_contents_per_keyword) || 20}"></div>
         <div class="form-field"><label for="ecol-comment-limit">每作品评论上限</label><input id="ecol-comment-limit" type="number" min="0" max="200" value="${Number(initial.max_comments_per_content) || 0}"></div>
       </div>
@@ -9879,8 +11552,8 @@ async function editCollection(jobId, draft = null) {
       </fieldset>
       <fieldset class="ui-form-group"><legend>评论与下载</legend>
       <div class="option-grid" aria-label="采集选项">
-        <label class="switch-row"><input type="checkbox" id="ecol-download"${initial.download_media ? " checked" : ""} onchange="$('ecol-dir-wrap').style.display=this.checked?'':'none'"><span class="switch-copy"><b>下载媒体</b><span>保存视频和封面来源</span></span></label>
-        <label class="switch-row"><input type="checkbox" id="ecol-replies"${initial.include_replies ? " checked" : ""}><span class="switch-copy"><b>包含二级评论</b><span>采集${platformName}当前可返回的回复</span></span></label>
+        <label class="switch-row"><input type="checkbox" id="ecol-download"${initial.download_media ? " checked" : ""}><span class="switch-copy"><b>下载媒体</b><span>保存视频、图集和封面来源</span></span></label>
+        <label class="switch-row" id="ecol-replies-row"><input type="checkbox" id="ecol-replies"${initial.include_replies ? " checked" : ""}><span class="switch-copy"><b>包含二级评论</b><span>采集${platformName}当前可返回的回复</span></span></label>
       </div>
       <div class="form-field" id="ecol-dir-wrap" style="display:${initial.download_media ? "" : "none"}"><label for="ecol-download-dir">下载目录（可选）</label><input id="ecol-download-dir" value="${esc(initial.download_dir)}" placeholder="留空使用默认目录"></div>
       </fieldset>`;
@@ -9889,34 +11562,42 @@ async function editCollection(jobId, draft = null) {
     $("ecol-sort").value = initial.search_sort || "general";
     $("ecol-publish-time").value = initial.publish_time || "all";
     $("ecol-content-type").value = initial.content_type || "all";
+    $("ecol-download")?.addEventListener("change", syncEditCollectionLinkage);
+    $("ecol-content-type")?.addEventListener("change", syncEditCollectionLinkage);
+    $("ecol-comment-limit")?.addEventListener("input", syncEditCollectionLinkage);
     enhanceAllSelects($("ui-body")); csSyncAll();
-    _uiGetVal = () => ({
-      account_id: $("ecol-account") ? Number($("ecol-account").value || 0) : 0,
-      source_type: initial.source_type,
-      source_ref: initial.source_ref,
-      source_name: initial.source_name,
-      keywords: $("ecol-keywords") ? $("ecol-keywords").value : "",
-      max_contents_per_keyword: Number($("ecol-content-limit").value || 0),
-      max_pages_per_keyword: Number($("ecol-page-limit").value || 0),
-      stagnant_pages: Number($("ecol-stagnant-pages").value || 0),
-      search_sort: $("ecol-sort").value || "general",
-      publish_time: $("ecol-publish-time").value || "all",
-      content_type: $("ecol-content-type").value || "all",
-      min_likes: Number($("ecol-min-likes").value || 0),
-      min_comments: Number($("ecol-min-comments").value || 0),
-      max_comments_per_content: Number($("ecol-comment-limit").value || 0),
-      include_replies: $("ecol-replies").checked,
-      download_media: $("ecol-download").checked,
-      video_quality: $("ecol-quality") ? ($("ecol-quality").value || "highest") : "highest",
-      download_dir: $("ecol-download-dir").value.trim(),
-    });
-    _uiOpen(`编辑采集任务 #${job.id}`, "已有作品和评论会保留。保存后点击「续跑」应用新配置，系统会自动去重。", {
+    syncEditCollectionLinkage();
+    _uiGetVal = () => {
+      const cmtLim = Number($("ecol-comment-limit").value || 0);
+      const dlOn = $("ecol-download").checked;
+      return {
+        account_id: $("ecol-account") ? Number($("ecol-account").value || 0) : 0,
+        source_type: "keyword",
+        source_ref: "",
+        source_name: "",
+        keywords: $("ecol-keywords") ? $("ecol-keywords").value : "",
+        max_contents_per_keyword: Number($("ecol-content-limit").value || 0),
+        max_pages_per_keyword: Number($("ecol-page-limit").value || 0),
+        stagnant_pages: Number($("ecol-stagnant-pages").value || 0),
+        search_sort: $("ecol-sort").value || "general",
+        publish_time: $("ecol-publish-time").value || "all",
+        content_type: $("ecol-content-type").value || "all",
+        min_likes: Number($("ecol-min-likes").value || 0),
+        min_comments: Number($("ecol-min-comments").value || 0),
+        max_comments_per_content: cmtLim,
+        include_replies: cmtLim > 0 && $("ecol-replies").checked,
+        download_media: dlOn,
+        video_quality: $("ecol-quality") ? ($("ecol-quality").value || "highest") : "highest",
+        download_dir: dlOn ? $("ecol-download-dir").value.trim() : "",
+      };
+    };
+    _uiOpen(`编辑关键词采集任务 #${job.id}`, "已有作品和评论会保留。保存后点击「续跑」应用新配置，系统会自动去重。", {
       okText: "保存配置", wide: true, icon: "i-library",
       submit: value => {
         const keywords = parseCollectionKeywords(value.keywords);
-        if (value.source_type === "keyword" && !keywords.length) uiEditorError("请至少填写一个关键词", "ecol-keywords");
+        if (!keywords.length) uiEditorError("请至少填写一个关键词", "ecol-keywords");
         if (keywords.length > 20) uiEditorError("单个任务最多 20 个关键词", "ecol-keywords");
-        if (collectionRequiresAccount(job.platform, value.source_type) && !value.account_id) uiEditorError(`请选择一个可用${platformName}账号`, "ecol-account");
+        if (collectionRequiresAccount(job.platform) && !value.account_id) uiEditorError(`请选择一个可用${platformName}账号`, "ecol-account");
         if (value.max_contents_per_keyword < 1 || value.max_contents_per_keyword > 100) uiEditorError("每词作品上限须为 1–100", "ecol-content-limit");
         if (value.max_pages_per_keyword < 1 || value.max_pages_per_keyword > 40) uiEditorError("每词采集深度须为 1–40 页", "ecol-page-limit");
         if (value.stagnant_pages < 1 || value.stagnant_pages > 8) uiEditorError("连续无新增停止阈值须为 1–8 页", "ecol-stagnant-pages");
@@ -10066,7 +11747,7 @@ function revealCollectionFile(jobId, contentId, button) { return collectionLocal
 function copyCollectionAuthorId(button) {
   return copyTextValue(
     button?.dataset?.authorId || "",
-    "创作者 ID 已复制，可用于创作者采集或作品监控",
+    "创作者 ID 已复制，可用于主页作品监控",
     "复制失败，请手动复制创作者 ID",
   );
 }
@@ -10230,25 +11911,20 @@ function exportCollection(jobId) {
   document.body.appendChild(link); link.click(); link.remove();
 }
 
-// 13-monitors-contents.js — 作品监控目标管理、已捕获内容库检索、批量操作与本地文件定位。
+// 13-monitors-contents.js — 主页作品监控目标管理、已捕获内容库检索、批量操作与本地文件定位。
 async function addMonitor() {
   const btn = evtBtn() || document.querySelector('button[onclick="addMonitor()"]');
   if (btn?.disabled) return;
   await withBusy(btn, "识别中", async () => {
-  const target_kind = (["xhs", "rednote"].includes(PLATFORM) && $("t-kind")) ? $("t-kind").value : "creator";
-  const normalizedTarget = target_kind === "keyword"
-    ? $("t-url").value.trim()
-    : await normalizeMonitorTarget(null, { quiet: true });
+  const normalizedTarget = await normalizeMonitorTarget(null, { quiet: true, toastErrors: true });
   if (normalizedTarget === null) return;
   const url_or_secuid = $("t-url").value.trim();
-  if (!url_or_secuid) { toast(target_kind === "keyword" ? "请输入搜索关键词" : "请输入主页链接 / 短链 / id", "err"); return; }
-  if (["xhs", "rednote", "douyin", "tiktok"].includes(PLATFORM) && !$("t-acc").value) {
+  if (!url_or_secuid) { toast("请输入创作者主页链接 / 短链 / ID", "err"); return; }
+  if (MONITOR_ACCOUNT_REQUIRED.includes(PLATFORM) && !$("t-acc").value) {
     const platformName = PF_NAME[PLATFORM] || "当前平台";
-    const available = PLATFORM === "tiktok"
-      ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
-      : ACCOUNTS;
-    if (!available.length) { toast(`请先在「账号」里完成${platformName}扫码登录`, "err"); switchTab("accounts"); return; }
-    toast(`${platformName}监控必须选择一个已登录账号`, "err"); return;
+    const available = ACCOUNTS.filter(a => a.status === "active" && (a.has_storage || a.has_creator));
+    if (!available.length) { toast(`请先在「账号矩阵」里完成${platformName}登录`, "err"); switchTab("accounts"); return; }
+    toast(`${platformName}主页作品监控必须选择一个已登录账号`, "err"); return;
   }
   const downloadMode = $("t-download").value;
   $("add-msg").textContent = "解析中…";
@@ -10257,13 +11933,13 @@ async function addMonitor() {
       await api("/api/monitors", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          url_or_secuid, platform: PLATFORM, target_kind,
+          url_or_secuid, platform: PLATFORM, target_kind: "creator",
           account_id: PLATFORM === "shipinhao" ? null : ($("t-acc").value ? +$("t-acc").value : null),
           interval_seconds: monitorIntervalSeconds("t-interval"),
           initial_backfill_count: !["xhs", "rednote"].includes(PLATFORM)
             ? ($("t-backfill").value === "" ? null : +$("t-backfill").value) : 0,
-          download_dir: $("t-dir").value.trim(),
-          video_quality: ["xhs", "rednote"].includes(PLATFORM) ? "" : $("t-quality").value,
+          download_dir: downloadMode === "none" ? "" : $("t-dir").value.trim(),
+          video_quality: QUALITY_PLATFORMS.includes(PLATFORM) && downloadMode !== "none" && downloadMode !== "images" ? $("t-quality").value : "",
           download_enabled: downloadMode !== "none",
           media_filter: downloadMode === "none" ? "all" : downloadMode,
           max_scrolls: +$("t-max-scrolls").value,
@@ -10280,8 +11956,9 @@ async function addMonitor() {
       });
       ["t-url", "t-dir", "t-alias"].forEach(id => $(id).value = "");
       setMetaValue("t-group", ""); setMetaValue("t-tags", "");
+      resetMonitorTargetState();
       $("add-msg").textContent = "已添加 ✓";
-      toast("已开始监控", "ok");
+      toast("已开始主页作品监控", "ok");
       globalThis.CreatorHubWorkbench?.completed?.("monitors");
     } catch (e) { $("add-msg").textContent = "失败: " + e.message; toast("添加失败:" + e.message, "err"); }
   });
@@ -10369,11 +12046,9 @@ function monitorIntervalSeconds(id) {
 }
 async function editMonitor(id) {
   const item = monitorById(id); if (!item) return;
-  const accounts = ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid");
-  const accountOptions = [
-    `<option value="">${item.account_id ? "保持当前绑定" : "不指定账号"}</option>`,
-    ...accounts.map(a => `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`),
-  ].join("");
+  const accounts = _preferCrawlAccounts(ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid"));
+  const supportsQuality = QUALITY_PLATFORMS.includes(item.platform);
+  const accountOptions = accOptions(accounts, item.account_id ? "保持当前绑定" : "不指定账号", { preferCrawler: true });
   const intervalOptions = monitorIntervalOptions(item.interval_seconds || 300);
   const backfillOptions = numericSelectOptions(item.initial_backfill_count ?? 0, [
     [0, "不回填历史"], [5, "最近 5 条"], [20, "最近 20 条"], [-1, "尽可能全量"],
@@ -10386,6 +12061,21 @@ async function editMonitor(id) {
     [0, "平台默认"], [5, "5 条"], [12, "12 条"], [20, "20 条"],
     [50, "50 条"], [100, "100 条"],
   ]);
+  const syncEditMonitorDownload = () => {
+    const dlMode = $("em-download")?.value || "all";
+    const recMedia = $("em-record-media")?.value || "all";
+    const isNone = dlMode === "none";
+    if ($("em-dir-wrap")) $("em-dir-wrap").style.display = isNone ? "none" : "";
+    if ($("em-quality-wrap")) $("em-quality-wrap").style.display = (supportsQuality && !isNone && dlMode !== "images") ? "" : "none";
+    const warnEl = $("em-download-conflict");
+    if (warnEl) {
+      const conflict = !isNone && ((recMedia === "video" && dlMode === "images") || (recMedia === "images" && dlMode === "video"));
+      warnEl.hidden = !conflict;
+      warnEl.textContent = conflict
+        ? `提示：入库类型（${recMedia === "video" ? "仅视频" : "仅图文"}）与自动下载范围（${dlMode === "images" ? "仅图集" : "仅视频"}）互斥，将不会触发媒体下载。`
+        : "";
+    }
+  };
   const value = await new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => {
@@ -10398,7 +12088,7 @@ async function editMonitor(id) {
         account_id: item.platform === "shipinhao"
           ? null
           : ($("em-account") && $("em-account").value ? +$("em-account").value : null),
-        download_dir: $("em-dir").value.trim(),
+        download_dir: downloadMode === "none" ? "" : $("em-dir").value.trim(),
         video_quality: $("em-quality") ? $("em-quality").value : "",
         download_enabled: downloadMode !== "none",
         media_filter: downloadMode === "none" ? "all" : downloadMode,
@@ -10433,7 +12123,7 @@ async function editMonitor(id) {
             ? ""
             : `<div><label class="field" for="em-account">抓取账号</label><select id="em-account">${accountOptions}</select></div>`}
         </div>
-        ${(item.platform !== "xhs" && (!item.last_scan_at || !(item.content_count > 0))) ? `<div><label class="field" for="em-backfill">首次历史回填</label>
+        ${(!["xhs", "rednote"].includes(item.platform) && (!item.last_scan_at || !(item.content_count > 0))) ? `<div><label class="field" for="em-backfill">首次历史回填</label>
           <select id="em-backfill">${backfillOptions}</select></div>` : ""}
         <div class="form-grid cols-4">
           <div><label class="field" for="em-max-scrolls">抓取深度</label><select id="em-max-scrolls">${depthOptions}</select></div>
@@ -10453,11 +12143,12 @@ async function editMonitor(id) {
         <legend>记录与下载</legend>
         <div class="row">
           <div><label class="field" for="em-download">自动下载范围</label>
-            <select id="em-download"><option value="all">全部作品</option><option value="video">仅视频</option><option value="images">仅图集</option><option value="none">仅记录，不下载</option></select></div>
-          ${item.platform === "xhs" ? "" : `<div><label class="field" for="em-quality">视频画质</label>
-            <select id="em-quality"><option value="">跟随全局默认</option><option value="highest">原画/最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>`}
+            <select id="em-download"><option value="all">全部作品</option><option value="video">仅视频</option><option value="images">仅图集</option><option value="none">仅记录，不下载</option></select>
+            <div class="field-help" id="em-download-conflict" style="color:var(--warn)" hidden></div></div>
+          ${supportsQuality ? `<div id="em-quality-wrap"><label class="field" for="em-quality">视频画质</label>
+            <select id="em-quality"><option value="">跟随全局默认</option><option value="highest">原画/最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>` : ""}
         </div>
-        <div><label class="field" for="em-dir">下载目录</label>
+        <div id="em-dir-wrap"><label class="field" for="em-dir">下载目录</label>
           <input id="em-dir" value="${esc(item.download_dir || "")}" placeholder="留空跟随全局默认"></div>
       </fieldset>`;
     enhanceMetaControl($("em-group"), "group"); enhanceMetaControl($("em-tags"), "tags");
@@ -10475,10 +12166,13 @@ async function editMonitor(id) {
     $("em-min-comments").value = String(item.min_comment_count || 0);
     $("em-include-keywords").value = (item.include_keywords || []).join(", ");
     $("em-exclude-keywords").value = (item.exclude_keywords || []).join(", ");
+    $("em-download")?.addEventListener("change", syncEditMonitorDownload);
+    $("em-record-media")?.addEventListener("change", syncEditMonitorDownload);
     ["em-interval", "em-account", "em-backfill", "em-quality", "em-download",
       "em-max-scrolls", "em-max-items", "em-record-media"]
       .forEach(key => { const el = $(key); if (el) enhanceSelect(el); });
-    _uiOpen("编辑作品监控", "监控对象保持不变。更换创作者或关键词，请新建监控。", {
+    syncEditMonitorDownload();
+    _uiOpen("编辑主页作品监控", "监控对象保持不变。更换创作者主页，请新建主页作品监控。", {
       okText: "保存修改", wide: true, icon: "i-eye",
       submit: value => api("/api/monitors/" + id, {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value),
@@ -10486,7 +12180,7 @@ async function editMonitor(id) {
     });
   });
   if (value === null) return;
-  toast("作品监控配置已更新", "ok"); refreshMonitors(); refreshContents();
+  toast("主页作品监控配置已更新", "ok"); refreshMonitors(); refreshContents();
 }
 function monitorStrategySummary(t) {
   const depth = t.max_scrolls || (t.platform === "xhs" ? 6 : 12);
@@ -10555,8 +12249,8 @@ async function monBatchDelete() {
   const ids = [...selMon];
   const btn = evtBtn();
   if (!await uiConfirm({
-    title: "批量删除作品监控",
-    message: `确认删除选中的 ${ids.length} 个作品监控任务吗？已抓取的作品记录与本地文件会保留。`,
+    title: "批量删除主页作品监控",
+    message: `确认删除选中的 ${ids.length} 个主页作品监控任务吗？已抓取的作品记录与本地文件会保留。`,
     okText: "删除",
     danger: true,
   })) return;
@@ -10566,7 +12260,7 @@ async function monBatchDelete() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids }),
       });
-      toast(`已删除 ${r.deleted || 0} 个作品监控`, "ok");
+      toast(`已删除 ${r.deleted || 0} 个主页作品监控`, "ok");
       selMon.clear();
       await refreshMonitors();
       refreshContents();
@@ -10574,35 +12268,40 @@ async function monBatchDelete() {
   });
 }
 function monRow(t) {
-  const plainLabel = t.target_kind === "keyword"
+  const isLegacyKeyword = (t.target_kind || "creator") !== "creator";
+  const plainLabel = isLegacyKeyword
     ? `#${t.keyword || ""}` : (t.nickname || (t.sec_uid || "").slice(0, 12));
-  const label = t.target_kind === "keyword"
-    ? `<span class="ic-text">${ic("i-hash")}${esc(t.keyword)}</span>` : esc(t.nickname || (t.sec_uid || "").slice(0, 12));
+  const label = isLegacyKeyword
+    ? `<span class="ic-text">${ic("i-hash")}${esc(t.keyword)}</span> <span class="pill q bare" title="关键词监控已下线，仅保留历史记录查看与删除；按词搜索请使用关键词采集">历史关键词(已下线)</span>`
+    : esc(t.nickname || (t.sec_uid || "").slice(0, 12));
   const acc = ACCOUNTS.find(a => a.id === t.account_id);
-  // 抖音/小红书都显示绑定账号:抖音未登录抓主页易拿到风控过的旧快照,绑号才稳定;视频号走本机微信客户端,无需绑定账号
+  const accRequired = MONITOR_ACCOUNT_REQUIRED.includes(t.platform);
   const accTag = t.platform === "shipinhao"
     ? `<div class="mut" style="font-size:11px;margin-top:2px">${acc ? `通道：本机微信客户端（附账号:${esc(acc.nickname)}）` : "通道：本机微信客户端"}</div>`
     : acc
     ? `<div class="mut" style="font-size:11px;margin-top:2px">账号:${esc(acc.nickname)}</div>`
-    : `<div class="ic-text" style="font-size:11px;margin-top:2px;color:var(--danger)">${ic("i-info")}未绑定账号</div>`;
+    : accRequired
+    ? `<div class="ic-text" style="font-size:11px;margin-top:2px;color:var(--danger)">${ic("i-info")}未绑定账号</div>`
+    : `<div class="mut" style="font-size:11px;margin-top:2px">匿名抓取（未绑号）</div>`;
   const downloadLabel = t.download_enabled === false ? "仅记录"
     : ({ all: "全部下载", video: "仅视频", images: "仅图集" }[t.media_filter] || "全部下载");
+  const showQualityPill = QUALITY_PLATFORMS.includes(t.platform) && t.download_enabled !== false && t.media_filter !== "images";
   const selected = selMon.has(t.id);
   return `<tr${selected ? ' class="is-selected"' : ""}>
-    <td class="task-check-cell"><label class="task-selection" title="选择此作品监控"><input type="checkbox" data-id="${t.id}" aria-label="选择作品监控 ${esc(plainLabel)}" onchange="monToggleOne(${t.id}, this.checked)"${selected ? " checked" : ""}></label></td>
+    <td class="task-check-cell"><label class="task-selection" title="选择此主页作品监控"><input type="checkbox" data-id="${t.id}" aria-label="选择主页作品监控 ${esc(plainLabel)}" onchange="monToggleOne(${t.id}, this.checked)"${selected ? " checked" : ""}></label></td>
     <td><div class="user-cell">${t.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(t.avatar))}" alt="" referrerpolicy="no-referrer">` : `<span class="wb-avatar-fallback" style="width:30px;height:30px;flex:0 0 30px;font-size:13px;border-radius:50%" aria-hidden="true">${esc((plainLabel || "监").replace(/^#/, "").slice(0, 1))}</span>`}<div><span title="${esc(plainLabel)}">${label}</span>${t.alias ? `<div class="alias-line" title="${esc(t.alias)}">${esc(t.alias)}</div>` : ""}${accTag}</div></div></td>
     <td>${metaChips(t)}</td>
     <td class="num"><button type="button" class="ghost sm monitor-record-link" data-monitor-records="${t.id}" onclick="showMonitorRecords(${t.id})">查看记录 <span>${t.content_count || 0}</span></button></td>
     <td class="num">${monitorIntervalText(t.interval_seconds)}</td>
     <td class="wrap" style="max-width:240px">
-      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="pill q bare">${downloadLabel}</span>${(t.platform === "xhs" || t.platform === "rednote") ? "" : `<span class="pill q bare">${QMAP[t.video_quality] || "默认画质"}</span>`}${monitorStrategySummary(t)}</div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="pill q bare">${downloadLabel}</span>${showQualityPill ? `<span class="pill q bare">${QMAP[t.video_quality] || "默认画质"}</span>` : ""}${monitorStrategySummary(t)}</div>
       ${t.download_dir ? `<div class="mut" title="${esc(t.download_dir)}" style="font-size:11px;margin-top:3px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">目录：${esc(t.download_dir)}</div>` : ""}</td>
-    <td class="mut">${t.last_scan_at ? new Date(t.last_scan_at + "Z").toLocaleString() : "—"}${t.last_error ? ` <span class="warn-ic" title="${esc(t.last_error)}">${ic("i-info")}</span>` : ""}${autoRunHint(t.next_auto_run_at)}</td>
-    <td><span class="pill ${t.enabled ? "active" : "paused"}">${t.enabled ? "监控中" : "已暂停"}</span></td>
+    <td class="mut">${t.last_scan_at ? new Date(t.last_scan_at + "Z").toLocaleString() : "—"}${t.last_error ? ` <span class="warn-ic" title="${esc(t.last_error)}">${ic("i-info")}</span>` : ""}${isLegacyKeyword ? "" : autoRunHint(t.next_auto_run_at)}</td>
+    <td><span class="pill ${isLegacyKeyword ? "paused" : (t.enabled ? "active" : "paused")}">${isLegacyKeyword ? "已下线" : (t.enabled ? "监控中" : "已暂停")}</span></td>
     <td class="acttd">
-      <button class="ghost sm" onclick="runNow(${t.id})">立即抓取</button>
+      ${isLegacyKeyword ? "" : `<button class="ghost sm" onclick="runNow(${t.id})">立即抓取</button>
       <button class="ghost sm" onclick="editMonitor(${t.id})">编辑</button>
-      <button class="ghost sm" onclick="toggleMon(${t.id})">${t.enabled ? "暂停" : "启用"}</button>
+      <button class="ghost sm" onclick="toggleMon(${t.id})">${t.enabled ? "暂停" : "启用"}</button>`}
       <button class="ghost sm danger" onclick="delMon(${t.id})">${ic("i-trash")}删除</button>
     </td></tr>`;
 }
@@ -10639,12 +12338,72 @@ async function refreshMonitors() {
   if ($("tb-mon")) $("tb-mon").textContent = ts.length;
   renderMonitorRows();
 }
+const _WATCHED_MONITOR_SCANS = new Set();
+function renderInlineDownloadProgHtml(recordId, downloadStatus = "", liveTask = null) {
+  const prog = window.CreatorHubProgress;
+  const task = liveTask || prog?.getTask?.("download:content:" + recordId);
+  const active = task && ["queued", "running"].includes(task.status);
+  if (!active && downloadStatus !== "downloading") return "";
+  const det = !!(task && task.determinate && task.percent !== null && task.percent !== undefined && Number.isFinite(Number(task.percent)));
+  const pct = det ? Math.max(0, Math.min(100, Math.round(Number(task.percent)))) : null;
+  const bar = prog?.renderProgressBar
+    ? prog.renderProgressBar({ determinate: det, percent: pct, tone: "info", label: "媒体下载进度", compact: true })
+    : `<div class="progress-track is-compact${det ? "" : " is-indeterminate"}"><div class="progress-fill" style="${det ? `width:${pct}%` : ""}"></div></div>`;
+  const parts = [];
+  if (task?.phase_label) parts.push(task.phase_label);
+  if (det) parts.push(`${pct}%`);
+  if (task && task.unit === "bytes" && Number(task.total) > 0) {
+    parts.push(`${prog?.fmtBytes?.(task.current) || ""} / ${prog?.fmtBytes?.(task.total) || ""}`);
+  } else if (task && task.unit === "bytes" && Number(task.current) > 0) {
+    parts.push(prog?.fmtBytes?.(task.current) || "");
+  }
+  const spd = task?.speed_bps ? (prog?.fmtSpeed?.(task.speed_bps) || "") : "";
+  if (spd) parts.push(spd);
+  const eta = task?.eta_seconds ? (prog?.fmtEta?.(task.eta_seconds) || "") : "";
+  if (eta) parts.push(eta);
+  return `<div class="dl-inline-prog">${bar}<div class="dl-inline-prog-meta progress-num">${esc(parts.join(" · ") || "正在下载…")}</div></div>`;
+}
+window.addEventListener("creatorhub:progress:update", e => {
+  const task = e?.detail?.task;
+  if (!task) return;
+  if (task.category === "monitor_scan" && _WATCHED_MONITOR_SCANS.has(task.task_key)) {
+    if (["completed", "failed", "canceled"].includes(task.status)) {
+      _WATCHED_MONITOR_SCANS.delete(task.task_key);
+      const r = task.extra?.result;
+      const tid = Number(task.extra?.target_id || 0);
+      if (task.status === "failed") {
+        toast("抓取未成功:" + (task.error || task.phase_label || "未知错误"), "err", 10000);
+      } else if (r) {
+        if (r.skipped) toast(r.reason || "本轮已跳过，请查看监控状态", "info", 6000);
+        else if (r.partial) toast(`部分完成：已获取 ${r.captured ?? r.new} 条作品，${r.failed || 0} 条详情失败。${r.error || ""}`, "info", 10000);
+        else if (r.error) toast("抓取未成功:" + r.error, "err", 10000);
+        else if (r.refreshed) toast(`抓取完成，新增 ${r.new} 条记录；已刷新 ${r.refreshed} 条失败记录的访问参数，可在作品记录中手动重试。`, "info", 10000);
+        else if ((r.scanned ?? 0) === 0 && (r.new ?? 0) === 0 && !r.filtered && (r.backfill_count === 0 || monitorById(tid)?.initial_backfill_count === 0)) {
+          toast("未抓取到作品：当前「首次历史回填」为“不回填历史(0 条)”，仅监控新建之后的新发布；可在「编辑」中改为“最近 5 条”后重抓。", "info", 8000);
+        }
+        else toast(`抓取完成,检查 ${r.scanned ?? r.new} 条，筛除 ${r.filtered || 0} 条，新增 ${r.new} 条`, "ok");
+      }
+    }
+    return;
+  }
+  if (task.category === "monitor_download" && typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "monitors") {
+    const recId = Number(task.extra?.record_id || String(task.task_key || "").split(":")[2] || 0);
+    if (!recId) return;
+    document.querySelectorAll(`[data-dl-prog="${recId}"]`).forEach(slot => {
+      slot.innerHTML = renderInlineDownloadProgHtml(recId, task.status === "running" ? "downloading" : "", task);
+    });
+  }
+});
 async function runNow(id) {
   const btn = evtBtn();
-  toast("抓取中…正在按配置的获取方式读取作品", "info", 7000);
-  await withBusy(btn, "抓取中", async () => {
+  await withBusy(btn, "发起中", async () => {
     try {
-      const r = await api("/api/monitors/" + id + "/run-now", { method: "POST" });
+      const r = await api("/api/monitors/" + id + "/run-now?async_mode=true", { method: "POST" });
+      if (r.async && r.queued) {
+        if (r.task_key) _WATCHED_MONITOR_SCANS.add(r.task_key);
+        toast(r.already_running ? "该监控正在后台抓取中，可在右上角「活动中心」查看进度" : "已开始后台抓取，可在右上角「活动中心」查看实时进度", "info", 4500);
+        return;
+      }
       if (r.skipped) toast(r.reason || "本轮已跳过，请查看监控状态", "info", 6000);
       else if (r.partial) toast(`部分完成：已获取 ${r.captured ?? r.new} 条作品，${r.failed || 0} 条详情失败。${r.error || ""}`, "info", 10000);
       else if (r.error) toast("抓取未成功:" + r.error, "err", 10000);
@@ -10653,9 +12412,9 @@ async function runNow(id) {
         toast("未抓取到作品：当前「首次历史回填」为“不回填历史(0 条)”，仅监控新建之后的新发布；可在「编辑」中改为“最近 5 条”后重抓。", "info", 8000);
       }
       else toast(`抓取完成,检查 ${r.scanned ?? r.new} 条，筛除 ${r.filtered || 0} 条，新增 ${r.new} 条`, "ok");
+      refreshMonitors(); refreshContents();
     } catch (e) { toast("抓取失败:" + e.message, "err"); }
   });
-  refreshMonitors(); refreshContents();
 }
 async function toggleMon(id) { try { await api("/api/monitors/" + id + "/toggle", { method: "POST" }); refreshMonitors(); } catch (e) { toast("操作失败:" + e.message, "err"); } }
 async function delMon(id) { if (await uiConfirm({ title: "删除监控", message: "删除该监控?", okText: "删除", danger: true })) { try { await api("/api/monitors/" + id, { method: "DELETE" }); selMon.delete(id); toast("监控已删除", "ok"); refreshMonitors(); } catch (e) { toast("删除失败:" + e.message, "err"); } } }
@@ -10797,7 +12556,7 @@ function noteCard(r) {
     ? `<img class="ncard-cover" src="${esc(safeMediaUrl(r.cover_url))}" alt="${esc((r.desc || "作品").slice(0, 20))}" referrerpolicy="no-referrer" loading="lazy" onclick="openPreview(${r.id})">`
     : `<div class="ncard-cover ph" onclick="openPreview(${r.id})">${ic(r.media_type === "images" ? "i-image" : "i-film")}</div>`;
   const hasLocal = Boolean(String(r.local_path || "").trim());
-  const canPickRepost = ["douyin", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && r.download_status === "done";
+  const canPickRepost = ["douyin", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM) && r.download_status === "done";
   return `<div class="ncard">
     ${cover}
     <span class="ncard-type">${ic(typeIc)}${esc(typeLabel)}</span>
@@ -10810,6 +12569,7 @@ function noteCard(r) {
         <span>${fmtTime(r.create_time)}</span>
         <span class="like">${ic("i-heart")}${fmtNum(r.like_count)} · 💬${fmtNum(r.comment_count)}</span>
       </div>
+      <div data-dl-prog="${r.id}">${renderInlineDownloadProgHtml(r.id, r.download_status)}</div>
       <div class="ncard-actions">
         <span class="pill ${r.download_status}" style="flex:1;justify-content:center" title="${esc(r.error || "")}">${contentStatusLabel(r.download_status)}${r.error ? " ⓘ" : ""}</span>
         ${hasLocal ? `<button class="ghost sm" style="flex:0 0 auto" onclick="revealContentPath(${r.id},this)" title="打开文件夹">${ic("i-folder")}</button>` : ""}
@@ -10986,6 +12746,7 @@ async function refreshContents(resetPage = false) {
       <td class="content-metrics num"><span class="metric like">${ic("i-heart")}${fmtNum(r.like_count)}</span><span class="metric">${ic("i-msg")}${fmtNum(r.comment_count)}</span></td>
       <td class="content-status-cell">
         <div class="content-status-row"><span class="pill ${r.download_status}">${contentStatusLabel(r.download_status)}</span>${r.error ? `<span class="warn-ic" data-tip="${esc(r.error)}" title="${esc(r.error)}">${ic("i-info")}</span>` : ""}</div>
+        <div data-dl-prog="${r.id}">${renderInlineDownloadProgHtml(r.id, r.download_status)}</div>
         ${contentPathCell(r)}
       </td>
       <td class="content-action-cell acttd">
@@ -10993,7 +12754,7 @@ async function refreshContents(resetPage = false) {
           <button type="button" class="ghost sm content-icon-btn" onclick="openPreview(${r.id})" data-tip="站内预览" title="站内预览" aria-label="预览作品">${ic("i-eye")}</button>
           ${hasLocal ? `<button type="button" class="ghost sm content-icon-btn local-path-action reveal" onclick="revealContentPath(${r.id},this)" data-tip="在文件夹中显示" title="在文件夹中显示" aria-label="在文件夹中显示">${ic("i-folder")}</button>` : ""}
           ${["failed", "skipped"].includes(r.download_status) ? `<button type="button" class="ghost sm" onclick="retryDl(${r.id})">${r.download_status === "skipped" ? "下载" : "重试"}</button>` : ""}
-          ${(["douyin", "bilibili", "instagram", "twitter", "facebook"].includes(PLATFORM) && r.download_status === "done") ? `<button type="button" class="ghost sm content-action-primary" onclick="pickRepostTarget(${r.id})">${ic("i-send")}转发</button>` : ""}
+          ${(["douyin", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(PLATFORM) && r.download_status === "done") ? `<button type="button" class="ghost sm content-action-primary" onclick="pickRepostTarget(${r.id})">${ic("i-send")}转发</button>` : ""}
           ${(PLATFORM === "xhs" && r.download_status === "done") ? `<button class="ghost sm content-action-primary" onclick="repostDouyin(${r.id})">${ic("i-send")}发抖音</button>` : ""}
           <button type="button" class="ghost sm content-action-delete danger" onclick="delContent(${r.id})" data-tip="删除作品" title="删除作品" aria-label="删除作品">${ic("i-trash")}</button>
         </div>
@@ -11164,7 +12925,7 @@ async function addDanmakuWatch() {
   const btn = evtBtn() || document.querySelector('button[onclick="addDanmakuWatch()"]');
   if (btn?.disabled) return;
   await withBusy(btn, "识别中", async () => {
-  const normalizedTarget = await normalizeDanmakuTarget(null, { quiet: true });
+  const normalizedTarget = await normalizeDanmakuTarget(null, { quiet: true, toastErrors: true });
   if (normalizedTarget === null) return;
   const url = $("d-w-url").value.trim();
   if (!url) { toast("请粘贴视频链接 / 账号主页 / aweme_id", "err"); return; }
@@ -11245,16 +13006,18 @@ async function editDanmakuWatch(id) {
   const probeOptions = numericSelectOptions(item.probe_step_seconds || 0, [
     [0, "跟随全局设置"], [0.5, "每 0.5 秒"], [1, "每 1 秒"], [2, "每 2 秒"], [5, "每 5 秒"],
   ], " 秒");
+  const isUserKind = item.kind === "user";
+  const showProbe = item.platform === "douyin" && item.mode !== "creator";
   const value = await new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => ({
       interval_seconds: monitorIntervalSeconds("edw-interval"),
-      recent_works: +$("edw-recent").value,
-      recent_days: +$("edw-days").value,
+      recent_works: $("edw-recent") ? +$("edw-recent").value : (item.recent_works || 0),
+      recent_days: $("edw-days") ? +$("edw-days").value : (item.recent_days || 0),
       max_scrolls: +$("edw-depth").value,
       time_start_ms: Math.round(Math.max(0, +$("edw-start").value || 0) * 1000),
       time_end_ms: Math.round(Math.max(0, +$("edw-end").value || 0) * 1000),
-      probe_step_seconds: +$("edw-probe").value || 0,
+      probe_step_seconds: $("edw-probe") ? (+$("edw-probe").value || 0) : (item.probe_step_seconds || 0),
       include_keywords: parseDanmakuKeywords($("edw-include").value),
       exclude_keywords: parseDanmakuKeywords($("edw-exclude").value),
       min_text_length: Math.max(0, +$("edw-min-len").value || 0),
@@ -11268,15 +13031,15 @@ async function editDanmakuWatch(id) {
         <div class="row">
           <div><label class="field" for="edw-start">视频内起点(秒)</label><input id="edw-start" type="number" min="0" step="0.1" value="${(item.time_start_ms || 0) / 1000}"></div>
           <div><label class="field" for="edw-end">视频内终点(秒)</label><input id="edw-end" type="number" min="0" step="0.1" value="${(item.time_end_ms || 0) / 1000}"></div>
-          <div><label class="field" for="edw-probe">时间轴扫描步长</label><select id="edw-probe">${probeOptions}</select></div>
+          ${showProbe ? `<div><label class="field" for="edw-probe">时间轴扫描步长</label><select id="edw-probe">${probeOptions}</select></div>` : ""}
           <div><label class="field" for="edw-interval">检查频率</label><select id="edw-interval">${intervalOptions}</select></div>
         </div>
       </fieldset>
-      <fieldset class="monitor-config-group"><legend>账号模式与容量</legend>
+      <fieldset class="monitor-config-group"><legend>${isUserKind ? "账号模式与容量" : "抓取深度与容量"}</legend>
         <div class="row">
-          <div><label class="field" for="edw-recent">近期作品数</label><select id="edw-recent">${recentOptions}</select></div>
-          <div><label class="field" for="edw-days">作品时间范围</label><select id="edw-days">${dayOptions}</select></div>
-          <div><label class="field" for="edw-depth">加载轮次</label><select id="edw-depth">${depthOptions}</select></div>
+          ${isUserKind ? `<div><label class="field" for="edw-recent">近期作品数</label><select id="edw-recent">${recentOptions}</select></div>
+          <div><label class="field" for="edw-days">作品时间范围</label><select id="edw-days">${dayOptions}</select></div>` : ""}
+          <div><label class="field" for="edw-depth">${item.mode === "creator" ? "创作中心翻页深度" : "弹幕加载轮次"}</label><select id="edw-depth">${depthOptions}</select></div>
         </div>
         <div class="row">
           <div><label class="field" for="edw-scan-cap">单轮入库上限</label><input id="edw-scan-cap" type="number" min="0" value="${item.max_records_per_scan || 0}"></div>
@@ -11296,10 +13059,10 @@ async function editDanmakuWatch(id) {
     ["edw-interval", "edw-recent", "edw-days", "edw-depth", "edw-probe"].forEach(key => {
       const el = $(key); if (el) enhanceSelect(el);
     });
-    $("edw-recent").value = String(item.recent_works || 0);
-    $("edw-days").value = String(item.recent_days || 0);
+    if ($("edw-recent")) $("edw-recent").value = String(item.recent_works || 0);
+    if ($("edw-days")) $("edw-days").value = String(item.recent_days || 0);
     $("edw-depth").value = String(item.max_scrolls || 0);
-    $("edw-probe").value = String(item.probe_step_seconds || 0);
+    if ($("edw-probe")) $("edw-probe").value = String(item.probe_step_seconds || 0);
     ["edw-interval", "edw-recent", "edw-days", "edw-depth", "edw-probe"].forEach(key => {
       const el = $(key); if (el && el._csSync) el._csSync();
     });
@@ -11480,16 +13243,19 @@ async function addWatch() {
   const btn = evtBtn() || document.querySelector('button[onclick="addWatch()"]');
   if (btn?.disabled) return;
   await withBusy(btn, "识别中", async () => {
-  const normalizedTarget = await normalizeWatchTarget(null, { quiet: true });
+  const normalizedTarget = await normalizeWatchTarget(null, { quiet: true, toastErrors: true });
   if (normalizedTarget === null) return;
   const url_or_id = $("w-url").value.trim();
-  if (!url_or_id) { toast("请粘贴视频链接 / 账号主页 / sec_uid", "err"); return; }
-  if (["xhs", "tiktok"].includes(PLATFORM) && !$("w-acc").value) {
+  if (!url_or_id) { toast("请粘贴作品链接 / 账号主页 / ID", "err"); return; }
+  const kind = $("w-kind").value;
+  const mode = PLATFORM === "douyin" && kind !== "video" ? $("w-mode").value : "public";
+  if (mode === "creator" && !$("w-acc").value) {
+    toast("创作中心模式必须选择一个已完成创作者登录的抖音账号", "err"); return;
+  }
+  if (WATCH_ACCOUNT_REQUIRED.includes(PLATFORM) && !$("w-acc").value) {
     const platformName = PF_NAME[PLATFORM] || "当前平台";
-    const available = PLATFORM === "tiktok"
-      ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
-      : ACCOUNTS;
-    if (!available.length) { toast("请先在「账号」里完成" + platformName + "登录", "err"); switchTab("accounts"); return; }
+    const available = ACCOUNTS.filter(a => a.status === "active" && (a.has_storage || a.has_creator));
+    if (!available.length) { toast("请先在「账号矩阵」里完成" + platformName + "登录", "err"); switchTab("accounts"); return; }
     toast(platformName + "评论监控必须选择一个已登录账号", "err"); return;
   }
   $("w-msg").textContent = "解析中…";
@@ -11498,12 +13264,12 @@ async function addWatch() {
       await api("/api/comment-watches", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          url_or_id, platform: PLATFORM, kind: $("w-kind").value,
-          mode: PLATFORM === "douyin" ? $("w-mode").value : "public",
+          url_or_id, platform: PLATFORM, kind,
+          mode,
           account_id: PLATFORM === "shipinhao" ? null : ($("w-acc").value ? +$("w-acc").value : null),
           interval_seconds: monitorIntervalSeconds("w-interval"),
-          recent_works: +$("w-recent").value,
-          recent_days: +$("w-days").value,
+          recent_works: kind === "video" ? 0 : +$("w-recent").value,
+          recent_days: kind === "video" ? 0 : +$("w-days").value,
           max_scrolls: +$("w-depth").value,
           alias: $("w-alias").value.trim(), group_name: getMetaValue("w-group").trim(),
           tags: parseTags(getMetaValue("w-tags")),
@@ -11643,12 +13409,17 @@ async function refreshWatches() {
 }
 async function editWatchMeta(id) {
   const item = watchById(id); if (!item) return;
-  const accounts = ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid");
+  const allAccounts = ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid");
   const canCreator = item.platform === "douyin" && item.kind === "user";
-  const accountOptions = [
-    `<option value="">${item.account_id ? "保持当前绑定" : "不指定账号"}</option>`,
-    ...accounts.map(a => `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`),
-  ].join("");
+  const buildWatchAccountOptions = (modeVal) => {
+    const creatorOnly = canCreator && modeVal === "creator";
+    const list = creatorOnly ? allAccounts.filter(a => a.has_creator) : _preferCrawlAccounts(allAccounts);
+    const ph = creatorOnly
+      ? (list.length ? "请选择创作者账号(必选)" : "无创作者账号，请先创作者登录")
+      : (item.account_id ? "保持当前绑定" : "不指定账号");
+    return accOptions(list, ph, { preferCrawler: !creatorOnly });
+  };
+  const initialMode = canCreator ? (item.mode || "public") : "public";
   const intervalOptions = monitorIntervalOptions(item.interval_seconds || 600);
   const recentOptions = numericSelectOptions(item.recent_works || 0, [
     [0, "跟随全局设置"], [3, "最近 3 个作品"], [5, "最近 5 个作品"],
@@ -11672,7 +13443,7 @@ async function editWatchMeta(id) {
       account_id: item.platform === "shipinhao"
         ? null
         : ($("ew-account") && $("ew-account").value ? +$("ew-account").value : null),
-      mode: $("ew-mode").value,
+      mode: $("ew-mode") ? $("ew-mode").value : "public",
       recent_works: $("ew-recent") ? +$("ew-recent").value : item.recent_works || 0,
       recent_days: $("ew-days") ? +$("ew-days").value : item.recent_days || 0,
       max_scrolls: $("ew-depth") ? +$("ew-depth").value : item.max_scrolls || 0,
@@ -11694,10 +13465,10 @@ async function editWatchMeta(id) {
             <select id="ew-interval">${intervalOptions}</select></div>
           ${item.platform === "shipinhao"
             ? ""
-            : `<div><label class="field" for="ew-account">抓取账号</label><select id="ew-account">${accountOptions}</select></div>`}
+            : `<div><label class="field" for="ew-account">抓取账号</label><select id="ew-account">${buildWatchAccountOptions(initialMode)}</select></div>`}
         </div>
-        <div><label class="field" for="ew-mode">评论来源</label>
-          <select id="ew-mode"><option value="public">公开评论区</option>${canCreator ? '<option value="creator">创作中心（仅自有账号）</option>' : ""}</select></div>
+        ${canCreator ? `<div><label class="field" for="ew-mode">评论来源</label>
+          <select id="ew-mode"><option value="public">公开评论区</option><option value="creator">创作中心（仅自有账号）</option></select></div>` : ""}
         ${item.kind === "user" ? `<div class="row">
           <div><label class="field" for="ew-recent">检查近期作品数</label><select id="ew-recent">${recentOptions}</select></div>
           <div><label class="field" for="ew-days">作品时间范围</label><select id="ew-days">${dayOptions}</select></div>
@@ -11709,7 +13480,19 @@ async function editWatchMeta(id) {
     setMetaValue("ew-group", item.group_name || ""); setMetaValue("ew-tags", itemTags(item).join(","));
     setupMonitorInterval("ew-interval", item.interval_seconds || 600);
     if ($("ew-account")) $("ew-account").value = item.account_id ? String(item.account_id) : "";
-    $("ew-mode").value = canCreator ? (item.mode || "public") : "public";
+    if ($("ew-mode")) {
+      $("ew-mode").value = initialMode;
+      $("ew-mode").addEventListener("change", () => {
+        const accSel = $("ew-account");
+        if (!accSel) return;
+        const prev = accSel.value;
+        const m = $("ew-mode").value;
+        accSel.innerHTML = buildWatchAccountOptions(m);
+        if ([...accSel.options].some(o => o.value === prev)) accSel.value = prev;
+        else if (m === "creator" && accSel.options.length > 1) accSel.value = accSel.options[1].value;
+        accSel._csSync?.();
+      });
+    }
     if ($("ew-recent")) $("ew-recent").value = String(item.recent_works || 0);
     if ($("ew-days")) $("ew-days").value = String(item.recent_days || 0);
     if ($("ew-depth")) $("ew-depth").value = String(item.max_scrolls || 0);
@@ -12001,7 +13784,45 @@ document.addEventListener("keydown", e => {
 const BILI_PARTITION_CACHE = new Map();
 function onBiliCopyrightChange() {
   const wrap = $("pub-bili-source-wrap");
-  if (wrap) wrap.style.display = $("pub-bili-copyright")?.value === "2" ? "" : "none";
+  const isVideo = ($("pub-type")?.value || "video") === "video";
+  if (wrap) wrap.style.display = (isVideo && $("pub-bili-copyright")?.value === "2") ? "" : "none";
+}
+function syncPublishPlatformFields() {
+  const mediaType = $("pub-type")?.value || "images";
+  // B站：图文动态隐藏仅视频投稿适用的分区/自制转载/二创/弹幕项
+  if (PLATFORM === "bilibili") {
+    const isVideo = mediaType === "video";
+    ["pub-bili-tid-wrap", "pub-bili-copyright-wrap", "pub-bili-statement-wrap", "pub-bili-recreate-wrap", "pub-bili-close-danmu-wrap"].forEach(id => {
+      if ($(id)) $(id).style.display = isVideo ? "" : "none";
+    });
+    onBiliCopyrightChange();
+  }
+  // Facebook：按发布目标（个人动态/公共主页/群组/快拍）联动 Page ID、群组链接、可见范围与首评
+  if (PLATFORM === "facebook") {
+    const target = $("pub-fb-target")?.value || "profile";
+    if ($("pub-fb-page-wrap")) $("pub-fb-page-wrap").style.display = target === "profile" ? "none" : "";
+    if ($("pub-fb-group-wrap")) $("pub-fb-group-wrap").style.display = target === "group" ? "" : "none";
+    if ($("pub-fb-privacy-wrap")) $("pub-fb-privacy-wrap").style.display = target === "profile" ? "" : "none";
+    if ($("pub-fb-first-comment-wrap")) $("pub-fb-first-comment-wrap").style.display = target === "story" ? "none" : "";
+  }
+  // YouTube：即时首映仅公开常规视频有效；切为 Shorts 或非公开时自动重置并隐藏
+  if (PLATFORM === "youtube") {
+    const ytKind = $("pub-yt-kind")?.value || "video";
+    const ytVis = $("pub-yt-visibility")?.value || "public";
+    const allowPremiere = ytKind === "video" && ytVis === "public";
+    if ($("pub-yt-premiere-wrap")) $("pub-yt-premiere-wrap").style.display = allowPremiere ? "" : "none";
+    if (!allowPremiere && $("pub-yt-premiere") && $("pub-yt-premiere").value !== "0") {
+      $("pub-yt-premiere").value = "0";
+      $("pub-yt-premiere")._csSync?.();
+    }
+  }
+  // Instagram：Reels 同步主页仅 auto/reels 显示；Story 快拍隐藏评论开关
+  if (PLATFORM === "instagram") {
+    const igKind = $("pub-ig-kind")?.value || "auto";
+    if ($("pub-ig-share-feed-wrap")) $("pub-ig-share-feed-wrap").style.display = (igKind === "auto" || igKind === "reels") ? "" : "none";
+    if ($("pub-ig-comment-wrap")) $("pub-ig-comment-wrap").style.display = igKind === "story" ? "none" : "";
+  }
+  onPubActionChange();
 }
 async function loadBiliPartitions(accountId) {
   const sel = $("pub-bili-tid");
@@ -12045,6 +13866,7 @@ function populatePubAcc() {
       : PLATFORM === "instagram" ? "请先完成「Instagram 登录」"
       : PLATFORM === "twitter" ? "请先完成「Twitter 登录」"
       : PLATFORM === "facebook" ? "请先完成「Facebook 登录」"
+      : PLATFORM === "youtube" ? "请先完成「YouTube 登录」"
       : PLATFORM === "rednote" ? "请先完成「海外小红书创作者登录」"
       : "请先完成「小红书创作者登录」");
   sel.innerHTML = accOptions(list, ph);
@@ -12056,6 +13878,123 @@ function populatePubAcc() {
   if (PLATFORM === "bilibili" && sel.value) loadBiliPartitions(sel.value);
 }
 let pubFilesDT = new DataTransfer();
+let pubCoverFile = null;
+let pubCoverPreviewUrl = "";
+let PUB_COVER_UPLOAD_CACHE = null;
+
+function updatePubCoverHelp() {
+  const help = $("pub-cover-help");
+  if (!help) return;
+  const mediaType = $("pub-type")?.value || "images";
+  if (mediaType === "images") {
+    help.textContent = ["xhs", "rednote"].includes(PLATFORM)
+      ? "图文默认以首图为封面；如额外上传自定义封面，小红书/海外小红书将尝试设为封面图。"
+      : "图文发布默认以首图为封面；视频发布时自动上传为自定义封面（留空使用平台默认）。";
+    return;
+  }
+  if (PLATFORM === "twitter") {
+    help.textContent = "提示：X / Twitter 标准网页发推页通常不支持单独修改视频缩略图；若当前账号支持媒体编辑将自动尝试设置，否则沿用默认首帧。";
+  } else if (PLATFORM === "youtube") {
+    help.textContent = "YouTube Studio 将自动上传为自定义缩略图（与下方本地路径二选一，优先使用此处上传的封面）。";
+  } else if (PLATFORM === "bilibili") {
+    help.textContent = "哔哩哔哩创作中心将自动上传自定义封面并覆盖默认视频帧。";
+  } else {
+    help.textContent = "视频发布时自动上传为自定义封面（全平台适用，留空则使用平台默认/视频首帧）。";
+  }
+}
+
+function onPubActionChange() {
+  const action = $("pub-action")?.value || "publish";
+  const lbl = $("pub-submit-label");
+  if (lbl) lbl.textContent = action === "draft" ? "加入平台草稿队列" : "加入发布队列";
+  const help = $("pub-action-help");
+  if (!help) return;
+  const mediaType = $("pub-type")?.value || "images";
+  if (action === "draft") {
+    if (PLATFORM === "bilibili" && mediaType === "images") {
+      help.textContent = "提示：哔哩哔哩图文动态无官方草稿箱，仅视频稿件支持「暂存到平台草稿箱」；如需本地暂存请点下方「存为本地草稿」。";
+    } else if (PLATFORM === "facebook" && ($("pub-fb-target")?.value || "profile") === "story") {
+      help.textContent = "提示：Facebook Story 快拍不支持平台草稿箱，请改选帖子形态或使用下方「存为本地草稿」。";
+    } else if (PLATFORM === "youtube") {
+      help.textContent = "将在 YouTube Studio 上传视频、自定义封面并填完元数据后关闭弹窗，自动保存为 YouTube 草稿（不公开发布）。";
+    } else if (["xhs", "rednote", "instagram"].includes(PLATFORM)) {
+      help.textContent = "将自动切换独立浏览器模式，上传素材与封面并填好文案后点击平台存草稿按钮，不公开发布。";
+    } else {
+      help.textContent = "将自动上传素材与封面、填好文案后点击目标平台存草稿按钮，不会公开发布。";
+    }
+  } else {
+    help.textContent = "按计划时间自动上传素材与封面并直接发布；若只想先保存在 CreatorHub 本地稍后编辑，请点下方「存为本地草稿」。";
+  }
+}
+
+function pubSetCover(file) {
+  if (!file) { pubCoverClear(); return; }
+  const ext = (file.name || "").split(".").pop().toLowerCase();
+  if (!["jpg", "jpeg", "png", "webp"].includes(ext) && !(file.type || "").startsWith("image/")) {
+    toast("自定义封面仅支持 JPG / PNG / WEBP 图片", "err");
+    return;
+  }
+  pubCoverFile = file;
+  PUB_COVER_UPLOAD_CACHE = null;
+  renderPubCover();
+}
+
+function pubCoverClear() {
+  pubCoverFile = null;
+  PUB_COVER_UPLOAD_CACHE = null;
+  const inp = $("pub-cover");
+  if (inp) inp.value = "";
+  renderPubCover();
+}
+
+function renderPubCover() {
+  const box = $("pub-cover-list");
+  if (!box) return;
+  if (pubCoverPreviewUrl) { URL.revokeObjectURL(pubCoverPreviewUrl); pubCoverPreviewUrl = ""; }
+  if (!pubCoverFile) { box.innerHTML = ""; return; }
+  pubCoverPreviewUrl = URL.createObjectURL(pubCoverFile);
+  box.innerHTML = `<span class="fp-chip"><img src="${pubCoverPreviewUrl}" alt="自定义封面"><span title="${esc(pubCoverFile.name)}">${esc(pubCoverFile.name)}</span><button type="button" onclick="pubCoverClear()" aria-label="移除封面">${ic("i-x")}</button></span>`;
+}
+
+function bindPubCoverPicker() {
+  const inp = $("pub-cover"), zone = $("pub-cover-drop");
+  if (!inp || !zone || inp._coverBound) return;
+  inp._coverBound = true;
+  inp.addEventListener("change", e => {
+    const f = e.target.files && e.target.files[0];
+    if (f) pubSetCover(f);
+  });
+  ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add("drag"); }));
+  ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault();
+    if (ev === "dragleave" && zone.contains(e.relatedTarget)) return;
+    zone.classList.remove("drag");
+  }));
+  zone.addEventListener("drop", e => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) pubSetCover(f);
+  });
+  const fbTarget = $("pub-fb-target");
+  if (fbTarget && !fbTarget._draftHelpBound) {
+    fbTarget._draftHelpBound = true;
+    fbTarget.addEventListener("change", () => onPubActionChange());
+  }
+}
+
+async function uploadSingleCoverFile(file) {
+  if (!file) return "";
+  if (PUB_COVER_UPLOAD_CACHE && PUB_COVER_UPLOAD_CACHE.file === file && PUB_COVER_UPLOAD_CACHE.path) {
+    return PUB_COVER_UPLOAD_CACHE.path;
+  }
+  const fd = new FormData();
+  fd.append("files", file);
+  const up = await api("/api/publish/upload", { method: "POST", body: fd });
+  const path = (up.files && up.files[0] && up.files[0].path) || "";
+  if (!path) throw new Error("自定义封面上传失败，未返回有效路径");
+  PUB_COVER_UPLOAD_CACHE = { file, path };
+  return path;
+}
+
 function onPubType() {
   const v = $("pub-type").value, inp = $("pub-files"), lbl = $("pub-files-label");
   if (!inp) return;
@@ -12070,6 +14009,8 @@ function onPubType() {
     lbl.textContent = ig ? "选择图片/视频（可多选，最多 10 项轮播）" : tw ? "选择图片（可多选，最多 4 张；留空可发纯文本推文）" : fb ? "选择图片（可多选，最多 20 张；留空可发纯文本帖子）" : "选择图片(可多选,最多 18 张)";
   }
   pubFilesClear();
+  updatePubCoverHelp();
+  syncPublishPlatformFields();
 }
 function pubFilesClear() { pubFilesDT = new DataTransfer(); _pubSync(); }
 function _pubSync() { const inp = $("pub-files"); if (inp) inp.files = pubFilesDT.files; renderPubFiles(); }
@@ -12106,21 +14047,53 @@ function renderPubFiles() {
 }
 function bindPubFilePicker() {
   const inp = $("pub-files"), zone = $("pub-drop");
-  if (!inp || !zone) return;
-  inp.addEventListener("change", e => { pubAddFiles(e.target.files); });
-  ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add("drag"); }));
-  ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); if (ev === "dragleave" && zone.contains(e.relatedTarget)) return; zone.classList.remove("drag"); }));
-  zone.addEventListener("drop", e => { if (e.dataTransfer && e.dataTransfer.files.length) pubAddFiles(e.dataTransfer.files); });
+  if (inp && zone && !inp._pubBound) {
+    inp._pubBound = true;
+    inp.addEventListener("change", e => { pubAddFiles(e.target.files); });
+    ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add("drag"); }));
+    ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); if (ev === "dragleave" && zone.contains(e.relatedTarget)) return; zone.classList.remove("drag"); }));
+    zone.addEventListener("drop", e => { if (e.dataTransfer && e.dataTransfer.files.length) pubAddFiles(e.dataTransfer.files); });
+  }
+  bindPubCoverPicker();
+  bindRepostCoverPicker();
+  updatePubCoverHelp();
+  syncPublishPlatformFields();
 }
-let PUB_SUBMITTING = false, PUB_UPLOAD_CACHE = null;
-function publishFormPayload() {
-  const tiktok = PLATFORM === "tiktok", bili = PLATFORM === "bilibili", ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook";
+let PUB_SUBMITTING = false, PUB_UPLOAD_CACHE = null, PUB_UPLOAD_ABORT = null;
+function renderPubUploadProgress(info) {
+  const box = $("pub-upload-progress");
+  if (!box) return;
+  if (!info) { box.hidden = true; box.innerHTML = ""; return; }
+  const P = window.CreatorHubProgress;
+  const pct = info.percent != null ? `${Math.round(info.percent)}%` : "上传中";
+  const bytes = info.total > 0 && P ? `${P.fmtBytes(info.loaded)} / ${P.fmtBytes(info.total)}` : "";
+  const spd = info.speedBps > 0 && P ? P.fmtSpeed(info.speedBps) : "";
+  const eta = info.etaSeconds > 0 && P ? P.fmtEta(info.etaSeconds) : "";
+  const meta = [bytes, spd, eta].filter(Boolean).join(" · ");
+  box.innerHTML = `
+    <div class="pub-upload-progress-head">
+      <span>正在上传素材${meta ? ` · <span class="mut progress-num">${esc(meta)}</span>` : ""}</span>
+      <span style="display:inline-flex;align-items:center;gap:8px">
+        <b class="progress-num">${esc(pct)}</b>
+        ${info.percent < 100 ? `<button type="button" class="ghost sm danger" style="min-height:22px;padding:1px 7px" onclick="cancelPubUpload()">取消</button>` : ""}
+      </span>
+    </div>
+    ${P ? P.renderProgressBar({ determinate: info.percent != null, percent: info.percent, tone: info.percent === 100 ? "ok" : "info", label: "素材上传进度", compact: true }) : ""}`;
+  box.hidden = false;
+}
+function cancelPubUpload() {
+  if (PUB_UPLOAD_ABORT) { try { PUB_UPLOAD_ABORT.abort(); } catch (_) {} }
+}
+function publishFormPayload(opts = {}) {
+  const saveAsDraft = Boolean(opts && opts.saveAsDraft);
+  const tiktok = PLATFORM === "tiktok", bili = PLATFORM === "bilibili", ig = PLATFORM === "instagram", tw = PLATFORM === "twitter", fb = PLATFORM === "facebook", yt = PLATFORM === "youtube";
   const mediaType = $("pub-type").value;
-  let biliOptions, igOptions, twOptions, fbOptions;
+  const publishAction = $("pub-action")?.value === "draft" ? "draft" : "publish";
+  let biliOptions, igOptions, twOptions, fbOptions, ytOptions;
   if (bili) {
     const copyright = +($("pub-bili-copyright")?.value || 1);
     const source = ($("pub-bili-source")?.value || "").trim();
-    if (mediaType === "video" && copyright === 2 && !source) {
+    if (!saveAsDraft && mediaType === "video" && copyright === 2 && !source) {
       throw new Error("转载稿件请填写转载来源");
     }
     const stmtVal = +($("pub-bili-statement")?.value || -1);
@@ -12148,7 +14121,7 @@ function publishFormPayload() {
     const targetType = $("pub-fb-target")?.value || "profile";
     const groupUrl = ($("pub-fb-group-url")?.value || "").trim();
     const pageId = ($("pub-fb-page-id")?.value || "").trim();
-    if (targetType === "group" && !groupUrl) {
+    if (!saveAsDraft && targetType === "group" && !groupUrl) {
       throw new Error("发布到 Facebook 群组时请填写目标群组链接或群组 ID");
     }
     fbOptions = {
@@ -12159,6 +14132,21 @@ function publishFormPayload() {
       first_comment: ($("pub-fb-first-comment")?.value || "").trim(),
     };
   }
+  if (yt) {
+    const rawTags = ($("pub-yt-tags")?.value || "").trim();
+    const rawPlaylists = ($("pub-yt-playlists")?.value || "").trim();
+    ytOptions = {
+      post_kind: $("pub-yt-kind")?.value || "video",
+      visibility: $("pub-yt-visibility")?.value || "public",
+      made_for_kids: $("pub-yt-mfk")?.value === "1",
+      channel_name: ($("pub-yt-channel")?.value || "").trim(),
+      tags: rawTags ? rawTags.split(/[,，\n]/).map(s => s.trim()).filter(Boolean) : [],
+      playlists: rawPlaylists ? rawPlaylists.split(/[,，\n]/).map(s => s.trim()).filter(Boolean) : [],
+      thumbnail_path: ($("pub-yt-thumbnail")?.value || "").trim(),
+      premiere: $("pub-yt-premiere")?.value === "1",
+      first_comment: ($("pub-yt-first-comment")?.value || "").trim(),
+    };
+  }
   if (ig) {
     igOptions = {
       post_kind: $("pub-ig-kind")?.value || "auto",
@@ -12166,10 +14154,11 @@ function publishFormPayload() {
     };
   }
   return { account_id: +$("pub-acc").value, media_type: mediaType,
+    publish_action: publishAction,
     title: $("pub-title").value.trim(), desc: $("pub-desc").value,
     topics: $("pub-topics").value.trim(), scheduled_at: scheduleToApi($("pub-when").value || null),
     location: $("pub-location") ? $("pub-location").value.trim() : "",
-    visibility: fb ? (($("pub-fb-privacy")?.value || "public") === "only_me" ? "private" : ($("pub-fb-privacy")?.value || "public")) : bili ? ($("pub-bili-visibility")?.value || "public") : (tiktok ? $("pub-tk-visibility").value : $("pub-visibility") ? $("pub-visibility").value : "public"),
+    visibility: yt ? ($("pub-yt-visibility")?.value || "public") : fb ? (($("pub-fb-privacy")?.value || "public") === "only_me" ? "private" : ($("pub-fb-privacy")?.value || "public")) : bili ? ($("pub-bili-visibility")?.value || "public") : (tiktok ? $("pub-tk-visibility").value : $("pub-visibility") ? $("pub-visibility").value : "public"),
     allow_save: $("pub-allowsave") ? $("pub-allowsave").value !== "0" : true,
     allow_comment: bili ? ($("pub-bili-close-reply")?.value !== "1") : ig ? ($("pub-ig-comment")?.value !== "0") : tw ? (($("pub-tw-reply-perm")?.value || "everyone") !== "mentioned") : (tiktok ? $("pub-tk-comment").value !== "0" : true),
     allow_duet: tiktok ? $("pub-tk-duet").value !== "0" : true,
@@ -12177,59 +14166,140 @@ function publishFormPayload() {
     ...(bili ? { bili_options: biliOptions } : {}),
     ...(ig ? { ig_options: igOptions } : {}),
     ...(tw ? { tw_options: twOptions } : {}),
-    ...(fb ? { fb_options: fbOptions } : {}) };
+    ...(fb ? { fb_options: fbOptions } : {}),
+    ...(yt ? { yt_options: ytOptions } : {}) };
 }
-async function addPublish() {
+async function addPublish(opts = {}) {
   if (PUB_SUBMITTING) return;
+  const saveAsDraft = Boolean(opts && opts.saveAsDraft);
   const acc = $("pub-acc").value;
   if (!acc) { toast("请选择" + (PF_NAME[PLATFORM] || "发布") + "账号", "err"); return; }
   const files = Array.from($("pub-files").files);
-  if (!files.length && PLATFORM !== "twitter" && PLATFORM !== "facebook") { toast("请先选择要发布的文件", "err"); return; }
-  if (!files.length && (PLATFORM === "twitter" || PLATFORM === "facebook") && !($("pub-title").value.trim() || $("pub-desc").value.trim() || $("pub-topics").value.trim())) { toast(PLATFORM === "facebook" ? "请填写帖子文案或选择媒体文件" : "请填写推文文案或选择媒体文件", "err"); return; }
+  const coverSnap = pubCoverFile;
+  const hasText = Boolean($("pub-title").value.trim() || $("pub-desc").value.trim() || $("pub-topics").value.trim());
+  const ytThumbText = PLATFORM === "youtube" ? ($("pub-yt-thumbnail")?.value || "").trim() : "";
+  if (saveAsDraft) {
+    if (!files.length && !coverSnap && !ytThumbText && !hasText) {
+      toast("暂存本地草稿请至少填写标题/正文，或选择媒体/封面文件", "err");
+      return;
+    }
+  } else {
+    if (!files.length && PLATFORM !== "twitter" && PLATFORM !== "facebook") { toast("请先选择要发布的文件", "err"); return; }
+    if (!files.length && (PLATFORM === "twitter" || PLATFORM === "facebook") && !hasText) { toast(PLATFORM === "facebook" ? "请填写帖子文案或选择媒体文件" : "请填写推文文案或选择媒体文件", "err"); return; }
+  }
   let body;
-  try { body = publishFormPayload(); }
+  try { body = publishFormPayload({ saveAsDraft }); }
   catch (e) { $("pub-msg").textContent = e.message; toast(e.message, "err"); return; }
-  const btn = evtBtn();
+  const btn = evtBtn() || (saveAsDraft ? $("pub-draft-btn") : $("pub-submit-btn"));
   PUB_SUBMITTING = true;
-  $("pub-msg").textContent = "上传中…";
-  try { await withBusy(btn, "提交中", async () => {
+  $("pub-msg").textContent = files.length || coverSnap ? "上传中…" : "保存中…";
+  try { await withBusy(btn, saveAsDraft ? "暂存中" : "提交中", async () => {
     try {
       if (!files.length) {
         PUB_UPLOAD_CACHE = { files: [], paths: [] };
       } else if (!PUB_UPLOAD_CACHE || PUB_UPLOAD_CACHE.files.length !== files.length ||
           !PUB_UPLOAD_CACHE.files.every((file, index) => file === files[index])) {
         const fd = new FormData(); for (const f of files) fd.append("files", f);
-        const up = await api("/api/publish/upload", { method: "POST", body: fd });
-        PUB_UPLOAD_CACHE = { files, paths: (up.files || []).map(f => f.path) };
+        PUB_UPLOAD_ABORT = new AbortController();
+        renderPubUploadProgress({ loaded: 0, total: files.reduce((s, f) => s + (f.size || 0), 0), percent: 0, speedBps: 0 });
+        try {
+          const up = await apiUploadWithProgress("/api/publish/upload", fd, {
+            signal: PUB_UPLOAD_ABORT.signal,
+            onProgress: prog => {
+              renderPubUploadProgress(prog);
+              if (prog.percent != null) $("pub-msg").textContent = `上传素材中 ${prog.percent}%…`;
+            },
+          });
+          PUB_UPLOAD_CACHE = { files, paths: (up.files || []).map(f => f.path) };
+        } finally {
+          PUB_UPLOAD_ABORT = null;
+          renderPubUploadProgress(null);
+        }
+      }
+      let coverPath = ytThumbText;
+      if (coverSnap) {
+        $("pub-msg").textContent = "上传自定义封面…";
+        coverPath = await uploadSingleCoverFile(coverSnap);
       }
       const paths = PUB_UPLOAD_CACHE.paths;
       await api("/api/publish", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...body, media_paths: paths }),
+        body: JSON.stringify({ ...body, media_paths: paths, cover_path: coverPath, save_as_draft: saveAsDraft }),
       });
       // A late response must not erase edits made during a slow upload.
       let unchanged = false;
-      try { unchanged = JSON.stringify(publishFormPayload()) === JSON.stringify(body) &&
+      try { unchanged = JSON.stringify(publishFormPayload({ saveAsDraft })) === JSON.stringify(body) &&
           Array.from($("pub-files").files).length === files.length &&
-          Array.from($("pub-files").files).every((file, index) => file === files[index]); } catch (_) {}
+          Array.from($("pub-files").files).every((file, index) => file === files[index]) &&
+          pubCoverFile === coverSnap; } catch (_) {}
       if (unchanged) {
-        pubFilesClear(); $("pub-title").value = ""; $("pub-desc").value = ""; $("pub-topics").value = ""; $("pub-when").value = ""; if ($("pub-location")) $("pub-location").value = ""; if ($("pub-tw-first-comment")) $("pub-tw-first-comment").value = ""; if ($("pub-fb-first-comment")) $("pub-fb-first-comment").value = ""; dtSyncAll();
+        pubFilesClear(); pubCoverClear();
+        $("pub-title").value = ""; $("pub-desc").value = ""; $("pub-topics").value = ""; $("pub-when").value = "";
+        if ($("pub-location")) $("pub-location").value = "";
+        if ($("pub-tw-first-comment")) $("pub-tw-first-comment").value = "";
+        if ($("pub-fb-first-comment")) $("pub-fb-first-comment").value = "";
+        if ($("pub-yt-first-comment")) $("pub-yt-first-comment").value = "";
+        if ($("pub-yt-thumbnail")) $("pub-yt-thumbnail").value = "";
+        dtSyncAll();
         PUB_UPLOAD_CACHE = null;
+        PUB_COVER_UPLOAD_CACHE = null;
       }
-      $("pub-msg").textContent = body.scheduled_at ? "已加入定时队列 ✓" : "已加入发布队列 ✓";
-      toast("已加入发布队列", "ok");
+      if (saveAsDraft) {
+        $("pub-msg").textContent = "已存为本地草稿 ✓";
+        toast("已存为本地草稿（可随时编辑或入队执行）", "ok");
+      } else if (body.publish_action === "draft") {
+        $("pub-msg").textContent = body.scheduled_at ? "已加入定时平台草稿队列 ✓" : "已加入平台草稿队列 ✓";
+        toast("已加入平台草稿队列", "ok");
+      } else {
+        $("pub-msg").textContent = body.scheduled_at ? "已加入定时队列 ✓" : "已加入发布队列 ✓";
+        toast("已加入发布队列", "ok");
+      }
     } catch (e) { $("pub-msg").textContent = "提交未确认: " + e.message + "；重试相同内容会沿用原提交编号。"; toast("提交未确认:" + e.message, "err"); }
   }); } finally { PUB_SUBMITTING = false; }
   refreshPublish();
 }
-const PUB_ST = { draft: "待确认预约", pending: "排队中", publishing: "发布中", uncertain: "结果待确认", done: "已发布", failed: "失败", canceled: "已取消" };
-const PUB_PILL = { draft: "pending", pending: "pending", publishing: "downloading", uncertain: "downloading", done: "done", failed: "failed", canceled: "invalid" };
+const PUB_ST = { draft: "本地草稿", pending: "排队中", publishing: "发布中", uncertain: "结果待确认", done: "已发布", failed: "失败", canceled: "已取消" };
+const PUB_PILL = { draft: "draft", pending: "pending", publishing: "downloading", uncertain: "downloading", done: "done", failed: "failed", canceled: "invalid" };
+function pubStatusLabel(t) {
+  if (!t) return "";
+  if (t.status === "draft") return t.schedule_needs_confirmation ? "待确认预约" : "本地草稿";
+  if (t.status === "done" && t.publish_action === "draft") return "已存平台草稿";
+  if (t.status === "publishing" && t.publish_action === "draft") return "存草稿中";
+  return PUB_ST[t.status] || t.status;
+}
+function pubStatusPill(t) {
+  if (!t) return "pending";
+  if (t.status === "draft") return t.schedule_needs_confirmation ? "pending" : "draft";
+  return PUB_PILL[t.status] || "pending";
+}
+function openPubCoverPreview(taskId, title = "自定义封面") {
+  return _pvOpen(async () => ({
+    media_type: "images",
+    desc: title || "自定义封面",
+    medias: [{ url: `/api/publish/${taskId}/cover?t=${Date.now()}`, kind: "image", ext: "jpg", index: 0 }],
+  }));
+}
+async function enqueuePublish(id) {
+  const btn = evtBtn();
+  await withBusy(btn, "入队中", async () => {
+    try {
+      await api("/api/publish/" + id + "/enqueue", { method: "POST" });
+      toast("草稿已加入执行队列 ✓", "ok");
+    } catch (e) {
+      toast("入队失败:" + e.message, "err");
+    }
+  });
+  refreshPublish();
+}
 async function editPublish(id) {
   const task = PUBLISH_TASKS.find(x => x.id === id); if (!task) return;
   const accounts = (ALL_ACCOUNTS.length ? ALL_ACCOUNTS : ACCOUNTS).filter(a => a.platform === task.platform);
   const accountOptions = accounts.map(a =>
     `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`
   ).join("");
+  const isLocalDraft = task.status === "draft" && !task.schedule_needs_confirmation;
+  let epCoverRemoved = false;
+  let epPreviewBlobUrl = "";
   const value = await new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     const curBili = task.bili_options || {};
@@ -12239,6 +14309,8 @@ async function editPublish(id) {
       desc: $("ep-desc").value,
       topics: $("ep-topics").value.trim(),
       scheduled_at: $("ep-when").value || null,
+      publish_action: $("ep-action") ? $("ep-action").value : (task.publish_action || "publish"),
+      keep_draft: $("ep-save-mode") ? $("ep-save-mode").value === "draft" : false,
       location: $("ep-location") ? $("ep-location").value.trim() : "",
       visibility: $("ep-visibility") ? $("ep-visibility").value : "public",
       allow_save: $("ep-allowsave") ? $("ep-allowsave").value !== "0" : true,
@@ -12255,8 +14327,12 @@ async function editPublish(id) {
         },
       } : {}),
     });
-    const editCap = task.platform === "facebook" ? 5000 : task.platform === "twitter" ? (task.tw_options?.long_text ? 4000 : 280) : task.platform === "instagram" ? 2200 : task.platform === "bilibili" ? 80 : task.platform === "rednote" ? 40 : task.platform === "douyin" ? 30 : task.platform === "shipinhao" ? 16 : 20;
+    const editCap = task.platform === "facebook" ? 5000 : task.platform === "twitter" ? (task.tw_options?.long_text ? 4000 : 280) : task.platform === "instagram" ? 2200 : task.platform === "youtube" ? 100 : task.platform === "bilibili" ? 80 : task.platform === "rednote" ? 40 : task.platform === "douyin" ? 30 : task.platform === "shipinhao" ? 16 : 20;
     const showVisOpts = ["douyin", "xhs", "rednote", "kuaishou"].includes(task.platform);
+    const mediaAccept = task.media_type === "video"
+      ? (task.platform === "instagram" ? "video/*,image/*" : "video/*")
+      : (task.platform === "instagram" ? "image/*,video/*" : "image/*");
+    const mediaMulti = task.media_type !== "video" || task.platform === "instagram";
     $("ui-body").innerHTML = `
       <div><label class="field" for="ep-account">发布账号</label>
         <select id="ep-account">${accountOptions}</select></div>
@@ -12266,8 +14342,39 @@ async function editPublish(id) {
         <textarea id="ep-desc" rows="4">${esc(task.desc || "")}</textarea></div>
       <div><label class="field" for="ep-topics">话题</label>
         <input id="ep-topics" value="${esc(task.topics || "")}" placeholder="逗号分隔，不用带 #"></div>
-      <div><label class="field" for="ep-when">定时发布</label>
-        <input type="datetime-local" id="ep-when" aria-label="定时发布（留空=尽快发）"></div>
+      <div class="form-grid">
+        <div><label class="field" for="ep-when">定时发布</label>
+          <input type="datetime-local" id="ep-when" aria-label="定时发布（留空=尽快发）"></div>
+        <div><label class="field" for="ep-action">提交模式</label>
+          <select id="ep-action">
+            <option value="publish">直接发布作品</option>
+            <option value="draft">暂存到平台草稿箱</option>
+          </select></div>
+      </div>
+      <div>
+        <label class="field" for="ep-save-mode">保存后的队列状态</label>
+        <select id="ep-save-mode">
+          <option value="enqueue">保存并加入执行队列（排队等待执行）</option>
+          <option value="draft">保存为 CreatorHub 本地草稿（暂不自动执行）</option>
+        </select>
+      </div>
+      <div>
+        <label class="field" for="ep-cover-file">自定义封面（JPG / PNG / WEBP，可选）</label>
+        <div class="ep-cover-row">
+          ${task.has_cover ? `<img id="ep-cover-img" class="ep-cover-preview" src="${esc(task.cover_url || (`/api/publish/${task.id}/cover`))}?t=${Date.now()}" alt="当前封面" title="点击预览" onclick="openPubCoverPreview(${task.id}, ${jsArg(task.title || '自定义封面')})">` : `<img id="ep-cover-img" class="ep-cover-preview" style="display:none" alt="封面预览">`}
+          <div class="ep-cover-meta">
+            <b id="ep-cover-name">${task.has_cover ? esc(task.cover_name || "已设置自定义封面") : "未设置自定义封面（使用平台默认）"}</b>
+            <div class="row" style="gap:8px;flex-wrap:wrap">
+              <input type="file" id="ep-cover-file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" style="max-width:220px;font-size:12px">
+              <button type="button" class="ghost sm danger" id="ep-cover-clear" style="${task.has_cover ? "" : "display:none"}">移除封面</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <label class="field" for="ep-media-files">${task.media_count ? `替换媒体附件（当前已附 ${task.media_count} 个；留空则保持不变）` : "补充媒体附件（当前无附件，入队发布前请先上传）"}</label>
+        <input type="file" id="ep-media-files" accept="${mediaAccept}" ${mediaMulti ? "multiple" : ""}>
+      </div>
       ${task.platform === "shipinhao" ? `<div><label class="field" for="ep-location">位置</label>
         <input id="ep-location" value="${esc(task.location || "")}" placeholder="城市或地点名"></div>` : ""}
       ${showVisOpts ? `<fieldset class="publish-permissions">
@@ -12301,100 +14408,246 @@ async function editPublish(id) {
       </fieldset>` : ""}`;
     $("ep-account").value = task.account_id ? String(task.account_id) : "";
     $("ep-when").value = localDateTimeValue(task.scheduled_at);
+    if ($("ep-action")) $("ep-action").value = task.publish_action === "draft" ? "draft" : "publish";
+    if ($("ep-save-mode")) $("ep-save-mode").value = isLocalDraft ? "draft" : "enqueue";
     if ($("ep-visibility")) $("ep-visibility").value = task.visibility || "public";
     if ($("ep-allowsave")) $("ep-allowsave").value = task.allow_save === false ? "0" : "1";
     if ($("ep-tk-comment")) $("ep-tk-comment").value = task.allow_comment === false ? "0" : "1";
     if ($("ep-tk-duet")) $("ep-tk-duet").value = task.allow_duet === false ? "0" : "1";
     if ($("ep-tk-stitch")) $("ep-tk-stitch").value = task.allow_stitch === false ? "0" : "1";
     if ($("ep-bili-copyright")) $("ep-bili-copyright").value = String(curBili.copyright || 1);
-    ["ep-account", "ep-visibility", "ep-allowsave", "ep-tk-comment", "ep-tk-duet", "ep-tk-stitch", "ep-bili-copyright"].forEach(key => { const el = $(key); if (el) enhanceSelect(el); });
+    const epCoverInput = $("ep-cover-file");
+    const epCoverImg = $("ep-cover-img");
+    const epCoverName = $("ep-cover-name");
+    const epCoverClear = $("ep-cover-clear");
+    if (epCoverInput) {
+      epCoverInput.addEventListener("change", () => {
+        const f = epCoverInput.files && epCoverInput.files[0];
+        if (!f) return;
+        epCoverRemoved = false;
+        if (epPreviewBlobUrl) URL.revokeObjectURL(epPreviewBlobUrl);
+        epPreviewBlobUrl = URL.createObjectURL(f);
+        if (epCoverImg) { epCoverImg.src = epPreviewBlobUrl; epCoverImg.style.display = ""; epCoverImg.onclick = null; }
+        if (epCoverName) epCoverName.textContent = `新封面：${f.name}`;
+        if (epCoverClear) epCoverClear.style.display = "";
+      });
+    }
+    if (epCoverClear) {
+      epCoverClear.addEventListener("click", () => {
+        epCoverRemoved = true;
+        if (epCoverInput) epCoverInput.value = "";
+        if (epCoverImg) epCoverImg.style.display = "none";
+        if (epCoverName) epCoverName.textContent = "已移除自定义封面（保存后生效）";
+        epCoverClear.style.display = "none";
+      });
+    }
+    ["ep-account", "ep-action", "ep-save-mode", "ep-visibility", "ep-allowsave", "ep-tk-comment", "ep-tk-duet", "ep-tk-stitch", "ep-bili-copyright"].forEach(key => { const el = $(key); if (el) enhanceSelect(el); });
     enhanceDateTime($("ep-when"));
-    _uiOpen("编辑发布任务", `${task.media_count} 个附件保持不变。调整文案、账号、预约时间与权限。`, {
+    _uiOpen(isLocalDraft ? "编辑本地草稿" : "编辑发布任务", `当前已附 ${task.media_count || 0} 个媒体文件。可调整文案、自定义封面、草稿/发布模式与附件。`, {
       okText: "保存修改", wide: true, icon: "i-send",
-      submit: value => {
+      submit: async value => {
         if (!value.account_id) uiEditorError("请选择发布账号", "ep-account");
-        const scheduled_at = scheduleToApi(value.scheduled_at);
+        const payload = { ...value, scheduled_at: scheduleToApi(value.scheduled_at) };
+        const newCoverFile = epCoverInput && epCoverInput.files && epCoverInput.files[0];
+        if (newCoverFile) {
+          payload.cover_path = await uploadSingleCoverFile(newCoverFile);
+        } else if (epCoverRemoved) {
+          payload.cover_path = "";
+        }
+        const newMediaFiles = Array.from(($("ep-media-files") && $("ep-media-files").files) || []);
+        if (newMediaFiles.length) {
+          const fd = new FormData();
+          for (const f of newMediaFiles) fd.append("files", f);
+          const up = await api("/api/publish/upload", { method: "POST", body: fd });
+          payload.media_paths = (up.files || []).map(f => f.path);
+        }
         return api("/api/publish/" + id, {
-          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...value, scheduled_at }),
+          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
         });
       },
     });
   });
+  if (epPreviewBlobUrl) { URL.revokeObjectURL(epPreviewBlobUrl); epPreviewBlobUrl = ""; }
   if (value === null) return;
-  toast("发布任务已更新", "ok"); refreshPublish();
+  toast(value.keep_draft ? "本地草稿已保存" : "发布任务已更新", "ok"); refreshPublish();
 }
+function renderPublishStepsHtml(steps = []) {
+  if (!Array.isArray(steps) || !steps.length) return "";
+  return `<div class="pub-stepper">${steps.map(st => {
+    const cls = st.state === "done" ? "done" : st.state === "warn" ? "warn" : st.state === "active" ? "active" : "";
+    return `<span class="pub-step ${cls}">${esc(st.label)}</span>`;
+  }).join("")}</div>`;
+}
+function inferPublishStepsClient(stage) {
+  const labels = ["准备环境", "上传媒体", "填写文案", "校验/验证", "提交确认"];
+  const text = String(stage || "");
+  let idx = 0;
+  if (/提交|点击发布|确认发布|完成发布|等待结果/.test(text)) idx = 4;
+  else if (/验证|滑块|扫码|验证码|校验|风控/.test(text)) idx = 3;
+  else if (/标题|正文|文案|话题|分区|标签|填写/.test(text)) idx = 2;
+  else if (/上传|素材|视频|图片|封面|转码/.test(text)) idx = 1;
+  const warn = /安全验证|验证码|滑块|扫码/.test(text);
+  return labels.map((label, i) => ({
+    label,
+    state: i < idx ? "done" : i === idx ? (warn ? "warn" : "active") : "pending",
+  }));
+}
+const PUB_VERIFY_TOASTED = new Set();
+if (typeof window !== "undefined") {
+  window.addEventListener("creatorhub:progress:update", e => {
+    const task = e.detail?.task;
+    if (!task || task.category !== "publish") return;
+    const tid = Number(task.extra?.task_id || 0);
+    if (!tid) return;
+    const stageText = String(task.phase_label || "").trim();
+    const rowStage = $(`pub-stage-${tid}`);
+    if (rowStage && stageText) rowStage.textContent = stageText;
+    const rowStepper = $(`pub-stepper-${tid}`);
+    if (rowStepper) {
+      rowStepper.innerHTML = renderPublishStepsHtml(task.steps?.length ? task.steps : inferPublishStepsClient(stageText));
+    }
+    if (task.status === "waiting_user" && stageText && !PUB_VERIFY_TOASTED.has(`${tid}:${stageText}`)) {
+      PUB_VERIFY_TOASTED.add(`${tid}:${stageText}`);
+      toast(stageText, "info", 10000);
+    }
+    if (["completed", "failed", "canceled"].includes(task.status)) {
+      const isDraftTask = task.extra?.publish_action === "draft" || /草稿/.test(stageText);
+      if (task.status === "completed") toast(`「${task.title}」${isDraftTask ? "已存平台草稿 ✓" : "发布成功 ✓"}`, "ok", 5500);
+      else if (task.status === "failed" && task.error) toast(`${isDraftTask ? "平台草稿保存" : "发布"}未成功：${task.error}`, "err", 7000);
+      if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB === "publish") refreshPublish();
+    }
+  });
+}
+
+function renderPublishRows() {
+  const tbody = $("pub-table");
+  if (!tbody) return;
+  const filter = $("pub-status-filter")?.value || "";
+  const allRows = Array.isArray(PUBLISH_TASKS) ? PUBLISH_TASKS : [];
+  const rows = filter ? allRows.filter(t => t.status === filter) : allRows;
+  if ($("tb-pub")) $("tb-pub").textContent = allRows.length;
+  tbody.innerHTML = rows.map(t => {
+    const accObj = (typeof findAnyAccount === "function" && findAnyAccount(t.account_id)) || ACCOUNTS.find(a => a.id === t.account_id);
+    const pubAcc = accObj ? (accObj.alias || accObj.nickname || `账号 #${t.account_id}`) : (t.account_id ? `账号 #${t.account_id}` : "—");
+    const pfBadge = GLOBAL_MODE ? `<span class="mx-mini-pf inline" style="margin-right:6px">${esc(PF_NAME[t.platform] || t.platform)}</span>` : "";
+    const liveTask = window.CreatorHubProgress?.getTask?.(`publish:${t.id}`);
+    const stageText = String(liveTask?.phase_label || t.live_stage || "执行中，请等待结果");
+    const stepsHtml = t.status === "publishing"
+      ? `<div id="pub-stepper-${t.id}">${renderPublishStepsHtml(liveTask?.steps?.length ? liveTask.steps : inferPublishStepsClient(stageText))}</div>`
+      : "";
+    const isLocalDraft = t.status === "draft" && !t.schedule_needs_confirmation;
+    const isPlatformDraft = t.publish_action === "draft";
+    const metaBadges = [];
+    if (isPlatformDraft) {
+      metaBadges.push(`<span class="pub-badge-mini draft" title="执行后保存到目标平台草稿箱，不公开发布">平台草稿</span>`);
+    }
+    if (t.has_cover) {
+      const coverSrc = esc(t.cover_url || `/api/publish/${t.id}/cover`);
+      metaBadges.push(`<img class="pub-cover-thumb" src="${coverSrc}" alt="自定义封面" title="点击预览自定义封面" onclick="openPubCoverPreview(${t.id}, ${jsArg(t.title || '自定义封面')})">`);
+      metaBadges.push(`<span class="pub-badge-mini cover" title="${esc(t.cover_name || '已设置自定义封面')}">自定义封面</span>`);
+    }
+    const mediaCell = isLocalDraft && !(t.media_count || 0) && t.platform !== "twitter" && t.platform !== "facebook"
+      ? `<span class="mut">未选素材（草稿）</span>`
+      : ((t.platform === "twitter" || t.platform === "facebook") && !(t.media_count || 0)
+        ? "纯文本"
+        : `${t.media_type === "video" ? "视频" : "图文"} · <span class="mut num">${t.media_count || 0}</span>`);
+    const openInCreatorBrowser = Boolean(
+      isPlatformDraft
+      || ["kuaishou", "shipinhao", "tiktok"].includes(t.platform)
+      || (t.platform === "bilibili" && String(t.result_url || "").includes("member.bilibili.com"))
+    );
+    const resultLink = t.result_url
+      ? (openInCreatorBrowser
+        ? ` <a href="javascript:void(0)" onclick="openPubInBrowser(${Number(t.account_id)}, ${jsArg(t.result_url)}, ${jsArg(t.platform)}, ${jsArg(t.publish_action || 'publish')})">${isPlatformDraft ? "打开草稿箱" : "查看"}</a>`
+        : ` <a href="${esc(safeHttpUrl(t.result_url))}" target="_blank" rel="noopener noreferrer">查看</a>`)
+      : "";
+    const runLabel = isPlatformDraft ? "立即存草稿" : "立即发布";
+    return `<tr>
+    <td class="wrap" style="max-width:250px"><b>${esc(t.title || "(无标题)")}</b>${metaBadges.length ? `<div class="pub-meta-badges">${metaBadges.join("")}</div>` : ""}</td>
+    <td>${pfBadge}${esc(pubAcc)}</td>
+    <td>${mediaCell}</td>
+    <td>${t.source_platform ? esc(PF_NAME[t.source_platform] || t.source_platform) + " 转发" : "手动"}</td>
+    <td class="mut num">${t.scheduled_at ? new Date(t.scheduled_at).toLocaleString() : "尽快"}${t.next_allowed_at ? `<div class="mut" title="预约保持不变，同时等待风控间隔结束">风控最早 ${esc(riskTime(t.next_allowed_at))}</div>` : ""}</td>
+    <td><span class="pill ${pubStatusPill(t)}">${pubStatusLabel(t)}</span>${t.error ? ` <span class="warn-ic" title="${esc(t.error)}">${ic("i-info")}</span>` : ""}${resultLink}${t.status === "publishing" ? `<div class="mut" id="pub-stage-${t.id}" style="margin-top:4px;white-space:normal;max-width:240px">${esc(stageText)}</div>${stepsHtml}` : (t.status === "pending" && t.blocked_reason ? `<div class="mut" style="margin-top:4px;white-space:normal;max-width:220px;color:var(--warn)">${esc(t.blocked_reason)}</div>` : "")}</td>
+    <td class="acttd">
+      ${isLocalDraft ? `<button class="ghost sm" onclick="enqueuePublish(${t.id})">${isPlatformDraft ? "加入草稿队列" : "入队发布"}</button>` : ""}
+      ${(isLocalDraft || ["pending", "failed"].includes(t.status)) ? `<button class="ghost sm" onclick="runPublish(${t.id})">${runLabel}</button>` : ""}
+      ${["draft", "pending", "failed", "canceled"].includes(t.status) ? `<button class="ghost sm" onclick="editPublish(${t.id})">${t.schedule_needs_confirmation ? "确认预约时间" : "编辑"}</button>` : ""}
+      ${t.status === "uncertain" ? `<button class="ghost sm" onclick="resolveTaskResult('publishes',${t.id})">核对结果</button>` : t.status === "publishing" ? "" : `<button class="ghost sm danger" onclick="delPublish(${t.id})">${ic("i-trash")}删除</button>`}
+    </td></tr>`;
+  }).join("") || empty(7, filter ? "当前筛选状态下暂无发布任务" : "暂无发布任务", "i-send",
+      filter ? "可切换顶部状态筛选查看本地草稿、排队中或已完成记录"
+      : PLATFORM === "kuaishou" ? "上传图集/视频加入队列或存为本地草稿(发布到快手创作平台)"
+      : PLATFORM === "douyin" ? "上传图集/视频加入队列或存为本地草稿(发布到抖音创作平台)"
+      : PLATFORM === "tiktok" ? "上传单个视频加入队列或存为本地草稿(发布到 TikTok Studio)"
+      : PLATFORM === "bilibili" ? "上传视频稿件或图文动态加入队列或存为本地草稿(发布到哔哩哔哩创作中心)"
+      : PLATFORM === "instagram" ? "上传单图 / 轮播 / Reels / Story 加入队列(发布到 Instagram)"
+      : PLATFORM === "twitter" ? "编写纯文本推文，或上传最多 4 图 / 单个视频加入队列(发布到 X / Twitter)"
+      : PLATFORM === "facebook" ? "编写纯文本帖子，或上传最多 20 图 / 单个视频加入队列(发布到 Facebook 主页/公共主页/群组/Story)"
+      : PLATFORM === "youtube" ? "上传视频或 Shorts 加入队列(通过 YouTube Studio 自动完成填写与发布)"
+      : "上传图集/视频加入队列、存为本地草稿，或在作品列表一键跨平台转发");
+}
+
 async function refreshPublish() {
   const isCurrent = beginViewRequest("publish");
   if (!$("pub-table")) return;
   const rows = await api("/api/publish" + (GLOBAL_MODE ? "" : "?platform=" + (pfHasPublish(PLATFORM) ? PLATFORM : "xhs")));
   if (!isCurrent()) return;
   PUBLISH_TASKS = rows;
-  if ($("tb-pub")) $("tb-pub").textContent = rows.length;
-  $("pub-table").innerHTML = rows.map(t => {
-    const accObj = (typeof findAnyAccount === "function" && findAnyAccount(t.account_id)) || ACCOUNTS.find(a => a.id === t.account_id);
-    const pubAcc = accObj ? (accObj.alias || accObj.nickname || `账号 #${t.account_id}`) : (t.account_id ? `账号 #${t.account_id}` : "—");
-    const pfBadge = GLOBAL_MODE ? `<span class="mx-mini-pf inline" style="margin-right:6px">${esc(PF_NAME[t.platform] || t.platform)}</span>` : "";
-    return `<tr>
-    <td class="wrap" style="max-width:240px"><b>${esc(t.title || "(无标题)")}</b></td>
-    <td>${pfBadge}${esc(pubAcc)}</td>
-    <td>${(t.platform === "twitter" || t.platform === "facebook") && !(t.media_count || 0) ? "纯文本" : `${t.media_type === "video" ? "视频" : "图文"} · <span class="mut num">${t.media_count || 0}</span>`}</td>
-    <td>${t.source_platform ? esc(PF_NAME[t.source_platform] || t.source_platform) + " 转发" : "手动"}</td>
-    <td class="mut num">${t.scheduled_at ? new Date(t.scheduled_at).toLocaleString() : "尽快"}${t.next_allowed_at ? `<div class="mut" title="预约保持不变，同时等待风控间隔结束">风控最早 ${esc(riskTime(t.next_allowed_at))}</div>` : ""}</td>
-    <td><span class="pill ${PUB_PILL[t.status] || "pending"}">${PUB_ST[t.status] || t.status}</span>${t.error ? ` <span class="warn-ic" title="${esc(t.error)}">${ic("i-info")}</span>` : ""}${t.result_url ? ((["kuaishou", "shipinhao", "tiktok"].includes(t.platform) || (t.platform === "bilibili" && String(t.result_url).includes("member.bilibili.com"))) ? ` <a href="javascript:void(0)" onclick="openPubInBrowser(${Number(t.account_id)}, ${jsArg(t.result_url)}, ${jsArg(t.platform)})">查看</a>` : ` <a href="${esc(safeHttpUrl(t.result_url))}" target="_blank" rel="noopener noreferrer">查看</a>`) : ""}${t.status === "publishing" ? `<div class="mut" id="pub-stage-${t.id}" style="margin-top:4px;white-space:normal;max-width:200px">${esc(t.live_stage || "执行中，请等待结果")}</div>` : ""}</td>
-    <td class="acttd">
-      ${["pending", "failed"].includes(t.status) ? `<button class="ghost sm" onclick="runPublish(${t.id})">立即发布</button>` : ""}
-      ${["draft", "pending", "failed", "canceled"].includes(t.status) ? `<button class="ghost sm" onclick="editPublish(${t.id})">${t.schedule_needs_confirmation ? "确认预约时间" : "编辑"}</button>` : ""}
-      ${t.status === "uncertain" ? `<button class="ghost sm" onclick="resolveTaskResult('publishes',${t.id})">核对结果</button>` : t.status === "publishing" ? "" : `<button class="ghost sm danger" onclick="delPublish(${t.id})">${ic("i-trash")}删除</button>`}
-    </td></tr>`;
-  }).join("") || empty(7, "暂无发布任务", "i-send",
-      PLATFORM === "kuaishou" ? "上传图集/视频加入队列(发布到快手创作平台)"
-      : PLATFORM === "douyin" ? "上传图集/视频加入队列(发布到抖音创作平台)"
-      : PLATFORM === "tiktok" ? "上传单个视频加入队列(发布到 TikTok Studio)"
-      : PLATFORM === "bilibili" ? "上传视频稿件或图文动态加入队列(发布到哔哩哔哩创作中心)"
-      : PLATFORM === "instagram" ? "上传单图 / 轮播 / Reels / Story 加入队列(发布到 Instagram)"
-      : PLATFORM === "twitter" ? "编写纯文本推文，或上传最多 4 图 / 单个视频加入队列(发布到 X / Twitter)"
-      : PLATFORM === "facebook" ? "编写纯文本帖子，或上传最多 20 图 / 单个视频加入队列(发布到 Facebook 主页/公共主页/群组/Story)"
-      : "上传图集/视频加入队列,或在抖音作品上点「发小红书」转发过来");
+  renderPublishRows();
 }
-// 创作平台管理页必须复用账号自己的登录态，不能交给系统浏览器。
-async function openPubInBrowser(accountId, url, platform = "shipinhao") {
+// 创作平台管理页/草稿箱必须复用账号自己的登录态，不能交给系统浏览器。
+async function openPubInBrowser(accountId, url, platform = "shipinhao", publishAction = "publish") {
   if (!accountId) { toast("缺少账号信息", "err"); return; }
-  const pageName = platform === "kuaishou" ? "快手作品管理页"
-    : platform === "tiktok" ? "TikTok Studio 内容页"
-    : platform === "bilibili" ? "哔哩哔哩稿件管理页" : "视频号管理页";
+  const isDraft = publishAction === "draft";
+  const pfLabel = PF_NAME[platform] || "创作平台";
+  const pageName = isDraft
+    ? `${pfLabel}草稿箱`
+    : (platform === "kuaishou" ? "快手作品管理页"
+      : platform === "tiktok" ? "TikTok Studio 内容页"
+      : platform === "bilibili" ? "哔哩哔哩稿件管理页"
+      : platform === "shipinhao" ? "视频号管理页" : `${pfLabel}创作页`);
   toast("正在用该账号浏览器打开" + pageName + "…", "info", 5000);
   try {
     await api("/api/accounts/" + accountId + "/open-browser?url=" + encodeURIComponent(url || ""), { method: "POST" });
   } catch (e) { toast("打开失败:" + e.message, "err"); }
 }
-async function runPublish(id) {
-  const btn = evtBtn();
-  toast("发布中…会弹出浏览器窗口完成发布", "info", 8000);
-  let lastStage = "";
-  const stageTimer = setInterval(async () => {
+async function runPublish(id, closeOpenBrowser = false) {
+  const btn = closeOpenBrowser ? null : evtBtn();
+  const taskMeta = PUBLISH_TASKS.find(item => item.id === id);
+  const isPlatformDraft = taskMeta?.publish_action === "draft";
+  let res = null;
+  await withBusy(btn, "启动中", async () => {
     try {
-      const resp = await fetch("/api/publish?platform=" + encodeURIComponent(pfHasPublish(PLATFORM) ? PLATFORM : "xhs"));
-      if (!resp.ok) return;
-      const rows = await resp.json();
-      const row = Array.isArray(rows) ? rows.find(item => item.id === id) : null;
-      const stage = String(row?.live_stage || "").trim();
-      if (!stage) return;
-      _busyHint = stage.includes("安全验证") ? "请在弹出窗口完成验证" : stage.slice(0, 24);
-      const rowEl = $(`pub-stage-${id}`);
-      if (rowEl) rowEl.textContent = stage;
-      if (stage !== lastStage) {
-        lastStage = stage;
-        if (stage.includes("安全验证") || stage.includes("验证码") || stage.includes("扫码")) {
-          toast(stage, "info", 12000);
-        }
+      const qs = `?async_mode=true${closeOpenBrowser ? "&close_open_browser=true" : ""}`;
+      res = await api("/api/publish/" + id + "/run-now" + qs, { method: "POST" });
+      if (!res?.ok && res?.blocked_by === "open_browser" && !closeOpenBrowser) {
+        return;
       }
-    } catch (_) {}
-  }, 2000);
-  await withBusy(btn, "发布中", async () => {
-    try { const r = await api("/api/publish/" + id + "/run-now", { method: "POST" }); toast(r.ok ? "发布成功 ✓" : "发布未成功:" + (r.error || ""), r.ok ? "ok" : "err", 6000); }
-    catch (e) { toast("发布失败:" + e.message, "err"); }
-    finally { clearInterval(stageTimer); _busyHint = ""; }
+      if (res?.ok && res?.queued) {
+        toast(closeOpenBrowser
+          ? `已关闭手动窗口并启动后台${isPlatformDraft ? "保存平台草稿" : "发布"}，步骤进度将实时推送`
+          : `已启动后台${isPlatformDraft ? "保存平台草稿" : "发布"}，步骤进度可在列表与右上角活动中心实时查看`, "info", 5500);
+      } else {
+        toast(res.ok ? (isPlatformDraft ? "已存平台草稿 ✓" : "发布成功 ✓") : "执行未成功:" + (res.error || ""), res.ok ? "ok" : "err", 6000);
+      }
+    } catch (e) { toast("启动失败:" + e.message, "err"); }
   });
+  if (res && !res.ok && res.blocked_by === "open_browser" && !closeOpenBrowser) {
+    const task = PUBLISH_TASKS.find(item => item.id === id);
+    const aid = res.account_id || task?.account_id;
+    const accObj = aid ? ((typeof findAnyAccount === "function" && findAnyAccount(aid)) || ACCOUNTS.find(a => a.id === aid)) : null;
+    const accLabel = accObj ? (accObj.alias || accObj.nickname || `账号 #${aid}`) : (aid ? `账号 #${aid}` : "该账号");
+    const ok = await uiConfirm({
+      title: "该账号的浏览器窗口仍开着",
+      message: `账号「${accLabel}」手动打开的独立浏览器窗口尚未关闭，为避免 Profile 冲突当前无法同时执行。是否先自动保存登录态并关闭该窗口，然后立即${isPlatformDraft ? "保存平台草稿" : "发布"}？`,
+      okText: isPlatformDraft ? "关闭窗口并存草稿" : "关闭窗口并发布",
+    });
+    if (ok) {
+      return runPublish(id, true);
+    }
+    toast("已暂缓执行，关闭该账号浏览器窗口后将自动执行", "info", 5000);
+  }
   refreshPublish();
 }
 async function delPublish(id) {
@@ -12455,6 +14708,7 @@ const repostRednote = (id) => openRepost(id, "rednote");
 const repostInstagram = (id) => openRepost(id, "instagram");
 const repostTwitter = (id) => openRepost(id, "twitter");
 const repostFacebook = (id) => openRepost(id, "facebook");
+const repostYouTube = (id) => openRepost(id, "youtube");
 async function pickRepostTarget(id) {
   const rec = CONTENTS.find(r => r.id === id);
   const options = [
@@ -12468,7 +14722,10 @@ async function pickRepostTarget(id) {
     { value: "twitter", label: "Twitter" },
     { value: "facebook", label: "Facebook" },
   ];
-  if (!rec || rec.media_type === "video") options.push({ value: "tiktok", label: "TikTok" });
+  if (!rec || rec.media_type === "video") {
+    options.push({ value: "tiktok", label: "TikTok" });
+    options.push({ value: "youtube", label: "YouTube" });
+  }
   const target = await uiSelect({
     title: "转发作品",
     hint: "选择要发布到的平台，下一步可以继续编辑标题、文案和发布时间。",
@@ -12477,6 +14734,68 @@ async function pickRepostTarget(id) {
   });
   if (target === null) return;
   openRepost(id, target);
+}
+let rpCoverFile = null;
+let rpCoverPreviewUrl = "";
+function rpSetCover(file) {
+  if (!file) { rpClearCover(); return; }
+  const ext = (file.name || "").split(".").pop().toLowerCase();
+  if (!["jpg", "jpeg", "png", "webp"].includes(ext) && !(file.type || "").startsWith("image/")) {
+    toast("自定义封面仅支持 JPG / PNG / WEBP 图片", "err");
+    return;
+  }
+  rpCoverFile = file;
+  renderRpCover();
+}
+function rpClearCover() {
+  rpCoverFile = null;
+  const inp = $("rp-cover");
+  if (inp) inp.value = "";
+  renderRpCover();
+}
+function renderRpCover() {
+  const box = $("rp-cover-list");
+  if (!box) return;
+  if (rpCoverPreviewUrl) { URL.revokeObjectURL(rpCoverPreviewUrl); rpCoverPreviewUrl = ""; }
+  if (!rpCoverFile) { box.innerHTML = ""; return; }
+  rpCoverPreviewUrl = URL.createObjectURL(rpCoverFile);
+  box.innerHTML = `<span class="fp-chip"><img src="${rpCoverPreviewUrl}" alt="自定义封面"><span title="${esc(rpCoverFile.name)}">${esc(rpCoverFile.name)}</span><button type="button" onclick="rpClearCover()" aria-label="移除封面">${ic("i-x")}</button></span>`;
+}
+function onRpActionChange() {
+  const action = $("rp-action")?.value || "publish";
+  const btn = $("rp-submit");
+  if (btn && !btn.disabled) {
+    btn.innerHTML = `<svg aria-hidden="true"><use href="#i-send"/></svg>${action === "draft" ? "推送至平台草稿" : "确认推送"}`;
+  }
+  const msg = $("rp-msg");
+  if (msg && msg.dataset.tone === "neutral") {
+    msg.textContent = action === "draft" ? "确认后加入目标平台草稿队列（不公开发布）" : "确认后加入发布队列";
+  }
+}
+function bindRepostCoverPicker() {
+  const inp = $("rp-cover"), zone = $("rp-cover-drop");
+  if (inp && zone && !inp._rpCoverBound) {
+    inp._rpCoverBound = true;
+    inp.addEventListener("change", e => {
+      const f = e.target.files && e.target.files[0];
+      if (f) rpSetCover(f);
+    });
+    ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add("drag"); }));
+    ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => {
+      e.preventDefault();
+      if (ev === "dragleave" && zone.contains(e.relatedTarget)) return;
+      zone.classList.remove("drag");
+    }));
+    zone.addEventListener("drop", e => {
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) rpSetCover(f);
+    });
+  }
+  const actionSel = $("rp-action");
+  if (actionSel && !actionSel._rpActionBound) {
+    actionSel._rpActionBound = true;
+    actionSel.addEventListener("change", () => onRpActionChange());
+  }
 }
 async function openRepost(id, target) {
   const rec = CONTENTS.find(r => r.id === id);
@@ -12505,6 +14824,8 @@ async function openRepost(id, target) {
                   ? "请先在 Twitter 账号页完成登录"
                   : target === "facebook"
                     ? "请先在 Facebook 账号页完成登录"
+                  : target === "youtube"
+                    ? "请先在 YouTube 账号页完成登录"
                 : "请先在抖音账号页完成登录(扫码/创作者/Cookie)";
     toast(loginHint, "err");
     return;
@@ -12519,8 +14840,9 @@ async function openRepost(id, target) {
   const isIg = target === "instagram";
   const isTw = target === "twitter";
   const isFb = target === "facebook";
-  const cap = isFb ? 5000 : isTw ? 280 : isIg ? 2200 : isBili ? 80 : isRn ? 40 : isDy ? 30 : isChannels ? 16 : 20;
-  const pname = isDy ? "抖音" : isChannels ? "视频号" : isKs ? "快手" : isTk ? "TikTok" : isBili ? "哔哩哔哩" : isIg ? "Instagram" : isTw ? "Twitter" : isFb ? "Facebook" : isRn ? "海外小红书" : "小红书";
+  const isYt = target === "youtube";
+  const cap = isFb ? 5000 : isTw ? 280 : isIg ? 2200 : isYt ? 100 : isBili ? 80 : isRn ? 40 : isDy ? 30 : isChannels ? 16 : 20;
+  const pname = isDy ? "抖音" : isChannels ? "视频号" : isKs ? "快手" : isTk ? "TikTok" : isBili ? "哔哩哔哩" : isIg ? "Instagram" : isTw ? "Twitter" : isFb ? "Facebook" : isYt ? "YouTube" : isRn ? "海外小红书" : "小红书";
   $("rp-head").textContent = "发" + pname + " · 编辑后推送";
   $("rp-title-label").textContent = `标题(≤${cap} 字)`;
   $("rp-title").maxLength = cap;
@@ -12531,6 +14853,8 @@ async function openRepost(id, target) {
   $("rp-desc").value = desc;
   $("rp-topics").value = "";
   $("rp-when").value = ""; dtSyncAll();
+  if ($("rp-action")) { $("rp-action").value = "publish"; $("rp-action")._csSync?.(); }
+  rpClearCover();
   $("rp-msg").textContent = "确认后加入发布队列";
   $("rp-msg").dataset.tone = "neutral";
   $("rp-msg").setAttribute("role", "status");
@@ -12540,6 +14864,8 @@ async function openRepost(id, target) {
   if (isDy) { if ($("rp-visibility")) $("rp-visibility").value = "public"; if ($("rp-allowsave")) $("rp-allowsave").value = "1"; }
   renderRepostThumbs(id);   // 异步拉媒体缩略图,不阻塞弹窗
   $("rp-submit").disabled = false;
+  if ($("rp-save-draft")) $("rp-save-draft").disabled = false;
+  onRpActionChange();
   $("repost").style.display = "flex";
   $("rp-body").scrollTop = 0;
   modalOpened($("repost"));
@@ -12628,21 +14954,25 @@ function rpMediaOrder() {
   return unchanged ? null : order;
 }
 function hideRepost() {
-  if ($("rp-submit").disabled) return;
+  if ($("rp-submit").disabled || $("rp-save-draft")?.disabled) return;
+  rpClearCover();
   $("repost").style.display = "none"; REPOST_ID = null;
   modalClosed($("repost"));
 }
-async function submitRepost() {
-  if (REPOST_ID === null || $("rp-submit").disabled) return;
+async function submitRepost(opts = {}) {
+  const saveAsDraft = Boolean(opts && opts.saveAsDraft);
+  if (REPOST_ID === null || $("rp-submit").disabled || $("rp-save-draft")?.disabled) return;
   const accId = +$("rp-acc").value;
   if (!accId) { toast("请选择发布账号", "err"); return; }
-  const btn = $("rp-submit"), modal = $("repost");
+  const btn = saveAsDraft ? ($("rp-save-draft") || $("rp-submit")) : $("rp-submit");
+  const modal = $("repost");
   let success = false;
   $("rp-body").inert = true; modal.setAttribute("aria-busy", "true");
-  modal.querySelectorAll(".pv-close,#rp-actions .ghost").forEach(button => { button.disabled = true; });
+  modal.querySelectorAll(".pv-close,#rp-actions button").forEach(button => { button.disabled = true; });
   $("rp-msg").dataset.tone = "neutral"; $("rp-msg").setAttribute("role", "status");
-  $("rp-msg").textContent = "提交中…";
+  $("rp-msg").textContent = rpCoverFile ? "上传自定义封面…" : "提交中…";
   $("rp-msg").focus({ preventScroll: true });
+  const publishAction = $("rp-action")?.value === "draft" ? "draft" : "publish";
   const body = {
     account_id: accId,
     title: $("rp-title").value.trim(),
@@ -12652,6 +14982,9 @@ async function submitRepost() {
     visibility: $("rp-visibility") ? $("rp-visibility").value : "public",
     allow_save: $("rp-allowsave") ? $("rp-allowsave").value !== "0" : true,
     media_order: rpMediaOrder(),
+    cover_path: "",
+    publish_action: publishAction,
+    save_as_draft: saveAsDraft,
   };
   const pname = REPOST_TARGET === "douyin" ? "抖音"
     : REPOST_TARGET === "shipinhao" ? "视频号"
@@ -12661,13 +14994,26 @@ async function submitRepost() {
     : REPOST_TARGET === "instagram" ? "Instagram"
     : REPOST_TARGET === "twitter" ? "Twitter"
     : REPOST_TARGET === "facebook" ? "Facebook"
+    : REPOST_TARGET === "youtube" ? "YouTube"
     : REPOST_TARGET === "rednote" ? "海外小红书" : "小红书";
   try {
     body.scheduled_at = scheduleToApi(body.scheduled_at);
-    const r = await withBusy(btn, "提交中", () => api("/api/contents/" + REPOST_ID + "/repost-" + REPOST_TARGET, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    }));
-    toast((body.scheduled_at ? "已加入定时发布队列" : `已加入${pname}发布队列`) + "(任务 #" + r.task_id + ")", "ok");
+    const r = await withBusy(btn, saveAsDraft ? "暂存中" : "提交中", async () => {
+      if (rpCoverFile) {
+        body.cover_path = await uploadSingleCoverFile(rpCoverFile);
+        $("rp-msg").textContent = "提交中…";
+      }
+      return api("/api/contents/" + REPOST_ID + "/repost-" + REPOST_TARGET, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+    });
+    if (saveAsDraft) {
+      toast(`已存为${pname}本地草稿 (任务 #${r.task_id})`, "ok");
+    } else if (publishAction === "draft") {
+      toast(`已加入${pname}平台草稿队列 (任务 #${r.task_id})`, "ok");
+    } else {
+      toast((body.scheduled_at ? "已加入定时发布队列" : `已加入${pname}发布队列`) + "(任务 #" + r.task_id + ")", "ok");
+    }
     success = true;
   } catch (e) {
     $("rp-msg").textContent = "提交未完成：" + e.message;
@@ -12675,7 +15021,7 @@ async function submitRepost() {
     $("rp-msg").focus({ preventScroll: true });
   } finally {
     $("rp-body").inert = false; modal.removeAttribute("aria-busy");
-    modal.querySelectorAll(".pv-close,#rp-actions .ghost").forEach(button => { button.disabled = false; });
+    modal.querySelectorAll(".pv-close,#rp-actions button").forEach(button => { button.disabled = false; });
   }
   if (success) { hideRepost(); if (typeof refreshPublish === "function") refreshPublish(); }
 }
@@ -12685,6 +15031,8 @@ async function submitRepost() {
 let AC_RULES = [];
 let AC_TASKS = [];
 let AC_POLICY_META = null;
+let AC_REVIEW_USER_CHOICE = null;
+let AC_REVIEW_PLATFORM = "";
 const AC_SELECTED_TASKS = new Set();
 
 const AC_MODE_T = { auto_reply: "自动回复", auto_comment: "自动评论" };
@@ -12705,7 +15053,7 @@ const AC_SRC_META = {
 };
 const AC_TASK_ST = { draft: "草稿待审", pending: "排队中", doing: "发送中", uncertain: "结果待确认", done: "已发送", failed: "失败", canceled: "已取消" };
 const AC_TASK_PILL = { draft: "downloading", pending: "pending", doing: "downloading", uncertain: "downloading", done: "done", failed: "failed", canceled: "invalid" };
-const AC_KEYWORD_PLATFORMS = ["xhs", "bilibili", "instagram", "twitter", "facebook"];
+const AC_KEYWORD_PLATFORMS = ["xhs", "bilibili", "instagram", "twitter", "facebook", "youtube"];
 
 function acKindOptionsFor(platform, mode) {
   if (mode === "auto_comment") {
@@ -12716,26 +15064,26 @@ function acKindOptionsFor(platform, mode) {
   return '<option value="self">自己近期作品</option><option value="work">指定作品</option>';
 }
 function acTargetMeta(platform, mode, kind) {
-  const xhs = platform === "xhs", bili = platform === "bilibili", ig = platform === "instagram", tw = platform === "twitter", fb = platform === "facebook";
+  const xhs = platform === "xhs", bili = platform === "bilibili", ig = platform === "instagram", tw = platform === "twitter", fb = platform === "facebook", yt = platform === "youtube";
   if (mode === "auto_reply") {
     if (kind === "self") return { show: false, label: "目标", ph: "" };
     return {
       show: true,
-      label: xhs ? "笔记链接 / id" : tw ? "推文链接 / status_id" : fb ? "帖子 / Reel / Watch 链接" : "作品链接 / id",
-      ph: xhs ? "explore 链接 / xhslink / note_id" : bili ? "视频链接 / BV或av号 / opus链接" : ig ? "instagram.com/p/... 或 /reel/... 链接" : tw ? "x.com/.../status/... 链接或数字推文 ID" : fb ? "facebook.com 帖子/Reel/Watch 链接或 fb.watch 短链" : "作品链接 / 短链 / 数字 id",
+      label: xhs ? "笔记链接 / id" : tw ? "推文链接 / status_id" : fb ? "帖子 / Reel / Watch 链接" : yt ? "YouTube 视频 / Shorts 链接" : "作品链接 / id",
+      ph: xhs ? "explore 链接 / xhslink / note_id" : bili ? "视频链接 / BV或av号 / opus链接" : ig ? "instagram.com/p/... 或 /reel/... 链接" : tw ? "x.com/.../status/... 链接或数字推文 ID" : fb ? "facebook.com 帖子/Reel/Watch 链接或 fb.watch 短链" : yt ? "youtube.com/watch?v=...、youtu.be/... 或 /shorts/..." : "作品链接 / 短链 / 数字 id",
     };
   }
   if (kind === "keyword") {
     return {
       show: true,
       label: "搜索关键词",
-      ph: tw ? "例如:AI agent / #buildinpublic" : fb ? "例如:跨境电商 / marketing tips" : ig ? "例如:#travel / skincare" : "例如:露营装备 / 口红试色",
+      ph: tw ? "例如:AI agent / #buildinpublic" : fb ? "例如:跨境电商 / marketing tips" : yt ? "例如:AI tutorial / tech review" : ig ? "例如:#travel / skincare" : "例如:露营装备 / 口红试色",
     };
   }
   return {
     show: true,
-    label: xhs ? "博主主页 / id" : bili ? "UP 主空间主页 / mid" : (ig || tw) ? "创作者主页 / @username" : fb ? "主页 / 公共主页 / 群组链接" : "博主主页 / sec_uid",
-    ph: xhs ? "主页链接 / xhslink / user_id" : bili ? "space.bilibili.com 链接 / mid" : ig ? "instagram.com/<username> 或 @username" : tw ? "x.com/<username> 或 @username" : fb ? "facebook.com/<page>、/groups/<id> 或 profile.php?id=..." : "主页链接 / 短链 / sec_uid",
+    label: xhs ? "博主主页 / id" : bili ? "UP 主空间主页 / mid" : (ig || tw) ? "创作者主页 / @username" : fb ? "主页 / 公共主页 / 群组链接" : yt ? "YouTube 频道 / @handle" : "博主主页 / sec_uid",
+    ph: xhs ? "主页链接 / xhslink / user_id" : bili ? "space.bilibili.com 链接 / mid" : ig ? "instagram.com/<username> 或 @username" : tw ? "x.com/<username> 或 @username" : fb ? "facebook.com/<page>、/groups/<id> 或 profile.php?id=..." : yt ? "youtube.com/@handle 或 /channel/UC..." : "主页链接 / 短链 / sec_uid",
   };
 }
 function acParseKwInput(text) {
@@ -12782,10 +15130,37 @@ function populateAcAiSelectors() {
   }
   csSyncAll();
 }
+function openAcEngineReviewSettings(policyOverride = null) {
+  const p = policyOverride || AC_POLICY_META?.policy;
+  const pf = p?.platform || PLATFORM;
+  const focusId = p?.xhs_manual_only
+    ? "engine-xhs_comment_write_mode"
+    : (pf === "xhs" ? "engine-xhs_comment_review_before_publish" : "");
+  if ($("uimodal") && getComputedStyle($("uimodal")).display !== "none" && typeof _uiClose === "function") {
+    _uiClose(null);
+  }
+  if (typeof openEngineSettingsSection === "function") {
+    openEngineSettingsSection(focusId);
+  }
+}
+function resetAcReviewDefaultForPlatform(pf = PLATFORM) {
+  AC_REVIEW_PLATFORM = pf;
+  AC_REVIEW_USER_CHOICE = null;
+  const cb = $("ac-review");
+  if (cb) {
+    cb.disabled = false;
+    cb.checked = pf === "xhs";
+  }
+  syncAcCreatePolicySummary();
+}
+function onAcReviewToggle() {
+  AC_REVIEW_PLATFORM = PLATFORM;
+  AC_REVIEW_USER_CHOICE = Boolean($("ac-review")?.checked);
+  syncAcCreatePolicySummary();
+}
 function renderAcPolicyBars() {
   const p = AC_POLICY_META?.policy;
-  if (!p) return;
-  const aiOk = p.ai_enabled && p.ai_route?.ready;
+  if (!p || p.platform !== PLATFORM) return;
   const aiTxt = !p.ai_enabled
     ? "AI 文案总开关未开启"
     : p.ai_route?.ready
@@ -12798,29 +15173,65 @@ function renderAcPolicyBars() {
     capParts.push(`全局最小间隔 ${Math.max(p.risk_comment_min_gap_seconds, p.legacy_comment_min_gap_seconds)} 秒`);
   }
   const limitTxt = capParts.length ? capParts.join(" · ") : "风控评论限额未开启（仅按规则自身参数）";
+  const xhsLocked = Boolean(p.xhs_manual_only || p.xhs_review_forced);
   const reviewTxt = p.xhs_manual_only
-    ? "小红书当前为「仅保存草稿」模式，不会自动发送"
+    ? "小红书当前为「仅保存草稿」模式，不会自动发送（可在采集与运行设置修改）"
     : p.xhs_review_forced
-      ? "小红书已开启「全局先审后发」，所有规则生成后均先入草稿"
-      : "审核状态由各规则单独控制";
+      ? "小红书已开启「全局强制先审」，将覆盖单条规则设置并全部先入草稿（可在采集与运行设置关闭）"
+      : "审核状态由各规则自身「发布前审核」开关决定";
 
   const rulesBar = $("ac-rules-policy-bar");
   if (rulesBar) {
-    rulesBar.dataset.state = (p.ai_enabled && !p.ai_route?.ready) ? "warn" : "ok";
+    rulesBar.dataset.state = ((p.ai_enabled && !p.ai_route?.ready) || xhsLocked) ? "warn" : "ok";
     if ($("ac-rules-policy-title")) $("ac-rules-policy-title").textContent = `${PF_NAME[PLATFORM] || PLATFORM} 生效策略 · ${aiTxt}`;
     if ($("ac-rules-policy-desc")) $("ac-rules-policy-desc").textContent = `${limitTxt} · ${reviewTxt}`;
   }
   syncAcCreatePolicySummary();
 }
 function syncAcCreatePolicySummary() {
-  const p = AC_POLICY_META?.policy;
+  const rawPolicy = AC_POLICY_META?.policy;
+  const p = (rawPolicy && rawPolicy.platform === PLATFORM) ? rawPolicy : null;
+  if (AC_REVIEW_PLATFORM !== PLATFORM) {
+    AC_REVIEW_PLATFORM = PLATFORM;
+    AC_REVIEW_USER_CHOICE = null;
+  }
+  const userReviewChoice = AC_REVIEW_USER_CHOICE !== null ? AC_REVIEW_USER_CHOICE : (PLATFORM === "xhs");
+  const xhsManualOnly = Boolean(p?.xhs_manual_only);
+  const xhsReviewForced = Boolean(p?.xhs_review_forced);
+  const reviewLocked = xhsManualOnly || xhsReviewForced;
+
+  const reviewCb = $("ac-review");
+  if (reviewCb) {
+    reviewCb.disabled = reviewLocked;
+    reviewCb.checked = reviewLocked ? true : userReviewChoice;
+  }
+  if ($("ac-review-row")) $("ac-review-row").classList.toggle("is-locked", reviewLocked);
+  if ($("ac-review-title")) {
+    $("ac-review-title").textContent = reviewLocked
+      ? "发布前先存草稿人工审核（已被全局设置锁定）"
+      : "发布前先存草稿人工审核";
+  }
+  if ($("ac-review-unlock-btn")) {
+    $("ac-review-unlock-btn").hidden = !reviewLocked;
+    $("ac-review-unlock-btn").textContent = xhsManualOnly ? "去修改发送方式 →" : "去设置关闭 →";
+  }
+  if ($("ac-review-help")) {
+    $("ac-review-help").textContent = xhsManualOnly
+      ? "当前小红书评论通道为「仅保存草稿」，无论单条规则如何设置，所有任务均只存草稿不会自动发送。"
+      : xhsReviewForced
+        ? "当前「设置 → 采集与运行」开启了小红书全局强制先审，将覆盖单条规则设置；关闭全局锁后即可自由切换。"
+        : PLATFORM === "xhs"
+          ? "小红书新建规则默认勾选以降低风控；取消勾选后，新生成的评论将直接排队发送。"
+          : "推荐开启：生成后进入「任务与审核」核对原文与拟发文案，通过后再按节流发出。";
+  }
+
   const banner = $("ac-create-policy-banner");
   if (!banner || !p) return;
   const cm = $("ac-compose-mode")?.value || "template_only";
   const ruleGap = Math.max(1, Number($("ac-gap")?.value) || 90);
   const ruleCap = Math.max(0, Number($("ac-cap")?.value) || 0);
   const effGap = Math.max(ruleGap, p.risk_comment_min_gap_seconds || 0, p.legacy_comment_min_gap_seconds || 0);
-  const reviewOn = Boolean($("ac-review")?.checked) || p.xhs_review_forced || p.xhs_manual_only;
+  const reviewOn = reviewLocked || userReviewChoice;
   const warnReasons = [];
   if (acUsesAi(cm) && !p.ai_enabled) warnReasons.push("当前选了 AI 生成，但「设置 → AI 文案」总开关尚未开启");
   else if (acUsesAi(cm) && !p.ai_route?.ready) warnReasons.push(`AI 模型未就绪（${p.ai_route?.reason || "请先配置"}）`);
@@ -12830,12 +15241,10 @@ function syncAcCreatePolicySummary() {
   if ($("ac-mode")?.value === "auto_comment" && acc && String(acc.account_role || "hybrid").toLowerCase() === "publish") {
     warnReasons.push("所选账号为「发布主号 (publish)」，不允许创建主动评论规则");
   }
-  if ($("ac-review-help")) {
-    $("ac-review-help").textContent = p.xhs_manual_only
-      ? "当前小红书评论通道为「仅保存草稿」，无论是否勾选均只存草稿。"
-      : p.xhs_review_forced
-        ? "当前「设置 → 采集与运行」开启了小红书全局先审后发，本规则会自动先存草稿。"
-        : "推荐开启：生成后进入「任务与审核」核对原文与拟发文案，通过后再按节流发出。";
+  if (xhsManualOnly) {
+    warnReasons.push("小红书评论发送方式为「仅保存草稿」，生成的任务不会自动发送");
+  } else if (xhsReviewForced) {
+    warnReasons.push("小红书已开启「全局强制先审」，将覆盖单条规则设置并全部先入草稿");
   }
   banner.dataset.state = warnReasons.length ? "warn" : "ok";
   if ($("ac-create-policy-title")) {
@@ -12850,8 +15259,10 @@ function syncAcCreatePolicySummary() {
   }
 }
 async function refreshAcPolicyMeta() {
+  const reqPlatform = PLATFORM;
   try {
-    const data = await api("/api/comment-rules/effective-policy?platform=" + encodeURIComponent(PLATFORM));
+    const data = await api("/api/comment-rules/effective-policy?platform=" + encodeURIComponent(reqPlatform));
+    if (reqPlatform !== PLATFORM) return;
     AC_POLICY_META = data;
     populateAcAiSelectors();
     renderAcPolicyBars();
@@ -12884,6 +15295,22 @@ function onAcMode() {
   if ([...k.options].some(o => o.value === prev)) k.value = prev;
   onAcKind();
 }
+function syncAcFilterLinkage() {
+  const matchMode = $("ac-match-mode")?.value || "any";
+  const kwInput = $("ac-include-kw");
+  const kwWrap = $("ac-include-kw-wrap");
+  const disabled = matchMode === "all";
+  if (kwInput) {
+    kwInput.disabled = disabled;
+    kwInput.placeholder = disabled
+      ? "当前为「不过滤」模式，包含关键词不生效"
+      : "例如：链接, 哪里买, 教程, 多少钱（留空=不限）";
+  }
+  if (kwWrap) kwWrap.style.opacity = disabled ? "0.55" : "";
+  const isSingleWork = $("ac-mode")?.value === "auto_reply" && $("ac-kind")?.value === "work";
+  if ($("ac-recent-works-wrap")) $("ac-recent-works-wrap").style.display = isSingleWork ? "none" : "";
+  if ($("ac-recent-days-wrap")) $("ac-recent-days-wrap").style.display = isSingleWork ? "none" : "";
+}
 function onAcKind() {
   const mode = $("ac-mode").value, kind = $("ac-kind").value;
   const meta = acTargetMeta(PLATFORM, mode, kind);
@@ -12892,6 +15319,7 @@ function onAcKind() {
   $("ac-target").placeholder = meta.ph;
   if ($("ac-scope-wrap")) $("ac-scope-wrap").style.display = mode === "auto_reply" ? "" : "none";
   onAcComposeModeChange();
+  syncAcFilterLinkage();
   syncAcCreatePolicySummary();
   csSyncAll();
 }
@@ -12913,6 +15341,11 @@ async function addCommentRule() {
   }
   const inc = acParseKwInput($("ac-include-kw")?.value || "");
   const exc = acParseKwInput($("ac-skip")?.value || "");
+  const activePolicy = (AC_POLICY_META?.policy?.platform === PLATFORM) ? AC_POLICY_META.policy : null;
+  const reviewLocked = Boolean(activePolicy && (activePolicy.xhs_review_forced || activePolicy.xhs_manual_only));
+  const requireReviewVal = reviewLocked
+    ? Boolean(AC_REVIEW_USER_CHOICE !== null ? AC_REVIEW_USER_CHOICE : (PLATFORM === "xhs"))
+    : Boolean($("ac-review").checked);
   const body = {
     platform: PLATFORM,
     name: ($("ac-name")?.value || "").trim(),
@@ -12928,7 +15361,7 @@ async function addCommentRule() {
     ai_preset_id: $("ac-ai-preset")?.value || "",
     ai_prompt: ($("ac-ai-prompt")?.value || "").trim(),
     ai_max_chars: Math.max(0, Number($("ac-ai-max-chars")?.value) || 0),
-    require_review: $("ac-review").checked,
+    require_review: requireReviewVal,
     match_mode: $("ac-match-mode")?.value || "any",
     include_keywords: inc,
     exclude_keywords: exc,
@@ -12953,6 +15386,7 @@ async function addCommentRule() {
       if ($("ac-ai-prompt")) $("ac-ai-prompt").value = "";
       if ($("ac-include-kw")) $("ac-include-kw").value = "";
       if ($("ac-skip")) $("ac-skip").value = "";
+      resetAcReviewDefaultForPlatform(PLATFORM);
       $("ac-msg").textContent = "规则已创建（默认关闭），点「试跑预览」核对命中与文案后再启用 ✓";
       toast("规则已创建", "ok"); refreshCommentRules();
       globalThis.CreatorHubWorkbench?.completed?.("autocomment");
@@ -12969,6 +15403,19 @@ function emOnMode() {
   if ([...k.options].some(o => o.value === prev)) k.value = prev;
   emOnKind();
 }
+function emSyncFilterLinkage() {
+  const disabled = ($("em-match-mode")?.value || "any") === "all";
+  const kwInput = $("em-include-kw");
+  const kwWrap = $("em-include-kw-wrap");
+  if (kwInput) {
+    kwInput.disabled = disabled;
+    kwInput.placeholder = disabled ? "当前为「不过滤」模式，包含关键词不生效" : "逗号/中文逗号/换行分隔，留空不限";
+  }
+  if (kwWrap) kwWrap.style.opacity = disabled ? "0.55" : "";
+  const isSingleWork = $("em-mode")?.value === "auto_reply" && $("em-kind")?.value === "work";
+  if ($("em-recent-works-wrap")) $("em-recent-works-wrap").style.display = isSingleWork ? "none" : "";
+  if ($("em-recent-days-wrap")) $("em-recent-days-wrap").style.display = isSingleWork ? "none" : "";
+}
 function emOnKind() {
   const mode = $("em-mode").value, kind = $("em-kind").value;
   const meta = acTargetMeta(EM_PF, mode, kind);
@@ -12976,6 +15423,7 @@ function emOnKind() {
   $("em-target-label").textContent = meta.label;
   $("em-target").placeholder = meta.ph;
   if ($("em-scope-wrap")) $("em-scope-wrap").style.display = mode === "auto_reply" ? "" : "none";
+  emSyncFilterLinkage();
   csSyncAll();
 }
 function emOnComposeMode() {
@@ -12992,6 +15440,10 @@ function editRule(id) {
   const r = AC_RULES.find(x => x.id === id); if (!r) return;
   EM_PF = r.platform;
   const accOpts = accOptions(ACCOUNTS.filter(a => a.platform === EM_PF), `请选择${PF_NAME[EM_PF] || "对应平台"}账号`);
+  const activePolicy = (AC_POLICY_META?.policy?.platform === EM_PF) ? AC_POLICY_META.policy : null;
+  const emManualOnly = EM_PF === "xhs" && Boolean(activePolicy?.xhs_manual_only);
+  const emReviewForced = EM_PF === "xhs" && Boolean(activePolicy?.xhs_review_forced);
+  const emReviewLocked = emManualOnly || emReviewForced;
   new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => {
@@ -13012,7 +15464,7 @@ function editRule(id) {
         ai_preset_id: $("em-ai-preset").value || "",
         ai_prompt: $("em-ai-prompt").value.trim(),
         ai_max_chars: Math.max(0, Number($("em-ai-max-chars").value) || 0),
-        require_review: $("em-review").checked,
+        require_review: emReviewLocked ? !!r.require_review : $("em-review").checked,
         match_mode: $("em-match-mode").value || "any",
         include_keywords: inc,
         exclude_keywords: exc,
@@ -13063,22 +15515,36 @@ function editRule(id) {
       </fieldset>
       <fieldset class="ui-form-group"><legend>筛选与发现范围</legend>
         <div class="form-grid">
-          <div><label class="field" for="em-match-mode">包含词匹配方式</label><select id="em-match-mode">
+          <div><label class="field" for="em-match-mode">包含词匹配方式</label><select id="em-match-mode" onchange="emSyncFilterLinkage()">
             <option value="any">命中任一包含词</option><option value="all_terms">同时命中全部词</option><option value="regex">正则匹配</option><option value="all">不过滤</option>
           </select></div>
           <div id="em-scope-wrap"><label class="field" for="em-comment-scope">评论层级</label><select id="em-comment-scope">
             <option value="all">全部评论</option><option value="top_only">仅一级顶层评论</option><option value="reply_only">仅二级子评论</option>
           </select></div>
-          <div><label class="field" for="em-include-kw">包含关键词</label><input id="em-include-kw" placeholder="逗号/中文逗号/换行分隔，留空不限"></div>
+          <div id="em-include-kw-wrap"><label class="field" for="em-include-kw">包含关键词</label><input id="em-include-kw" placeholder="逗号/中文逗号/换行分隔，留空不限"></div>
           <div><label class="field" for="em-skip">排除 / 跳过关键词</label><input id="em-skip" placeholder="命中任一即跳过"></div>
           <div><label class="field" for="em-min-len">最少字数（0=不限）</label><input type="number" id="em-min-len" min="0" max="500"></div>
           <div><label class="field" for="em-max-age">最近 N 小时内（0=按天）</label><input type="number" id="em-max-age" min="0" max="8760"></div>
-          <div><label class="field" for="em-recent-works">扫描近期作品数（0=全局）</label><input type="number" id="em-recent-works" min="0" max="50"></div>
-          <div><label class="field" for="em-recent-days">扫描近期天数（0=全局）</label><input type="number" id="em-recent-days" min="0" max="365"></div>
+          <div id="em-recent-works-wrap"><label class="field" for="em-recent-works">扫描近期作品数（0=全局）</label><input type="number" id="em-recent-works" min="0" max="50"></div>
+          <div id="em-recent-days-wrap"><label class="field" for="em-recent-days">扫描近期天数（0=全局）</label><input type="number" id="em-recent-days" min="0" max="365"></div>
         </div>
       </fieldset>
       <fieldset class="ui-form-group"><legend>审核与执行频率</legend>
-        <label class="ui-toggle"><span><b>发布前审核</b><small>先生成草稿，由你核对原文后通过再发送</small></span><input type="checkbox" role="switch" id="em-review"></label>
+        <label class="ui-toggle${emReviewLocked ? " is-locked" : ""}">
+          <span>
+            <b>发布前审核${emReviewLocked ? "（已被全局设置锁定）" : ""}</b>
+            <small>${emManualOnly
+              ? `当前小红书评论通道为「仅保存草稿」，所有任务均只存草稿；本规则原设置为「${r.require_review ? "开启" : "关闭"}」。`
+              : emReviewForced
+                ? `当前「设置 → 采集与运行」开启了小红书全局强制先审，将覆盖此开关；本规则原设置为「${r.require_review ? "开启" : "关闭"}」。`
+                : "先生成草稿，由你核对原文后通过再发送"}</small>
+          </span>
+          <input type="checkbox" role="switch" id="em-review"${emReviewLocked ? " disabled" : ""}>
+        </label>
+        ${emReviewLocked ? `<div class="ac-lock-notice">
+          <span>如需按本规则设置直接排队发送，请先前往「设置 → 采集与运行」关闭全局限制。</span>
+          <button type="button" class="ghost sm" onclick="openAcEngineReviewSettings()">${emManualOnly ? "去修改发送方式 →" : "去关闭全局强制先审 →"}</button>
+        </div>` : ""}
         <div class="form-grid">
           <div><label class="field" for="em-cap">每日上限（0=跟随账号风控）</label><input type="number" id="em-cap" min="0" inputmode="numeric"></div>
           <div><label class="field" for="em-gap">最小间隔（秒）</label><input type="number" id="em-gap" min="1" inputmode="numeric"></div>
@@ -13107,7 +15573,8 @@ function editRule(id) {
     $("em-max-age").value = String(r.max_source_age_hours || 0);
     $("em-recent-works").value = String(r.recent_works || 0);
     $("em-recent-days").value = String(r.recent_days || 0);
-    $("em-review").checked = !!r.require_review;
+    emSyncFilterLinkage();
+    $("em-review").checked = emReviewLocked ? true : !!r.require_review;
     $("em-cap").value = r.daily_cap; $("em-gap").value = r.min_gap_seconds;
     $("em-max").value = r.max_per_run;
     if ([...$("em-interval").options].some(o => o.value === String(r.interval_seconds))) $("em-interval").value = String(r.interval_seconds);
@@ -13147,12 +15614,16 @@ async function duplicateRule(id) {
 async function refreshCommentRules() {
   const isCurrent = beginViewRequest("comment-rules");
   if (!$("ac-rule-table")) return;
-  refreshAcPolicyMeta();
-  const rows = await api("/api/comment-rules?platform=" + PLATFORM);
+  const [, rows] = await Promise.all([
+    refreshAcPolicyMeta(),
+    api("/api/comment-rules?platform=" + PLATFORM),
+  ]);
   if (!isCurrent()) return;
   if ($("tb-ac")) $("tb-ac").textContent = rows.length;
   AC_RULES = rows;
   const presets = AC_POLICY_META?.ai_presets || [];
+  const policy = (AC_POLICY_META?.policy?.platform === PLATFORM) ? AC_POLICY_META.policy : null;
+  const xhsLocked = Boolean(policy && (policy.xhs_manual_only || policy.xhs_review_forced));
   $("ac-rule-table").innerHTML = rows.map(r => {
     const tgt = r.mode === "auto_comment"
       ? (r.target_kind === "keyword" ? "#" + esc(r.keyword) : esc((r.sec_uid || "").slice(0, 14)))
@@ -13163,7 +15634,11 @@ async function refreshCommentRules() {
     const badges = [
       `<span class="pill ${acUsesAi(cm) ? "downloading" : "skipped"} bare" style="font-size:10px">${esc(AC_COMPOSE_T[cm] || cm)}</span>`,
       presetName ? `<span class="pill bare" style="font-size:10px">${esc(presetName)}</span>` : "",
-      r.require_review ? `<span class="pill pending bare" style="font-size:10px">草稿审核</span>` : "",
+      r.require_review
+        ? `<span class="pill pending bare" style="font-size:10px">草稿审核</span>`
+        : (r.platform === "xhs" && xhsLocked)
+          ? `<span class="pill downloading bare" style="font-size:10px" title="该规则未勾选审核，但正被小红书全局设置强制转草稿">${policy.xhs_manual_only ? "全局仅存草稿" : "全局强制先审"}</span>`
+          : "",
       (r.include_keywords?.length) ? `<span class="pill bare" style="font-size:10px">含 ${r.include_keywords.length} 词</span>` : "",
       (r.comment_scope && r.comment_scope !== "all" && r.mode === "auto_reply") ? `<span class="pill bare" style="font-size:10px">${esc(AC_SCOPE_T[r.comment_scope] || r.comment_scope)}</span>` : "",
     ].filter(Boolean).join("");
@@ -13202,16 +15677,23 @@ async function previewRule(id) {
   if (!res.ok) { toast("预览未通过：" + (res.error || "未知原因"), "err", 8000); return; }
 
   const items = res.items || [];
+  const ep = res.effective_policy || {};
+  const willReview = Boolean(res.review || res.manual_only);
+  const forcedByGlobal = Boolean(ep.xhs_manual_only || ep.xhs_review_forced);
   const action = await new Promise(resolve => {
-    _uiResolve = resolve; _uiCancelVal = null; _uiGetVal = () => "draft";
+    _uiResolve = resolve; _uiCancelVal = null; _uiGetVal = () => (willReview ? "draft" : "live");
     $("ui-body").innerHTML = `
       <div class="stack" style="gap:10px">
-        <div class="ac-policy-strip" data-state="${res.ai_warning ? "warn" : "ok"}">
+        <div class="ac-policy-strip" data-state="${(res.ai_warning || forcedByGlobal) ? "warn" : "ok"}">
           <div class="ac-policy-copy">
             <b>发现 ${res.candidates || 0} 个候选 · 本次命中 ${items.length} 条（纯预览，未发任何评论）</b>
             <p>${esc(res.note || "所有候选均已按当前筛选与去重条件过滤。")}${res.ai_warning ? ` ⚠️ ${esc(res.ai_warning)}` : ""}</p>
           </div>
         </div>
+        ${forcedByGlobal && !(rule && rule.require_review) ? `<div class="ac-lock-notice">
+          <span>${ep.xhs_manual_only ? "当前小红书评论通道为「仅保存草稿」，正式运行也只会保存草稿。" : "本规则未勾选审核，但「设置 → 采集与运行」已开启小红书全局强制先审，因此仍会先入草稿。"}</span>
+          <button type="button" class="ghost sm" id="ac-prev-open-engine">${ep.xhs_manual_only ? "去修改发送方式 →" : "去关闭全局强制先审 →"}</button>
+        </div>` : ""}
         ${items.length ? `<div class="ac-preview-list">${items.map(it => {
           const [srcLabel, srcCls] = AC_SRC_META[it.content_source] || ["模板", ""];
           return `<div class="ac-preview-item">
@@ -13227,15 +15709,18 @@ async function previewRule(id) {
             ${it.ai_error ? `<div class="mut" style="color:var(--warn);font-size:11px">AI 提示：${esc(it.ai_error)}</div>` : ""}
           </div>`;
         }).join("")}</div>` : `<div class="empty"><div class="empty-t">本次未命中可生成的目标</div><div class="empty-sub">${esc(res.note || "可检查关键词筛选或近期作品范围")}</div></div>`}
-        ${items.length ? `<div style="display:flex;justify-content:flex-end;gap:8px;padding-top:4px">
-          <button type="button" class="ghost sm" id="ac-prev-run-live">按规则配置正式执行一轮</button>
+        ${items.length && !willReview ? `<div style="display:flex;justify-content:flex-end;gap:8px;padding-top:4px">
+          <button type="button" class="ghost sm" id="ac-prev-run-draft">本次仅存草稿待审</button>
         </div>` : ""}
       </div>`;
-    if ($("ac-prev-run-live")) {
-      $("ac-prev-run-live").onclick = () => { _uiClose("live"); };
+    if ($("ac-prev-run-draft")) {
+      $("ac-prev-run-draft").onclick = () => { _uiClose("draft"); };
     }
-    _uiOpen(`试跑预览 · ${rule ? rule.name : "#" + id}`, "仅抓取与生成样例，不写入队列也不发送。确认满意后再生成草稿或正式运行。", {
-      okText: items.length ? "生成草稿待审" : "关闭",
+    if ($("ac-prev-open-engine")) {
+      $("ac-prev-open-engine").onclick = () => { openAcEngineReviewSettings(ep); };
+    }
+    _uiOpen(`试跑预览 · ${rule ? rule.name : "#" + id}`, "仅抓取与生成样例，不写入队列也不发送。确认满意后再执行本轮。", {
+      okText: items.length ? (willReview ? (res.manual_only ? "生成人工发布草稿" : "生成草稿待审") : "按规则正式执行一轮") : "关闭",
       wide: true,
       icon: "i-sparkles",
     });
@@ -13426,6 +15911,7 @@ async function delTask(id) {
 }
 window.addEventListener("creatorhub:ai-config:updated", () => refreshAcPolicyMeta());
 window.addEventListener("creatorhub:ai-channels:updated", () => refreshAcPolicyMeta());
+window.addEventListener("creatorhub:engine-settings:updated", () => refreshAcPolicyMeta());
 
 // ─── 统一任务队列 ───
 let TASK_QUEUE_PAGE = 1;
@@ -13448,14 +15934,26 @@ const TASK_QUEUE_STATE_META = {
 };
 
 function updateTaskQueuePlatformLabel() {
-  const option = $("queue-platform-current");
-  if (option) option.textContent = `当前平台（${PF_NAME[PLATFORM] || PLATFORM}）`;
+  const wrap = $("queue-platform-wrap");
+  if (wrap) wrap.classList.toggle("hidden", !GLOBAL_MODE);
   const select = $("queue-platform");
-  if (select && select._csSync) select._csSync();
+  if (!select) return;
+  if (GLOBAL_MODE) {
+    const prev = select.value;
+    const opts = ['<option value="all">全部平台</option>']
+      .concat(Object.entries(PF_NAME).map(([pf, label]) => `<option value="${esc(pf)}">${esc(label)}</option>`));
+    select.innerHTML = opts.join("");
+    select.value = (prev === "all" || PF_NAME[prev]) ? prev : "all";
+  } else {
+    select.innerHTML = `<option value="${esc(PLATFORM)}">当前平台（${esc(PF_NAME[PLATFORM] || PLATFORM)}）</option>`;
+    select.value = PLATFORM;
+  }
+  if (select._csSync) select._csSync();
 }
 
 function taskQueuePlatform() {
-  const value = $("queue-platform")?.value || "current";
+  if (!GLOBAL_MODE) return PLATFORM;
+  const value = $("queue-platform")?.value || "all";
   return value === "current" ? PLATFORM : value;
 }
 
@@ -13471,9 +15969,84 @@ function taskQueueDate(value) {
 
 function taskQueueSourceLabel(tab) {
   return ({
-    collections: "采集任务", publish: "发布任务", autocomment: "评论任务",
-    hub: "账号管理", monitors: "作品监控",
+    collections: "关键词采集", publish: "发布任务", autocomment: "评论任务",
+    hub: "账号管理", monitors: "主页作品监控",
   })[tab] || "查看";
+}
+
+function queueProgressTaskKey(item) {
+  const id = Number(item?.id || 0);
+  if (!id) return "";
+  if (item.queue_type === "collections") return `collection:${id}`;
+  if (item.queue_type === "publishes") return `publish:${id}`;
+  if (item.queue_type === "monitor_downloads") return `download:content:${id}`;
+  if (item.queue_type === "collection_downloads") return `download:collection:${id}`;
+  return "";
+}
+
+function renderTaskQueueProgressHtml(item, liveTask = null) {
+  const prog = window.CreatorHubProgress;
+  const p = liveTask
+    ? {
+        percent: liveTask.percent,
+        determinate: !!liveTask.determinate,
+        phase_label: liveTask.phase_label || "",
+        speed_bps: liveTask.speed_bps,
+        eta_seconds: liveTask.eta_seconds,
+        current: liveTask.current,
+        total: liveTask.total,
+        unit: liveTask.unit,
+        status: liveTask.status,
+        next_allowed_at: liveTask.next_allowed_at || item.next_allowed_at,
+      }
+    : (item.progress || null);
+  const st = liveTask?.status === "running"
+    ? "running"
+    : liveTask?.status === "waiting_user" || liveTask?.status === "blocked"
+      ? "blocked"
+      : liveTask?.status === "completed"
+        ? "completed"
+        : liveTask?.status === "failed"
+          ? "failed"
+          : (item.state || "pending");
+  const nextAt = p?.next_allowed_at || item.next_allowed_at;
+  if (st === "blocked" && nextAt) {
+    const cd = prog?.fmtCountdown?.(nextAt) || "等待恢复";
+    const phase = p?.phase_label || "冷却中";
+    return `<div class="queue-progress-cell"><div class="queue-progress-head"><span>${esc(phase)}</span></div><div class="queue-progress-meta progress-num" data-countdown-iso="${esc(nextAt)}">${esc(cd)}</div></div>`;
+  }
+  if (st === "running") {
+    const det = !!(p && p.determinate && p.percent !== null && p.percent !== undefined && Number.isFinite(Number(p.percent)));
+    const pct = det ? Math.max(0, Math.min(100, Math.round(Number(p.percent)))) : null;
+    const bar = prog?.renderProgressBar
+      ? prog.renderProgressBar({ determinate: det, percent: pct, tone: "info", label: item.title || "执行进度", compact: true })
+      : `<div class="progress-track is-compact${det ? "" : " is-indeterminate"}"><div class="progress-fill" style="${det ? `width:${pct}%` : ""}"></div></div>`;
+    const meta = [];
+    if (p?.unit === "bytes" && Number(p.total) > 0) {
+      meta.push(`${prog?.fmtBytes?.(p.current) || ""} / ${prog?.fmtBytes?.(p.total) || ""}`);
+    } else if (p?.unit === "bytes" && Number(p.current) > 0) {
+      meta.push(prog?.fmtBytes?.(p.current) || "");
+    }
+    const spd = p?.speed_bps ? (prog?.fmtSpeed?.(p.speed_bps) || "") : "";
+    if (spd) meta.push(spd);
+    const eta = p?.eta_seconds ? (prog?.fmtEta?.(p.eta_seconds) || "") : "";
+    if (eta) meta.push(eta);
+    return `<div class="queue-progress-cell"><div class="queue-progress-head"><span title="${esc(p?.phase_label || "执行中")}">${esc(p?.phase_label || "执行中")}</span><b class="progress-num">${det ? `${pct}%` : "进行中"}</b></div>${bar}${meta.length ? `<div class="queue-progress-meta progress-num">${esc(meta.join(" · "))}</div>` : ""}</div>`;
+  }
+  if (st === "completed") {
+    return `<div class="queue-progress-cell"><div class="queue-progress-meta">${esc(p?.phase_label || (item.status === "canceled" ? "已取消" : item.status === "skipped" ? "已跳过" : "100% · 已完成"))}</div></div>`;
+  }
+  if (st === "failed") {
+    return `<div class="queue-progress-cell"><div class="queue-progress-meta" style="color:var(--danger)">${esc(p?.phase_label || "执行中断")}</div></div>`;
+  }
+  if (p && p.determinate && Number.isFinite(Number(p.percent)) && Number(p.percent) > 0) {
+    const pct = Math.max(0, Math.min(100, Math.round(Number(p.percent))));
+    const bar = prog?.renderProgressBar
+      ? prog.renderProgressBar({ determinate: true, percent: pct, tone: "warn", label: item.title || "任务进度", compact: true })
+      : `<div class="progress-track is-compact"><div class="progress-fill tone-warn" style="width:${pct}%"></div></div>`;
+    return `<div class="queue-progress-cell"><div class="queue-progress-head"><span>${esc(p.phase_label || "等待继续")}</span><b class="progress-num">${pct}%</b></div>${bar}</div>`;
+  }
+  return `<div class="queue-progress-cell"><div class="queue-progress-meta">${esc(p?.phase_label || "等待调度")}</div></div>`;
 }
 
 function taskQueueRow(item) {
@@ -13487,19 +16060,44 @@ function taskQueueRow(item) {
   const reasonClass = item.error && !item.blocked_reason ? " has-error" : "";
   const signal = item.blocked_signal ? `<small>信号：${esc(item.blocked_signal)}</small>` : "";
   const stopKey = `${item.queue_type}:${Number(item.id)}`;
+  const progKey = queueProgressTaskKey(item);
+  const liveTask = progKey ? window.CreatorHubProgress?.getTask?.(progKey) : null;
   const selectable = ["collections", "publishes", "comments", "actions"].includes(item.queue_type)
     && !["done", "canceled", "skipped", "uncertain"].includes(item.status);
-  return `<tr>
+  return `<tr data-queue-key="${esc(stopKey)}"${progKey ? ` data-progress-key="${esc(progKey)}"` : ""}>
     <td><input type="checkbox" class="queue-select" data-queue-type="${esc(item.queue_type)}" data-task-id="${Number(item.id)}" aria-label="选择任务 ${Number(item.id)}" onchange="toggleTaskQueueItem(this)"${selectable ? "" : " disabled"}${TASK_QUEUE_SELECTED.has(stopKey) ? " checked" : ""}></td>
     <td><span class="pill q bare">${esc(item.queue_label)}</span><small class="mut" style="display:block;margin-top:5px">${esc(PF_NAME[item.platform] || item.platform || "—")}</small></td>
     <td><div class="queue-copy"><b title="${esc(item.title)}">${esc(item.title)}</b>${item.detail ? `<small>${esc(item.detail)}</small>` : ""}</div></td>
     <td><div class="queue-account"><b>${esc(account)}</b>${item.account_id ? `<small>ID ${Number(item.account_id)}</small>` : ""}</div></td>
     <td><div class="queue-time">${scheduled || "尽快执行"}${created}</div></td>
     <td><span class="pill ${stateMeta[1]}">${esc(stateMeta[0])}</span><small class="mut" style="display:block;margin-top:5px">${esc(rawStatus)}</small></td>
+    <td class="queue-col-progress" data-queue-prog-cell="${esc(progKey || stopKey)}">${renderTaskQueueProgressHtml(item, liveTask)}</td>
     <td><div class="queue-reason${reasonClass}">${esc(reason)}${signal}${nextAllowed}</div></td>
     <td class="acttd">${item.status === "uncertain" ? `<button type="button" class="ghost sm" onclick="resolveTaskResult(${jsArg(item.queue_type)},${Number(item.id)})">核对结果</button>` : ""}<button type="button" class="ghost sm" onclick="openTaskQueueSource(${jsArg(item.source_tab)})">${esc(taskQueueSourceLabel(item.source_tab))}</button></td>
   </tr>`;
 }
+
+window.addEventListener("creatorhub:progress:update", e => {
+  const task = e?.detail?.task;
+  if (!task || !task.task_key) return;
+  if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB !== "queue") return;
+  const cells = document.querySelectorAll(`#queue-table td[data-queue-prog-cell]`);
+  for (const cell of cells) {
+    if (cell.dataset.queueProgCell === task.task_key) {
+      cell.innerHTML = renderTaskQueueProgressHtml({ title: task.title, state: task.status, status: task.status, next_allowed_at: task.next_allowed_at }, task);
+    }
+  }
+});
+
+setInterval(() => {
+  if (document.hidden || typeof CURRENT_TAB === "undefined" || CURRENT_TAB !== "queue") return;
+  const prog = window.CreatorHubProgress;
+  if (!prog?.fmtCountdown) return;
+  document.querySelectorAll("#queue-table [data-countdown-iso]").forEach(el => {
+    const iso = el.dataset.countdownIso;
+    if (iso) el.textContent = prog.fmtCountdown(iso) || "即将恢复";
+  });
+}, 1000);
 
 function updateTaskQueueSelection() {
   const button = $("queue-batch-stop");
@@ -13609,15 +16207,16 @@ async function refreshTaskQueue(resetPage = false) {
   try {
     const data = await api("/api/task-queue?" + params.toString());
     if (!isCurrent()) return;
-    body.innerHTML = data.items?.length
+    const html = data.items?.length
       ? data.items.map(taskQueueRow).join("")
-      : empty(8, "当前筛选范围内没有任务", "i-inbox", "切换状态或平台范围后再查看");
+      : empty(9, "当前筛选范围内没有任务", "i-inbox", GLOBAL_MODE ? "切换状态或平台范围后再查看" : "切换任务状态或队列类型后再查看");
+    setHtmlIfChanged(body, html);
     updateTaskQueueSelection();
     renderTaskQueueSummary(data.summary || {});
     renderTaskQueuePager(data);
   } catch (e) {
     if (!isCurrent()) return;
-    body.innerHTML = empty(8, "任务队列加载失败", "i-info", e.message || "请稍后重试");
+    setHtmlIfChanged(body, empty(9, "任务队列加载失败", "i-info", e.message || "请稍后重试"));
     if (CURRENT_TAB === "queue") toast("任务队列加载失败：" + e.message, "err");
   } finally {
     TASK_QUEUE_LOADING = false;
@@ -13634,8 +16233,8 @@ async function refreshTaskQueueBadge() {
   const isCurrent = beginViewRequest("task-queue-badge");
   TASK_QUEUE_BADGE_LOADING = true;
   try {
-    const params = new URLSearchParams({ platform: GLOBAL_MODE ? "all" : PLATFORM, state: "active", page_size: "1" });
-    const data = await api("/api/task-queue?" + params.toString());
+    const params = new URLSearchParams({ platform: GLOBAL_MODE ? "all" : PLATFORM });
+    const data = await api("/api/task-queue/summary?" + params.toString());
     if (!isCurrent() || CURRENT_TAB === "queue") return;
     globalThis.CreatorHubWorkbench?.queueSummary?.(data.summary || {});
     const badge = $("tb-queue");
@@ -13734,15 +16333,15 @@ $("danmaku-watch-table").innerHTML = skeleton(8);
 $("danmaku-table").innerHTML = skeleton(6);
 $("collection-job-table").innerHTML = collectionTaskSkeleton(3);
 $("collection-content-list").innerHTML = collectionResultSkeleton(4);
-$("queue-table").innerHTML = skeleton(8);
+$("queue-table").innerHTML = skeleton(9);
 
 // restore last-selected platform & global mode BEFORE restoring tab so global-mode tab guards apply cleanly
-PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "rednote", "douyin", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
+PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "rednote", "douyin", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
 GLOBAL_MODE = (() => { try { const g = localStorage.getItem("dym-global"); return g === null ? true : g === "1"; } catch (e) { return true; } })();
 if ($("queue-platform") && GLOBAL_MODE) $("queue-platform").value = "all";
 
 // restore last-selected section (default: 总览);旧版四个独立页已并入「账号管理」
-const VALID_TABS = ["overview", "media-hub", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "tiktok-tools", "publish", "autocomment", "share-download", "notifications", "settings"];
+const VALID_TABS = ["overview", "media-hub", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "tiktok-tools", "youtube-tools", "publish", "autocomment", "share-download", "notifications", "settings"];
 const LEGACY_HUB_TABS = ["myworks", "following", "fans", "dm"];
 switchTab((() => {
   try {
@@ -13769,8 +16368,9 @@ updateTaskQueuePlatformLabel();
 setupMonitorInterval("t-interval", 300);
 setupMonitorInterval("w-interval", 600);
 setupMonitorInterval("d-w-interval", 0, true);
-onTypeChange(); bindPubFilePicker(); onPubType(); populateWatchAccount(); applyDanmakuForm(); onAcMode(); loadSettings(); refreshAccounts(); refreshBrowserRuntimes(); refreshProxies(); refreshChannels(); loop();
+onTypeChange(); bindPubFilePicker(); onPubType(); populateWatchAccount(); applyDanmakuForm(); resetAcReviewDefaultForPlatform(PLATFORM); onAcMode(); loadSettings(); refreshAccounts(); refreshBrowserRuntimes(); refreshProxies(); refreshChannels(); window.CreatorHubProgress?.start?.(); loop();
 enhanceAllSelects();   // 把所有原生 <select> 升级为美化下拉
+if (typeof syncShareHistoryPlatformControl === "function") syncShareHistoryPlatformControl();
 enhanceAllMetaControls(); // 分组/标签：当前平台词库下拉，可搜索并新增
 enhanceAllDateTime();  // 把 datetime-local 升级为自定义日期选择器
 // 编辑弹窗和异步列表会动态插入控件；统一做渐进增强，避免新旧样式混用。
@@ -13798,9 +16398,11 @@ window.addEventListener("hashchange", () => {
 });
 document.querySelector(".pswitch").addEventListener("keydown", e => {
   if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
-  e.preventDefault();
-  const buttons = [...document.querySelectorAll(".pswitch button")];
+  const buttons = [...document.querySelectorAll('.pswitch button[role="tab"]:not(.ps-overflow-hidden):not(.ps-idle-hidden)')];
+  if (!buttons.length) return;
   let index = buttons.indexOf(document.activeElement);
+  if (index < 0) return;
+  e.preventDefault();
   if (e.key === "Home") index = 0;
   else if (e.key === "End") index = buttons.length - 1;
   else index = (index + (e.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
@@ -13842,6 +16444,7 @@ function launchPlatformLogin(pf, mode = "main") {
   if (pf === "instagram") return startInstagramLogin();
   if (pf === "twitter") return startTwitterLogin();
   if (pf === "facebook") return startFacebookLogin();
+  if (pf === "youtube") return startYouTubeLogin();
   return creator ? startCreatorLogin() : startLogin();
 }
 
@@ -13872,7 +16475,11 @@ window.CreatorHubBridge = {
     refreshAll: () => { refreshAccounts(); refreshProxies(); },
   },
   openQueue(state, allPlatforms = GLOBAL_MODE) {
-    if ($("queue-platform")) { $("queue-platform").value = allPlatforms ? "all" : "current"; $("queue-platform")._csSync?.(); }
+    updateTaskQueuePlatformLabel();
+    if ($("queue-platform")) {
+      $("queue-platform").value = GLOBAL_MODE ? (allPlatforms ? "all" : PLATFORM) : PLATFORM;
+      $("queue-platform")._csSync?.();
+    }
     $("queue-state").value = state; $("queue-state")._csSync?.();
     $("queue-query").value = ""; $("queue-type").value = ""; $("queue-type")._csSync?.();
     TASK_QUEUE_PAGE = 1;

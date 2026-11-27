@@ -43,7 +43,15 @@ def _write_account_cookie_file(account_id: int | None) -> tuple[str, str, str]:
         raw_cookie = acc.cookie or ""
         platform = acc.platform
         account_proxy = acc.proxy or ""
-        account_ua = acc.ua or ""
+        if app_runtime.browser is not None:
+            try:
+                account_ua = app_runtime.browser.direct_request_user_agent(
+                    app_runtime.browser.identity_for(acc)
+                )
+            except Exception:
+                account_ua = acc.ua or ""
+        else:
+            account_ua = acc.ua or ""
 
     try:
         state = json.loads(state_text or "{}")
@@ -61,6 +69,7 @@ def _write_account_cookie_file(account_id: int | None) -> tuple[str, str, str]:
             "instagram": ".instagram.com",
             "twitter": ".x.com",
             "facebook": ".facebook.com",
+            "youtube": ".youtube.com",
         }.get(platform, ".douyin.com")
         for part in raw_cookie.split(";"):
             name, sep, value = part.strip().partition("=")

@@ -66,7 +66,7 @@ class WorkSyncMixin:
             if self._proxy_bad(acc):
                 return {"ok": False, "error": "账号代理不可用"}
             state = acc.storage_state or acc.creator_storage_state or ""
-            ua = acc.ua or self.cfg.engine.user_agent
+            ua = self._direct_request_ua(acc)
             proxy = acc.proxy or ""
             tiktok_author_unique_id = (acc.douyin_id or "") if platform == "tiktok" else ""
             dy_transport = (resolve_transport(
@@ -318,9 +318,10 @@ class WorkSyncMixin:
                         )
                     if not api_err or collected_ig:
                         source = "api"
-                auth_failed = classify_platform_error(api_err)[0] == RiskCategory.AUTH
+                err_category = classify_platform_error(api_err)[0] if api_err else RiskCategory.BUSINESS
+                hard_block = err_category in {RiskCategory.AUTH, RiskCategory.RISK}
                 if configured_mode == "browser" or (
-                    configured_mode == "hybrid" and not collected_ig and api_err and not auth_failed and identity is not None
+                    configured_mode == "hybrid" and not collected_ig and api_err and not hard_block and identity is not None
                 ):
                     ig_rows, ig_err = await fetch_ig_comments(
                         self.browser, identity, item_id, max_count=200
@@ -385,6 +386,32 @@ class WorkSyncMixin:
                         if cid and cid not in known and cid not in dedup_fb:
                             dedup_fb[cid] = c
                     fresh = list(dedup_fb.values())
+            elif platform == "youtube":
+                from app.platforms.youtube import video_url as yt_video_url
+                configured_mode = str(
+                    getattr(self.cfg.engine, "youtube_read_mode", "hybrid") or "hybrid"
+                ).lower()
+                if identity is None and (configured_mode == "browser" or not state):
+                    error = "缺少 YouTube 账号浏览器身份"
+                else:
+                    target_u = item_id if str(item_id).startswith("http") else yt_video_url(item_id)
+                    yt_rows, yt_err, source = await self._yt_read_comments(
+                        identity,
+                        target_u,
+                        max_pages=6,
+                        max_count=200,
+                        include_replies=True,
+                        state=state,
+                        ua=ua,
+                        proxy=proxy,
+                    )
+                    error = "" if yt_rows or yt_err == "empty" else yt_err
+                    dedup_yt: dict[str, dict] = {}
+                    for c in yt_rows:
+                        cid = c.get("comment_id")
+                        if cid and cid not in known and cid not in dedup_yt:
+                            dedup_yt[cid] = c
+                    fresh = list(dedup_yt.values())
             else:
                 return {"ok": False, "fetched": 0, "added": 0,
                         "error": f"不支持的平台:{platform}",
@@ -442,7 +469,7 @@ class WorkSyncMixin:
             if self._proxy_bad(acc):
                 return [], "账号代理不可用"
             state = acc.storage_state or acc.creator_storage_state or ""
-            ua = acc.ua or self.cfg.engine.user_agent
+            ua = self._direct_request_ua(acc)
             proxy = acc.proxy or ""
             sec_uid = acc.sec_uid or ""
             direct_environment = douyin_client_environment(acc)

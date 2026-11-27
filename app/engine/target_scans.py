@@ -1,4 +1,4 @@
-"""作品监控周期判断与抖音、快手、TikTok、视频号目标扫描。"""
+"""主页作品监控周期判断与抖音、快手、TikTok、视频号目标扫描。"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -40,15 +40,28 @@ class TargetScanMixin:
         return row.enabled and (deadline is None or datetime.utcnow() >= deadline)
 
     async def _scan_once(self):
+        from app.services.login_sessions import has_active_open_browser
+
         due: list[tuple[int, int | None]] = []
         with get_session() as s:
-            targets = s.exec(select(MonitorTarget).where(MonitorTarget.enabled == True)).all()  # noqa: E712
+            targets = s.exec(
+                select(MonitorTarget).where(
+                    MonitorTarget.enabled == True,  # noqa: E712
+                    MonitorTarget.target_kind == "creator",
+                )
+            ).all()
             for t in targets:
                 if self._periodic_due(t, "monitor"):
                     due.append((t.id, t.account_id))
         if due:
             ordered = _round_robin_by_account(due)
-            await asyncio.gather(*(self.scan_target(tid) for tid, _ in ordered))
+            runnable: list[int] = []
+            for tid, aid in ordered:
+                if aid and (await has_active_open_browser(aid) or self.browser.lock_for(f"acc:{aid}").locked()):
+                    continue
+                runnable.append(tid)
+            if runnable:
+                await asyncio.gather(*(self.scan_target(tid) for tid in runnable))
 
     async def scan_target(self, target_id: int) -> dict:
         if target_id in self._inflight:
@@ -102,6 +115,13 @@ class TargetScanMixin:
             t0 = s.get(MonitorTarget, target_id)
             if not t0:
                 return {"ok": False, "error": "target not found"}
+            if (t0.target_kind or "creator") != "creator":
+                msg = "历史关键词监控已下线，已自动跳过；按关键词搜索请使用「关键词采集」"
+                t0.enabled = False
+                t0.last_error = msg
+                s.add(t0)
+                s.commit()
+                return {"ok": False, "new": 0, "skipped": True, "error": msg}
             platform = t0.platform
         if platform == "xhs":
             return await self._scan_xhs_target_locked(target_id)
@@ -121,6 +141,8 @@ class TargetScanMixin:
             return await self._scan_twitter_target_locked(target_id)
         if platform == "facebook":
             return await self._scan_facebook_target_locked(target_id)
+        if platform == "youtube":
+            return await self._scan_youtube_target_locked(target_id)
         with get_session() as s:
             target = s.get(MonitorTarget, target_id)
             if not target:
@@ -128,7 +150,7 @@ class TargetScanMixin:
             first_scan = target.last_scan_at is None   # 首扫建立时间基线，可按目标配置回填历史
             if not target.account_id:
                 return self._mark_target_skip(
-                    target_id, "抖音作品监控必须绑定已登录账号,匿名主页可能返回陈旧或残缺作品")
+                    target_id, "抖音主页作品监控必须绑定已登录账号,匿名主页可能返回陈旧或残缺作品")
             acc = s.get(DouyinAccount, target.account_id)
             if not acc or acc.platform != "douyin" or acc.status != "active":
                 return self._mark_target_skip(
@@ -344,7 +366,7 @@ class TargetScanMixin:
             first_scan = target.last_scan_at is None
             if not target.account_id:
                 return self._mark_target_skip(
-                    target_id, "TikTok 作品监控必须绑定已登录账号")
+                    target_id, "TikTok 主页作品监控必须绑定已登录账号")
             acc = s.get(DouyinAccount, target.account_id)
             if not acc or acc.platform != "tiktok" or acc.status != "active":
                 return self._mark_target_skip(

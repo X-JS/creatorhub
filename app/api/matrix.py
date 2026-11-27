@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 import asyncio
 import json
+import time
+import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -15,7 +17,13 @@ from sqlmodel import select
 
 from app import runtime as app_runtime
 from app.api.accounts import _clean_account_tags, _parse_account_tags
-from app.api.publishing import _publish_dict, _publish_title_cap, _validate_non_xhs_publish_files
+from app.api.publishing import (
+    _norm_publish_action,
+    _publish_dict,
+    _publish_title_cap,
+    _resolve_task_cover_path,
+    _validate_non_xhs_publish_files,
+)
 from app.browser.backends import ACCOUNT_BROWSER_BACKENDS, LOCAL_BACKEND
 from app.browser.manager import normalize_proxy
 from app.profiles import assign_proxy_from_pool, inspect_account_proxy_risk, resolve_pool_proxy_row
@@ -41,6 +49,7 @@ from app.models import (
 )
 from app.platforms.rednote import has_web_session as rednote_has_web_session, weighted_truncate
 from app.platforms.xhs import has_creator_cookies
+from app.progress_hub import progress_hub
 from app.scheduling import utc_iso
 from app.services import account_profiles as account_profiles_service
 from app.services import browser_runtimes as browser_runtimes_service
@@ -64,6 +73,7 @@ ALL_PLATFORMS: tuple[str, ...] = (
     "instagram",
     "twitter",
     "facebook",
+    "youtube",
 )
 
 GROUP_COLORS = {"blue", "rose", "emerald", "amber", "violet", "cyan", "slate"}
@@ -93,7 +103,7 @@ def _account_login_flags(acc: DouyinAccount) -> tuple[bool, bool]:
     has_creator = (
         bool(acc.creator_storage_state)
         or (
-            acc.platform in ("kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "rednote", "instagram", "twitter", "facebook")
+            acc.platform in ("kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "rednote", "instagram", "twitter", "facebook", "youtube")
             and bool(acc.storage_state)
         )
         or (acc.platform == "xhs" and has_creator_cookies(acc.storage_state))
@@ -214,7 +224,7 @@ def _account_health_state(
     if same_platform_shared_proxy:
         return "shared_proxy"
     if not acc.proxy and (
-        acc.platform in {"tiktok", "rednote", "instagram", "twitter", "facebook"}
+        acc.platform in {"tiktok", "rednote", "instagram", "twitter", "facebook", "youtube"}
         or same_platform_total_count > 1
         or same_platform_direct_count > 1
     ):
@@ -367,7 +377,7 @@ async def matrix_overview(platform: str = ""):
             if not pf_filter or pf == pf_filter:
                 pending_reviews += 1
 
-        # 构建 10 平台态势条 (供顶部导航栏徽章 & 全局总览平台卡片墙共用)
+        # 构建 11 平台态势条 (供顶部导航栏徽章 & 全局总览平台卡片墙共用)
         strip_map: dict[str, dict[str, Any]] = {
             pf: {
                 "platform": pf,
@@ -496,7 +506,7 @@ async def matrix_overview(platform: str = ""):
                 "like_count": int(rec.like_count or 0),
                 "comment_count": int(rec.comment_count or 0),
                 "author_name": mon_name_map.get(rec.target_id, f"监控 #{rec.target_id}"),
-                "source_label": "作品监控",
+                "source_label": "主页作品监控",
                 "download_status": rec.download_status or "pending",
                 "local_ready": bool(rec.download_status == "done" and rec.local_path),
                 "create_time": int(rec.create_time or 0),
@@ -516,8 +526,8 @@ async def matrix_overview(platform: str = ""):
                 "media_type": rec.media_type or "video",
                 "like_count": int(rec.like_count or 0),
                 "comment_count": int(rec.comment_count or 0),
-                "author_name": rec.author_name or (f"#{rec.keyword}" if rec.keyword else "批量采集"),
-                "source_label": f"采集 · {rec.keyword}" if rec.keyword else "批量采集",
+                "author_name": rec.author_name or (f"#{rec.keyword}" if rec.keyword else "关键词采集"),
+                "source_label": f"采集 · {rec.keyword}" if rec.keyword else "关键词采集",
                 "download_status": rec.download_status or "skipped",
                 "local_ready": bool(rec.download_status == "done" and rec.local_path),
                 "create_time": int(rec.create_time or 0),
@@ -1045,21 +1055,264 @@ async def batch_operate_accounts(body: AccountBatchActionIn):
     if act == "close_browsers":
         closed = 0
         for aid in ids:
-            lease = app_runtime.open_browsers.pop(aid, None)
-            if lease is not None:
-                try:
-                    await lease.close()
-                    closed += 1
-                except Exception:
-                    pass
-            if app_runtime.browser is not None:
-                try:
-                    await app_runtime.browser.close_context(aid)
-                except Exception:
-                    pass
+            if await login_sessions_service.close_open_browser_for_account(aid):
+                closed += 1
         return {"ok": True, "closed": closed}
 
     raise HTTPException(400, f"不支持的批量操作类型：{act}")
+
+
+class MatrixBatchJobIn(BaseModel):
+    action: str  # test_proxy | refresh_profile | delete_accounts
+    account_ids: list[int] = PydanticField(default_factory=list)
+    concurrency: int = 0
+
+
+def _sync_matrix_batch_to_hub(job: dict[str, Any], *, immediate: bool = False) -> None:
+    total = max(1, int(job.get("total") or 1))
+    done = int(job.get("done") or 0)
+    ok_count = int(job.get("ok_count") or 0)
+    fail_count = int(job.get("fail_count") or 0)
+    status = str(job.get("status") or "running")
+    pct = 100.0 if status == "completed" else round(min(99.5, (done * 100.0) / total), 1)
+    eta = None
+    if status == "running" and done > 0 and done < total:
+        elapsed = max(0.2, time.monotonic() - float(job.get("_started_mono") or time.monotonic()))
+        eta = max(1, int((elapsed / done) * (total - done)))
+    detail = f"成功 {ok_count} · 失败/跳过 {fail_count} · 并发 {job.get('concurrency', 1)}"
+    current_label = str(job.get("current_label") or "")
+    phase_label = (
+        f"正在处理：{current_label}" if (status == "running" and current_label)
+        else str(job.get("phase_label") or ("处理中" if status == "running" else "已完成"))
+    )
+    progress_hub.upsert(
+        f"matrix_batch:{job['id']}",
+        immediate=immediate,
+        category="matrix_batch",
+        title=str(job.get("label") or "账号批量任务"),
+        platform="",
+        source_tab="accounts",
+        status=status,
+        phase=status,
+        phase_label=phase_label,
+        detail=detail,
+        error=str(job.get("error") or ""),
+        determinate=True,
+        percent=pct,
+        current=done,
+        total=total,
+        unit="items",
+        eta_seconds=eta,
+        metrics={
+            "done": done,
+            "total": total,
+            "ok": ok_count,
+            "failed": fail_count,
+            "concurrency": int(job.get("concurrency") or 1),
+        },
+        cancelable=status in {"queued", "running"},
+        extra={
+            "job_id": job["id"],
+            "action": job.get("action"),
+            "deleted_ids": list(job.get("deleted_ids") or []),
+            "failed_ids": list(job.get("failed_ids") or []),
+            "failed_samples": list(job.get("failed_samples") or [])[:8],
+        },
+    )
+
+
+async def _run_matrix_batch_job(job_id: str, action: str, ids: list[int], concurrency: int) -> None:
+    from app.api import accounts as accounts_api
+    from app.api import proxies as proxies_api
+
+    job = app_runtime._matrix_batch_jobs[job_id]
+    job["status"] = "running"
+    job["phase_label"] = "开始并发执行"
+    job["_started_mono"] = time.monotonic()
+    _sync_matrix_batch_to_hub(job, immediate=True)
+
+    names: dict[int, str] = {}
+    with get_session() as session:
+        for acc in session.exec(select(DouyinAccount).where(DouyinAccount.id.in_(ids))).all():
+            if acc.id is not None:
+                names[acc.id] = _account_display_name(acc, acc.id)
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def process_one(aid: int) -> None:
+        if job.get("_cancel_requested"):
+            return
+        async with sem:
+            if job.get("_cancel_requested"):
+                return
+            label = names.get(aid, f"账号 #{aid}")
+            job["current_label"] = label
+            _sync_matrix_batch_to_hub(job)
+            ok = False
+            err_msg = ""
+            try:
+                if action == "test_proxy":
+                    res = await proxies_api.test_account_proxy(aid)
+                    ok = bool(res.get("ok"))
+                    if not ok:
+                        err_msg = str(res.get("detail") or "检测未通过")
+                elif action == "refresh_profile":
+                    res = await accounts_api.refresh_account_profile(aid)
+                    ok = bool(res.get("ok")) and not bool(res.get("skipped"))
+                    if not ok:
+                        err_msg = str(res.get("reason") or res.get("error") or "已跳过")
+                elif action == "delete_accounts":
+                    await accounts_api.del_account(aid)
+                    ok = True
+                    job["deleted_ids"].append(aid)
+            except HTTPException as exc:
+                ok = False
+                err_msg = str(exc.detail or exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                ok = False
+                err_msg = str(exc) or repr(exc)
+
+            job["done"] += 1
+            if ok:
+                job["ok_count"] += 1
+            else:
+                job["fail_count"] += 1
+                job["failed_ids"].append(aid)
+                if len(job["failed_samples"]) < 12:
+                    job["failed_samples"].append(f"{label}：{err_msg[:120]}")
+            _sync_matrix_batch_to_hub(job)
+            progress_hub.emit_event(
+                "matrix.account_updated",
+                {"job_id": job_id, "account_id": aid, "action": action, "ok": ok},
+            )
+
+    try:
+        await asyncio.gather(*(process_one(aid) for aid in ids))
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        if job.get("_cancel_requested"):
+            job["status"] = "canceled"
+            job["phase_label"] = f"已停止（完成 {job['done']}/{job['total']}）"
+        else:
+            job["status"] = "completed"
+            job["phase_label"] = (
+                f"已完成：成功 {job['ok_count']} 个"
+                + (f"，未通过/跳过 {job['fail_count']} 个" if job["fail_count"] else "")
+            )
+        job["current_label"] = ""
+        _sync_matrix_batch_to_hub(job, immediate=True)
+    except asyncio.CancelledError:
+        job["status"] = "canceled"
+        job["phase_label"] = f"已停止（完成 {job['done']}/{job['total']}）"
+        job["current_label"] = ""
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        _sync_matrix_batch_to_hub(job, immediate=True)
+        raise
+    except Exception as exc:
+        job["status"] = "failed"
+        job["phase_label"] = "批量任务异常中断"
+        job["error"] = str(exc) or repr(exc)
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        _sync_matrix_batch_to_hub(job, immediate=True)
+
+
+@router.post("/api/matrix/batch-jobs", status_code=202)
+async def start_matrix_batch_job(body: MatrixBatchJobIn):
+    """在后台异步并发执行账号矩阵批量操作，并通过 /api/progress/stream 实时推送逐号进展。"""
+    action = str(body.action or "").strip().lower()
+    labels = {
+        "test_proxy": "批量检测代理与出口",
+        "refresh_profile": "批量刷新资料与登录态",
+        "delete_accounts": "批量删除账号",
+    }
+    if action not in labels:
+        raise HTTPException(400, f"不支持的异步批量操作：{action}")
+    ids = list(dict.fromkeys(int(i) for i in body.account_ids if int(i) > 0))
+    if not ids:
+        raise HTTPException(400, "请先选择至少一个账号")
+
+    if body.concurrency > 0:
+        concurrency = max(1, min(12, int(body.concurrency)))
+    elif action == "test_proxy":
+        # native 账号测代理会走浏览器出口探测，限制为 4；非 native 纯 HTTP 探测可并发 8
+        with get_session() as session:
+            has_native = any(
+                acc.identity_mode == "native"
+                for acc in session.exec(select(DouyinAccount).where(DouyinAccount.id.in_(ids))).all()
+            )
+        concurrency = 4 if has_native else 8
+    elif action == "refresh_profile":
+        concurrency = max(1, min(4, int(getattr(app_runtime.cfg.engine, "active_accounts", 3) or 3)))
+    else:
+        concurrency = 4
+    concurrency = min(concurrency, len(ids))
+
+    finished = [
+        k for k, v in app_runtime._matrix_batch_jobs.items()
+        if v.get("status") in {"completed", "failed", "canceled"}
+    ]
+    for old in finished[:-30]:
+        app_runtime._matrix_batch_jobs.pop(old, None)
+        app_runtime._matrix_batch_tasks.pop(old, None)
+
+    job_id = uuid.uuid4().hex[:12]
+    job: dict[str, Any] = {
+        "id": job_id,
+        "action": action,
+        "label": labels[action],
+        "status": "queued",
+        "phase_label": "排队中",
+        "current_label": "",
+        "total": len(ids),
+        "done": 0,
+        "ok_count": 0,
+        "fail_count": 0,
+        "concurrency": concurrency,
+        "deleted_ids": [],
+        "failed_ids": [],
+        "failed_samples": [],
+        "error": "",
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "completed_at": None,
+        "_cancel_requested": False,
+        "_started_mono": time.monotonic(),
+    }
+    app_runtime._matrix_batch_jobs[job_id] = job
+    _sync_matrix_batch_to_hub(job, immediate=True)
+
+    def _cancel():
+        job["_cancel_requested"] = True
+        t = app_runtime._matrix_batch_tasks.get(job_id)
+        if t is not None and not t.done():
+            t.cancel()
+        return {"ok": True, "job_id": job_id}
+
+    progress_hub.register_cancel(f"matrix_batch:{job_id}", _cancel)
+    task = asyncio.create_task(_run_matrix_batch_job(job_id, action, ids, concurrency))
+    app_runtime._matrix_batch_tasks[job_id] = task
+    task.add_done_callback(lambda _t, k=job_id: app_runtime._matrix_batch_tasks.pop(k, None))
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+@router.get("/api/matrix/batch-jobs/{job_id}")
+async def get_matrix_batch_job(job_id: str):
+    job = app_runtime._matrix_batch_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "批量任务不存在")
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+@router.post("/api/matrix/batch-jobs/{job_id}/cancel")
+async def cancel_matrix_batch_job(job_id: str):
+    job = app_runtime._matrix_batch_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "批量任务不存在")
+    job["_cancel_requested"] = True
+    task = app_runtime._matrix_batch_tasks.get(job_id)
+    if task is not None and not task.done():
+        task.cancel()
+    return {"ok": True, "job_id": job_id}
 
 
 # ─────────────────── 自有矩阵跨号数据对比与作品大盘 ───────────────────
@@ -1381,7 +1634,7 @@ async def list_media_hub(
                 "desc": r.desc or "（无标题描述）",
                 "author_name": src_info["label"],
                 "group_name": src_info["group_name"],
-                "source_label": "作品监控",
+                "source_label": "主页作品监控",
                 "media_type": r.media_type or "video",
                 "cover_url": (
                     f"/api/contents/{r.id}/cover"
@@ -1491,7 +1744,11 @@ async def list_media_hub(
         # 4) 分享链接解析下载记录
         s_stmt = select(ShareDownloadRecord)
         if pf_filter:
-            s_stmt = s_stmt.where(ShareDownloadRecord.platform == pf_filter)
+            share_pf_aliases = {
+                "shipinhao": ("shipinhao", "wechat", "channels"),
+                "twitter": ("twitter", "x"),
+            }.get(pf_filter, (pf_filter,))
+            s_stmt = s_stmt.where(ShareDownloadRecord.platform.in_(share_pf_aliases))
         for r in session.exec(s_stmt).all():
             source_counts["share"] += 1
             if src not in {"all", "share"}:
@@ -1506,11 +1763,12 @@ async def list_media_hub(
                 continue
             if query_text and query_text not in f"{r.title} {r.author} {r.item_id}".lower():
                 continue
+            norm_share_pf = {"wechat": "shipinhao", "channels": "shipinhao", "x": "twitter"}.get(r.platform, r.platform)
             unified.append({
                 "uid": f"share:{r.id}",
                 "source_kind": "share",
                 "id": r.id,
-                "platform": r.platform if r.platform in ALL_PLATFORMS else "douyin",
+                "platform": norm_share_pf if norm_share_pf in ALL_PLATFORMS else "douyin",
                 "aweme_id": r.item_id or "",
                 "desc": r.title or "（分享链接下载素材）",
                 "author_name": r.author or "分享链接解析",
@@ -1818,17 +2076,22 @@ class MatrixPublishOverrideIn(BaseModel):
     title: str | None = None
     desc: str | None = None
     topics: str | None = None
+    cover_path: str | None = None
     visibility: str = "public"
     bili_options: dict[str, Any] = PydanticField(default_factory=dict)
     ig_options: dict[str, Any] = PydanticField(default_factory=dict)
     tw_options: dict[str, Any] = PydanticField(default_factory=dict)
     fb_options: dict[str, Any] = PydanticField(default_factory=dict)
+    yt_options: dict[str, Any] = PydanticField(default_factory=dict)
 
 
 class MatrixBatchPublishIn(BaseModel):
     account_ids: list[int]
     media_type: str = "video"               # video | images
     media_paths: list[str] = PydanticField(default_factory=list)
+    cover_path: str = ""                    # 可选统一自定义封面本地图片路径
+    publish_action: str = "publish"         # publish(直接发布) | draft(暂存到目标平台草稿箱)
+    save_as_draft: bool = False             # True=在 CreatorHub 本地存为草稿(status=draft)
     title: str = ""
     desc: str = ""
     topics: str = ""
@@ -1855,6 +2118,8 @@ async def create_matrix_batch_publish(body: MatrixBatchPublishIn):
         raise HTTPException(400, "media_type 须为 video 或 images")
 
     stagger = max(0, min(1440, int(body.stagger_minutes or 0)))
+    publish_action = _norm_publish_action(body.publish_action)
+    save_as_draft = bool(body.save_as_draft)
     created_tasks: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
@@ -1889,8 +2154,12 @@ async def create_matrix_batch_publish(body: MatrixBatchPublishIn):
             eff_desc = ov.desc if (ov and ov.desc is not None) else body.desc
             eff_topics = (ov.topics if (ov and ov.topics is not None) else body.topics).strip()
             eff_vis = (ov.visibility if ov else "public")
-            if eff_vis not in {"public", "friends", "private"}:
+            allowed_vis = {"public", "friends", "unlisted", "private"} if acc.platform == "youtube" else {"public", "friends", "private"}
+            if eff_vis not in allowed_vis:
                 eff_vis = "public"
+            bili_opts = dict((ov.bili_options if ov else {}) or {})
+            yt_opts = dict((ov.yt_options if ov else {}) or {})
+            raw_cover = (ov.cover_path if (ov and ov.cover_path is not None) else body.cover_path) or ""
 
             # 校验该平台媒体合法性（Twitter 图集若超过 4 张自动截取前 4 张，Facebook 最多 20 张）
             candidate_paths = list(body.media_paths or [])
@@ -1902,7 +2171,17 @@ async def create_matrix_batch_publish(body: MatrixBatchPublishIn):
                 candidate_paths = candidate_paths[:20]
 
             try:
-                if acc.platform in {"xhs", "rednote"}:
+                eff_cover = _resolve_task_cover_path(acc.platform, raw_cover, bili_opts, yt_opts)
+                if eff_cover:
+                    if acc.platform == "youtube":
+                        yt_opts["thumbnail_path"] = eff_cover
+                    elif acc.platform == "bilibili":
+                        bili_opts["cover"] = eff_cover
+                if save_as_draft and not candidate_paths:
+                    if not (eff_title or eff_desc.strip() or eff_cover):
+                        raise ValueError("暂存本地草稿请至少填写标题/正文或上传媒体/封面")
+                    paths = []
+                elif acc.platform in {"xhs", "rednote"}:
                     from app.platforms.xhs.media import validate_publish_files
                     paths = validate_publish_files(body.media_type, candidate_paths)
                 else:
@@ -1941,12 +2220,16 @@ async def create_matrix_batch_publish(body: MatrixBatchPublishIn):
                 desc=eff_desc,
                 topics=eff_topics,
                 location=(body.location or "").strip()[:60],
+                cover_path=eff_cover,
+                publish_action=publish_action,
+                status="draft" if save_as_draft else "pending",
                 visibility=eff_vis,
                 media_json=json.dumps(paths),
-                bili_options_json=json.dumps((ov.bili_options if ov else {}) or {}, ensure_ascii=False),
+                bili_options_json=json.dumps(bili_opts, ensure_ascii=False),
                 ig_options_json=json.dumps((ov.ig_options if ov else {}) or {}, ensure_ascii=False),
                 tw_options_json=json.dumps((ov.tw_options if ov else {}) or {}, ensure_ascii=False),
                 fb_options_json=json.dumps((ov.fb_options if ov else {}) or {}, ensure_ascii=False),
+                yt_options_json=json.dumps(yt_opts, ensure_ascii=False),
                 scheduled_at=sched_time,
                 scheduled_at_is_utc=True,
                 source_platform=body.source_platform or "",

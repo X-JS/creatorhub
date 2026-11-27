@@ -11,8 +11,9 @@ const platforms = {
   tiktok: { name: "TikTok", task: "完成首次关键词视频采集", target: "collections", hint: "登录 TikTok 账号后，输入 1 个关键词做小规模视频与评论采集，再按需开启媒体下载。" },
   bilibili: { name: "哔哩哔哩", task: "下载第一条视频或监控弹幕", target: "share-download", hint: "粘贴整段哔哩哔哩分享文案或 BV 号到链接下载，也可在弹幕监控中拉取视频时间轴弹幕。" },
   instagram: { name: "Instagram", task: "下载第一条帖子或采集话题", target: "share-download", hint: "登录 Instagram 账号后，粘贴 /p/ 或 /reel/ 链接到链接下载保存原图、轮播或视频，也可在关键词采集中搜索 #话题。" },
-  twitter: { name: "Twitter", task: "下载推文原片或实时搜索采集", target: "share-download", hint: "绑定海外代理并登录 X (Twitter) 账号后，粘贴 x.com/.../status/... 或 t.co 短链下载最高清视频与原图，或进行关键词与创作者批量采集。" },
-  facebook: { name: "Facebook", task: "下载帖子视频或采集主页/群组动态", target: "share-download", hint: "绑定海外代理并登录 Facebook 账号后，粘贴帖子/Reel/Watch 链接或 fb.watch 短链下载原片，也可批量采集公共主页与群组动态，或使用 i_user 切换公共主页发布内容。" },
+  twitter: { name: "Twitter", task: "下载推文原片或实时搜索采集", target: "share-download", hint: "绑定海外代理并登录 X (Twitter) 账号后，粘贴 x.com/.../status/... 或 t.co 短链下载最高清视频与原图，或进行关键词采集与主页作品监控。" },
+  facebook: { name: "Facebook", task: "下载帖子视频或追踪主页/群组动态", target: "share-download", hint: "绑定海外代理并登录 Facebook 账号后，粘贴帖子/Reel/Watch 链接或 fb.watch 短链下载原片，也可进行关键词采集、主页/群组监控，或使用 i_user 切换公共主页发布内容。" },
+  youtube: { name: "YouTube", task: "下载高清视频或关键词采集", target: "share-download", hint: "绑定海外代理并登录 YouTube (Google) 账号后，粘贴 watch/shorts/youtu.be 链接即可无损合流下载，也可进行关键词采集、频道主页作品监控、YouTube Studio 上传发布与多频道切换互动。" },
 };
 function savedState() {
   try {
@@ -53,7 +54,7 @@ export function Onboarding({ platform }) {
         <Dialog.Description>{demo ? "当前是示例演示：操作不会登录真实账号或产生真实任务。" : "先选平台、再登录、最后完成一个小任务。不会自动发布或发送任何内容。"}</Dialog.Description>
         <ol className="wb-onboarding-steps" aria-label="上手步骤">{["选择平台", "登录账号", "第一个任务"].map((label, i) => <li key={label}><button className="ghost" aria-current={step === i ? "step" : undefined} onClick={() => setStep(i)}>{i + 1}. {label}</button></li>)}</ol>
         {step === 0 && <div><h3>你想先使用哪个平台？</h3><div className="wb-onboarding-platforms">{Object.entries(platforms).map(([key, value]) => <button key={key} className="ghost" aria-pressed={selected === key} onClick={() => setSelected(key)}><b>{value.name}</b><span>{value.task}</span></button>)}</div><p>不同平台的能力独立。视频号支持创作者助手与微信原生协议双通道，小红书主站与创作者登录分开。</p></div>}
-        {step === 1 && <div><h3>登录你的{current.name}账号</h3><ol><li>点击下方按钮，进入平台账号。</li><li>选择“添加账号”，按平台提示扫码或登录。</li><li>回到账号列表检测状态，再从“新手向导”继续。</li></ol><p>{selected === "xhs" || selected === "rednote" ? "先扫码获取主站读取态。发布笔记时，还要完成独立的创作者登录。" : "登录需要本机弹出的浏览器窗口。账号列表为空时，先完成登录。"}</p><button type="button" onClick={() => navigate("accounts")}>前往{current.name}账号页</button></div>}
+        {step === 1 && <div><h3>登录你的{current.name}账号</h3><ol><li>点击下方按钮，进入平台账号。</li><li>点击页面上方的扫码 / 网页登录或 Cookie 导入按钮完成登录。</li><li>回到账号列表检测状态，再从“新手向导”继续。</li></ol><p>{selected === "xhs" || selected === "rednote" ? "先扫码获取主站读取态。发布笔记时，还要完成独立的创作者登录。" : "登录需要本机弹出的浏览器窗口。账号列表为空时，先完成登录。"}</p><button type="button" onClick={() => navigate("accounts")}>前往{current.name}账号页</button></div>}
         {step === 2 && <div><h3>{current.task}</h3><p>{current.hint}</p><button type="button" onClick={() => navigate(current.target)}>前往操作页面</button><p><label className="wb-onboarding-check"><input type="checkbox" checked={saved.completed?.[selected] === true} onChange={e => persist({ ...saved, completed: { ...saved.completed, [selected]: e.target.checked } })} />我已检查结果，标记这条路线完成</label></p><small>这是你的手动学习记录，不代表系统已验证账号或任务状态。记录保存在当前浏览器，换端口或设备后需重新标记。</small></div>}
         <a href={`${guideBase}${selected}/`} target="_blank" rel="noopener noreferrer">打开{current.name}图文教程 ↗</a>
         <div className="wb-onboarding-footer"><button className="ghost" disabled={step === 0} onClick={() => setStep(step - 1)}>上一步</button>{step < 2 ? <button onClick={() => setStep(step + 1)}>下一步</button> : <button onClick={() => changeOpen(false)}>返回工作台</button>}</div>

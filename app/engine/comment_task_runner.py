@@ -4,21 +4,36 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from app.account_lifecycle import AccountUnavailableError
-from app.browser import douyin_secure_post_api, post_bili_comment, post_channels_comment, post_comment_browser, post_facebook_comment, post_ig_comment, post_ks_comment, post_twitter_comment
+from app.browser import douyin_secure_post_api, post_bili_comment, post_channels_comment, post_comment_browser, post_facebook_comment, post_ig_comment, post_ks_comment, post_twitter_comment, post_youtube_comment
 from app.browser.tiktok_actions import post_tiktok_comment
 from app.db import get_session
-from app.engine.monitor_helpers import log
+from app.engine.monitor_helpers import _AccountCheckBusy, log
 from app.models import CommentTask, DouyinAccount
 from app.platforms.bilibili import BilibiliClient
 from app.platforms.douyin import DouyinClient, cookie_from_state as dy_cookie_from_state
 from app.platforms.instagram import InstagramClient
 from app.platforms.xhs import comment_xhs_browser
 from app.risk import OperationKind, RiskCategory, classify_platform_error
+from app.services.login_sessions import has_active_open_browser
 from app.transport_matrix import douyin_client_environment
 
 
 class CommentTaskRunnerMixin:
-    async def execute_comment_task(self, task_id: int) -> dict:
+    def _mark_comment_open_browser_blocked(self, task_id: int) -> None:
+        reason = "该账号手动浏览器窗口仍开着，关闭窗口后将自动发送"
+        with get_session() as s:
+            t = s.get(CommentTask, task_id)
+            if t and t.status == "pending":
+                t.blocked_reason = reason
+                t.blocked_signal = "open_browser"
+                t.blocked_operation = OperationKind.COMMENT.value
+                t.blocked_at = datetime.utcnow()
+                t.next_allowed_at = None
+                t.error = reason
+                s.add(t)
+                s.commit()
+
+    async def execute_comment_task(self, task_id: int, *, scheduled: bool = False) -> dict:
         if task_id in self._commenting:
             return {"ok": False, "error": "正在执行中"}
         self._commenting.add(task_id)
@@ -26,10 +41,26 @@ class CommentTaskRunnerMixin:
             with get_session() as s:
                 t = s.get(CommentTask, task_id)
                 account_id = t.account_id if t else None
+            if await has_active_open_browser(account_id):
+                self._mark_comment_open_browser_blocked(task_id)
+                return {
+                    "ok": False,
+                    "deferred": True,
+                    "blocked_by": "open_browser",
+                    "error": "该账号手动浏览器窗口仍开着，请先关闭窗口后再发送评论",
+                }
             async with self._operation_guard(
                     account_id, OperationKind.COMMENT,
-                    fallback_key=f"cmt:{task_id}"):
+                    fallback_key=f"cmt:{task_id}",
+                    skip_busy=scheduled):
                 return await self._execute_comment_task_locked(task_id)
+        except _AccountCheckBusy:
+            return {
+                "ok": False,
+                "deferred": True,
+                "blocked_by": "account_busy",
+                "error": "该账号当前正在执行其他浏览器操作，稍后将自动重试",
+            }
         except AccountUnavailableError:
             return self._fail_missing_account_task(CommentTask, task_id)
         finally:
@@ -118,7 +149,7 @@ class CommentTaskRunnerMixin:
                 return {"ok": False, "error": gate_error}
             state = acc.storage_state or acc.creator_storage_state or ""
             proxy = acc.proxy or ""
-            ua = acc.ua or self.cfg.engine.user_agent
+            ua = self._direct_request_ua(acc)
             direct_environment = douyin_client_environment(acc)
             native_mode = acc.identity_mode == "native"
             # API-only 评论不启动账号浏览器；hybrid/browser 保留页面回退所需身份。
@@ -214,6 +245,21 @@ class CommentTaskRunnerMixin:
                     on_submit=lambda: self._mark_write_submit(CommentTask, task_id, channel="browser"),
                 )
                 result = ""
+            elif platform == "youtube":
+                from app.platforms.youtube import video_url as yt_video_url
+                method = "browser"
+                yt_url = target_url or (aweme_id if str(aweme_id).startswith("http") else yt_video_url(aweme_id, comment_id=target_cid))
+                ok, posted_url, err = await post_youtube_comment(
+                    self.browser,
+                    identity,
+                    yt_url,
+                    content,
+                    target_comment_id=target_cid,
+                    target_comment_url=(yt_url if "lc=" in yt_url else ""),
+                    headed=(True if native_mode else self.cfg.engine.comment_browser_headed),
+                    on_submit=lambda: self._mark_write_submit(CommentTask, task_id, channel="browser"),
+                )
+                result = posted_url or ""
             elif platform == "rednote":
                 method = "unavailable"
                 err = "unavailable:海外小红书暂未开放评论写入与自动计划"
@@ -303,10 +349,11 @@ class CommentTaskRunnerMixin:
                             "write_uncertain:",
                             "logged_out:",
                             "verification_required:",
+                            "rate_limit:",
                         ))
                     ):
                         category, _ = classify_platform_error(err)
-                        if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                        if category == RiskCategory.BUSINESS:
                             ok, err = await post_ig_comment(
                                 self.browser,
                                 identity,

@@ -21,13 +21,16 @@ import json
 import os
 import re
 import shutil
+import threading
 import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
+
+from app.progress_hub import run_in_media_pool
 
 
 class ShareLinkError(ValueError):
@@ -425,6 +428,15 @@ def _find_ffmpeg() -> str:
     return find_ffmpeg()
 
 
+def _find_node() -> str:
+    from app.runtime_tools import find_node
+    return find_node()
+
+
+def _is_youtube_url(url: str) -> bool:
+    return detect_platform(url) == "youtube"
+
+
 def _download_format_options(quality: str, ffmpeg_location: str = "") -> dict[str, Any]:
     """构建格式和后处理参数，保证“仅音频”不会直接产出带画面的文件。"""
     audio_only = _is_audio_quality(quality)
@@ -565,6 +577,8 @@ class ShareDownloader:
         options: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
+            "no_color": True,
+            "noprogress": True,
             "logger": logger,
             "socket_timeout": self.timeout,
             "retries": 3,
@@ -582,12 +596,67 @@ class ShareDownloader:
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
             },
         }
+        node_path = _find_node()
+        if node_path:
+            options["js_runtimes"] = {"node": {"path": str(node_path)}}
         from app.netfp import curl_proxy_url
         # 显式传入空字符串可禁止 yt-dlp 隐式读取系统注册表/环境变量代理；socks5 自动转 socks5h 走远端 DNS
         options["proxy"] = curl_proxy_url(proxy) if proxy else ""
         if cookie_file:
             options["cookiefile"] = cookie_file
         return options
+
+    @staticmethod
+    def _youtube_attempt_options(
+        base_options: dict[str, Any],
+        *,
+        quality: str = "highest",
+        ffmpeg_location: str = "",
+    ) -> list[dict[str, Any]]:
+        """构造 YouTube 多客户端回退配置：
+        1) 默认客户端（无 PO Token 限制的视频 / Shorts 可拿到高清 DASH + FFmpeg 无损合流）；
+        2) android 客户端单流封装（规避 YouTube 对 android_vr/DASH >2MB 无 PO Token 返回 403 Forbidden）；
+        3) android_vr + tv + ios 兜底。
+        注意移动端 Innertube 客户端不强塞桌面 UA，避免客户端校验失败。
+        """
+        primary = dict(base_options)
+        primary.pop("cookiefile", None)
+
+        audio_only = _is_audio_quality(quality)
+        android_opts = dict(primary)
+        android_opts.pop("http_headers", None)
+        android_opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+        if audio_only:
+            android_opts["format"] = "ba/b[ext=mp4][acodec!=none]/b" if ffmpeg_location else "ba/b"
+        else:
+            android_opts["format"] = "best[ext=mp4][acodec!=none][vcodec!=none]/best[ext=mp4]/best"
+            android_opts.pop("merge_output_format", None)
+
+        fallback_opts = dict(primary)
+        fallback_opts.pop("http_headers", None)
+        fallback_opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "ios"]}}
+
+        return [primary, android_opts, fallback_opts]
+
+    @staticmethod
+    def _cleanup_partial_downloads(job_dir: Path, temp_dir: Path) -> None:
+        """清理上一轮失败残留的 .part / 分离 DASH 临时流，保留后续成功产物干净。"""
+        for folder in (temp_dir, job_dir):
+            if not folder.exists():
+                continue
+            for p in list(folder.rglob("*")):
+                if not p.is_file():
+                    continue
+                low = p.name.lower()
+                if (
+                    folder == temp_dir
+                    or p.suffix.lower() in {".part", ".ytdl"}
+                    or re.search(r"\.f\d+\.(mp4|m4a|webm|mkv)$", low)
+                ):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def _inspect_sync(
         self,
@@ -624,7 +693,7 @@ class ShareDownloader:
         proxy: str = "",
         cookie_file: str = "",
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
+        return await run_in_media_pool(
             self._inspect_sync, url, proxy=proxy, cookie_file=cookie_file
         )
 
@@ -639,8 +708,12 @@ class ShareDownloader:
         proxy: str = "",
         cookie_file: str = "",
         max_filesize_mb: int = 0,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         self._check_url(url)
+        if cancel_event is not None and cancel_event.is_set():
+            raise ShareDownloadError("下载已取消")
         yt_dlp = self._load_yt_dlp()
         logger = _YDLLogger()
         root = self.output_dir.resolve()
@@ -656,7 +729,16 @@ class ShareDownloader:
         ffmpeg_location = _find_ffmpeg()
         has_ffmpeg = bool(ffmpeg_location)
 
+        def emit_progress() -> None:
+            if on_progress is not None:
+                try:
+                    on_progress(dict(progress))
+                except Exception:
+                    pass
+
         def hook(data: dict[str, Any]) -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ShareDownloadError("下载已取消")
             status = str(data.get("status") or "")
             progress["status"] = status
             for key in (
@@ -665,6 +747,19 @@ class ShareDownloader:
             ):
                 if data.get(key) is not None:
                     progress[key] = _json_value(data.get(key))
+            info_dict = data.get("info_dict")
+            if isinstance(info_dict, dict) and info_dict.get("title") and not progress.get("title"):
+                progress["title"] = str(info_dict.get("title") or "")[:200]
+            emit_progress()
+
+        def post_hook(data: dict[str, Any]) -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ShareDownloadError("下载已取消")
+            pp_status = str(data.get("status") or "")
+            if pp_status == "started":
+                progress["status"] = "postprocessing"
+                progress["postprocessor"] = str(data.get("postprocessor") or "")
+                emit_progress()
 
         options = self._base_options(logger=logger, proxy=proxy, cookie_file=cookie_file)
         options.update({
@@ -694,6 +789,7 @@ class ShareDownloader:
             "writeautomaticsub": bool(save_subtitles),
             "subtitleslangs": ["zh-Hans", "zh-Hant", "zh", "en"],
             "progress_hooks": [hook],
+            "postprocessor_hooks": [post_hook],
         })
         options.update(_download_format_options(quality, ffmpeg_location))
         if max_filesize_mb:
@@ -701,16 +797,36 @@ class ShareDownloader:
                 raise ShareDownloadError("max_filesize_mb 必须大于 0")
             options["max_filesize"] = int(max_filesize_mb) * 1024 * 1024
 
+        attempts = (
+            self._youtube_attempt_options(
+                options, quality=quality, ffmpeg_location=ffmpeg_location
+            )
+            if _is_youtube_url(url)
+            else [options]
+        )
+        info: Any = None
+        last_exc: Exception | None = None
+        last_detail = ""
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except Exception as exc:
-            detail = logger.errors[-1] if logger.errors else str(exc)
-            files = _list_output_files(job_dir)
-            raise ShareDownloadError(
-                f"{_clean_ydl_error(detail)}"
-                + (f"；已保留 {len(files)} 个临时/附属文件：{job_dir}" if files else "")
-            ) from exc
+            for idx, attempt_opts in enumerate(attempts):
+                if idx > 0:
+                    self._cleanup_partial_downloads(job_dir, temp_dir)
+                    logger.errors.clear()
+                try:
+                    with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                    last_exc = None
+                    last_detail = ""
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    last_detail = logger.errors[-1] if logger.errors else str(exc)
+            if last_exc is not None:
+                files = _list_output_files(job_dir)
+                raise ShareDownloadError(
+                    f"{_clean_ydl_error(last_detail or str(last_exc))}"
+                    + (f"；已保留 {len(files)} 个临时/附属文件：{job_dir}" if files else "")
+                ) from last_exc
         finally:
             try:
                 if temp_dir.exists() and not any(temp_dir.iterdir()):
@@ -752,8 +868,10 @@ class ShareDownloader:
         proxy: str = "",
         cookie_file: str = "",
         max_filesize_mb: int = 0,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
+        return await run_in_media_pool(
             self._download_sync,
             url,
             quality=quality,
@@ -763,6 +881,8 @@ class ShareDownloader:
             proxy=proxy,
             cookie_file=cookie_file,
             max_filesize_mb=max_filesize_mb,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
         )
 
 
@@ -787,7 +907,7 @@ def _clean_ydl_error(message: str) -> str:
         return (
             "这条分享口令对应的是抖音用户主页，不是单条视频作品；"
             "请进入具体视频后点击“分享→复制链接”。"
-            "如需持续下载该账号作品，可把该主页链接添加到“作品监控”"
+            "如需持续下载该账号作品，可把该主页链接添加到“主页作品监控”"
         )
     if (
         "unsupported url" in lowered

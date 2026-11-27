@@ -7,19 +7,22 @@ import random
 
 from sqlmodel import select
 
-from app.browser import fetch_facebook_post_detail, fetch_rednote_note_detail, fetch_twitter_tweet_detail, fetch_xhs_note_detail
+from app.browser import fetch_facebook_post_detail, fetch_rednote_note_detail, fetch_twitter_tweet_detail, fetch_xhs_note_detail, fetch_youtube_video_detail
 from app.db import get_session
 from app.engine.monitor_helpers import MAX_AUTO_RETRY, _loads, _loads_list, _tiktok_download_session, log
 from app.models import ContentRecord, DouyinAccount, MonitorTarget, NotificationChannel
 from app.notifier import notify_all
+from app.pacing import download_stagger
 from app.platforms.bilibili import BilibiliClient, cookie_map_from_state as bili_cookie_map
 from app.platforms.douyin.extract import Aweme, MediaItem
 from app.platforms.facebook import FacebookClient, parse_facebook_aweme, post_url as fb_post_url
+from app.platforms.youtube import YouTubeClient, cookie_map_from_state as yt_cookie_map, parse_youtube_aweme, video_url as yt_video_url
 from app.platforms.instagram import InstagramClient
 from app.platforms.rednote import parse_rednote_detail
 from app.platforms.tiktok.urls import profile_url as tiktok_profile_url, video_url as tiktok_video_url
 from app.platforms.twitter import TwitterClient, parse_twitter_aweme
 from app.platforms.xhs import parse_note_detail
+from app.progress_hub import progress_hub
 from app.risk import OperationKind
 from app.settings import get_setting
 
@@ -74,7 +77,7 @@ class MediaDownloadMixin:
             channels = [{"type": c.type, "config": _loads(c.config)} for c in chans]
         if not channels:
             return
-        title = f"作品监控 · {target_name} 新增 {len(awemes)} 个作品"
+        title = f"主页作品监控 · {target_name} 新增 {len(awemes)} 个作品"
         lines = []
         for aw in awemes[:6]:
             tag = "图集" if aw.media_type == "images" else "视频"
@@ -86,17 +89,76 @@ class MediaDownloadMixin:
         except Exception as e:
             log.warning("通知发送失败: %s", e)
 
+    @staticmethod
+    def _publish_download_progress(record_id: int, aweme, data: dict) -> None:
+        dl = int(data.get("downloaded_bytes") or 0)
+        tot = int(data.get("total_bytes") or 0)
+        pct = round(min(99.5, (dl * 100.0) / tot), 1) if tot > 0 else None
+        progress_hub.upsert(
+            f"download:content:{record_id}",
+            category="monitor_download",
+            title=str(getattr(aweme, "desc", "") or getattr(aweme, "aweme_id", "") or f"作品 #{record_id}")[:120],
+            platform=str(getattr(aweme, "platform", "") or ""),
+            source_tab="monitors",
+            status="running",
+            phase=str(data.get("phase") or "downloading"),
+            phase_label=str(data.get("phase_label") or "正在下载媒体"),
+            determinate=tot > 0,
+            percent=pct,
+            current=dl,
+            total=tot,
+            unit="bytes",
+            speed_bps=data.get("speed_bps"),
+            eta_seconds=data.get("eta_seconds"),
+            extra={"record_id": record_id},
+        )
+
     async def _download(self, record_id: int, aweme, base_dir: str = "", proxy: str = "",
                         *, user_agent: str = "", cookies=None, referer: str = ""):
+        await download_stagger(0.15, 0.6)
         async with self._sem:
             with get_session() as s:
                 rec = s.get(ContentRecord, record_id)
                 if rec:
                     rec.download_status = "downloading"
                     s.add(rec); s.commit()
+            title = str(getattr(aweme, "desc", "") or getattr(aweme, "aweme_id", "") or f"作品 #{record_id}")[:120]
+            pf = str(getattr(aweme, "platform", "") or "")
+            progress_hub.upsert(
+                f"download:content:{record_id}",
+                immediate=True,
+                category="monitor_download",
+                title=title,
+                platform=pf,
+                source_tab="monitors",
+                status="running",
+                phase="downloading",
+                phase_label="开始下载媒体",
+                determinate=False,
+                percent=None,
+                unit="bytes",
+                extra={"record_id": record_id},
+            )
             ok, path, err = await self.downloader.download_aweme(
                 aweme, base_dir, self._dl_proxy(proxy), user_agent=user_agent,
-                cookies=cookies, referer=referer)
+                cookies=cookies, referer=referer,
+                on_progress=lambda d: self._publish_download_progress(record_id, aweme, d),
+            )
+            progress_hub.upsert(
+                f"download:content:{record_id}",
+                immediate=True,
+                category="monitor_download",
+                title=title,
+                platform=pf,
+                source_tab="monitors",
+                status="completed" if ok else "failed",
+                phase="completed" if ok else "failed",
+                phase_label="下载完成" if ok else "下载失败",
+                error="" if ok else str(err or ""),
+                determinate=True if ok else False,
+                percent=100.0 if ok else None,
+                extra={"record_id": record_id},
+            )
             with get_session() as s:
                 rec = s.get(ContentRecord, record_id)
                 if rec:
@@ -168,17 +230,30 @@ class MediaDownloadMixin:
                 not media_json or not aw.medias)
             needs_fb_refetch = platform == "facebook" and (
                 not media_json or not aw.medias)
+            needs_yt_refetch = platform == "youtube" and (
+                not media_json or not aw.medias)
             rec.download_status = "downloading"
-            if not needs_xhs_refetch and not needs_bili_refetch and not needs_ig_refetch and not needs_tw_refetch and not needs_fb_refetch:
+            if not needs_xhs_refetch and not needs_bili_refetch and not needs_ig_refetch and not needs_tw_refetch and not needs_fb_refetch and not needs_yt_refetch:
                 rec.retry_count = (rec.retry_count or 0) + 1
             s.add(rec); s.commit()
+
+        if platform == "youtube" and (not media_json or not aw.medias):
+            aw.source_url = aw.source_url or yt_video_url(note_id)
+            aw.medias = [MediaItem(url=aw.source_url, kind="video", ext="mp4", index=0)]
+            media_json = json.dumps([{"url": aw.source_url, "kind": "video", "ext": "mp4", "index": 0}])
+            with get_session() as s:
+                rec = s.get(ContentRecord, record_id)
+                if rec:
+                    rec.retry_count = (rec.retry_count or 0) + 1
+                    rec.media_json = media_json
+                    s.add(rec); s.commit()
 
         if platform == "facebook" and (not media_json or not aw.medias):
             async def _refetch_fb():
                 target_u = aw.source_url or (note_id if str(note_id).startswith("http") else fb_post_url(note_id))
                 fcli = FacebookClient(
                     acc_state,
-                    (acc.ua if acc and acc.ua else self.cfg.engine.user_agent),
+                    self._direct_request_ua(identity if identity is not None else acc),
                     proxy=acc_proxy,
                     timeout=self.cfg.engine.request_timeout_seconds,
                 )
@@ -221,7 +296,7 @@ class MediaDownloadMixin:
             async def _refetch_tw():
                 tcli = TwitterClient(
                     acc_state,
-                    (acc.ua if acc and acc.ua else self.cfg.engine.user_agent),
+                    self._direct_request_ua(identity if identity is not None else acc),
                     proxy=acc_proxy,
                     timeout=self.cfg.engine.request_timeout_seconds,
                 )
@@ -275,7 +350,7 @@ class MediaDownloadMixin:
             async def _refetch_ig():
                 icli = InstagramClient(
                     acc_state,
-                    (acc.ua if acc and acc.ua else self.cfg.engine.user_agent),
+                    self._direct_request_ua(identity if identity is not None else acc),
                     proxy=acc_proxy,
                     timeout=self.cfg.engine.request_timeout_seconds,
                     account_seed=(
@@ -332,7 +407,7 @@ class MediaDownloadMixin:
             async def _refetch_bili():
                 bcli = BilibiliClient(
                     acc_state,
-                    (acc.ua if acc and acc.ua else self.cfg.engine.user_agent),
+                    self._direct_request_ua(identity if identity is not None else acc),
                     proxy=acc_proxy,
                     timeout=self.cfg.engine.request_timeout_seconds,
                 )
@@ -528,22 +603,29 @@ class MediaDownloadMixin:
             download_referer = aw.source_url or tiktok_profile_url(
                 t.sec_uid if t else "")
         elif platform == "bilibili":
-            download_ua = acc.ua if (acc and acc.ua) else self.cfg.engine.user_agent
+            download_ua = self._direct_request_ua(identity if identity is not None else acc)
             if acc_state:
                 download_cookies = bili_cookie_map(acc_state)
             download_referer = aw.source_url or f"https://www.bilibili.com/video/{note_id}"
         elif platform == "instagram":
-            download_ua = acc.ua if (acc and acc.ua) else self.cfg.engine.user_agent
+            download_ua = self._direct_request_ua(identity if identity is not None else acc)
             download_referer = "https://www.instagram.com/"
         elif platform == "twitter":
-            download_ua = acc.ua if (acc and acc.ua) else self.cfg.engine.user_agent
+            download_ua = self._direct_request_ua(identity if identity is not None else acc)
             download_referer = "https://x.com/"
         elif platform == "facebook":
-            download_ua = acc.ua if (acc and acc.ua) else self.cfg.engine.user_agent
+            download_ua = self._direct_request_ua(identity if identity is not None else acc)
             download_referer = "https://www.facebook.com/"
+        elif platform == "youtube":
+            download_ua = self._direct_request_ua(identity if identity is not None else acc)
+            download_referer = "https://www.youtube.com/"
+            if acc_state:
+                download_cookies = yt_cookie_map(acc_state)
         ok, path, err = await self.downloader.download_aweme(
             aw, base_dir, self._dl_proxy(acc_proxy), user_agent=download_ua,
-            cookies=download_cookies, referer=download_referer)
+            cookies=download_cookies, referer=download_referer,
+            on_progress=lambda d: self._publish_download_progress(record_id, aw, d),
+        )
         if not ok and platform == "bilibili" and not needs_bili_refetch and "403" in str(err):
             # B 站 CDN 防盗链签名过期时自动重拉一次最新直链重试下载
             bcli_refresh = BilibiliClient(
@@ -601,6 +683,21 @@ class MediaDownloadMixin:
                         seconds=backoff_sec * random.uniform(0.85, 1.35)
                     )
                 s.add(rec); s.commit()
+        progress_hub.upsert(
+            f"download:content:{record_id}",
+            immediate=True,
+            category="monitor_download",
+            title=str(getattr(aw, "desc", "") or getattr(aw, "aweme_id", "") or f"作品 #{record_id}")[:120],
+            platform=str(platform or ""),
+            source_tab="monitors",
+            status="completed" if ok else "failed",
+            phase="completed" if ok else "failed",
+            phase_label="下载完成" if ok else "下载失败",
+            error="" if ok else str(err or ""),
+            determinate=True if ok else False,
+            percent=100.0 if ok else None,
+            extra={"record_id": record_id},
+        )
         return {"ok": ok, "error": err}
 
     async def _retry_failed(self):

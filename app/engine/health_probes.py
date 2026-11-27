@@ -8,7 +8,7 @@ import time
 
 from sqlmodel import select
 
-from app.browser import fetch_account_works, fetch_bili_self_profile, fetch_channels_self_profile, fetch_douyin_account_works_api, fetch_facebook_self_profile, fetch_ig_self_profile, fetch_ks_self_profile, fetch_rednote_self_profile, fetch_self_profile, fetch_twitter_self_profile, fetch_xhs_self_profile
+from app.browser import fetch_account_works, fetch_bili_self_profile, fetch_channels_self_profile, fetch_douyin_account_works_api, fetch_facebook_self_profile, fetch_ig_self_profile, fetch_ks_self_profile, fetch_rednote_self_profile, fetch_self_profile, fetch_twitter_self_profile, fetch_xhs_self_profile, fetch_youtube_self_profile
 from app.browser.tiktok_fetcher import fetch_tiktok_self_profile
 from app.db import get_session
 from app.engine.monitor_helpers import _AccountCheckBusy, _TZ_COUNTRY, _loads, log
@@ -19,6 +19,7 @@ from app.platforms.bilibili import BilibiliClient
 from app.platforms.channels import parse_self_user as parse_channels_self_user
 from app.platforms.douyin import DouyinClient, cookie_from_state as dy_cookie_from_state, parse_self_user
 from app.platforms.facebook import FacebookClient, build_facebook_storage_state
+from app.platforms.youtube import YouTubeClient
 from app.platforms.instagram import InstagramClient
 from app.platforms.kuaishou import parse_self_user as parse_ks_self_user
 from app.platforms.rednote import (
@@ -34,6 +35,7 @@ from app.platforms.xhs import (
 )
 from app.risk import OperationKind, RiskCategory, classify_platform_error
 from app.services import thumb_cache
+from app.services.login_sessions import has_active_open_browser
 from app.services.session_keepalive import (
     _cookies_meaningfully_changed,
     _parse_state_dict,
@@ -54,6 +56,7 @@ _PLATFORM_LABELS = {
     "instagram": "Instagram",
     "twitter": "X (Twitter)",
     "facebook": "Facebook",
+    "youtube": "YouTube",
 }
 
 
@@ -268,7 +271,7 @@ class HealthProbeMixin:
         aid, platform, state, creator_state, proxy, identity = probe
         # A user-held window owns this lock for its whole lifetime. Never let
         # one busy account stall the scheduler and every other account's check.
-        if self.browser.lock_for(f"acc:{aid}").locked():
+        if await has_active_open_browser(aid) or self.browser.lock_for(f"acc:{aid}").locked():
             return {"ok": False, "deferred": True, "reason": "account_busy"}
         decision = self.risk.preflight(
             aid,
@@ -338,7 +341,7 @@ class HealthProbeMixin:
                     used_browser = False
                     if mode in {"api", "hybrid"} and cookie:
                         client = DouyinClient(
-                            cookie, identity.ua or self.cfg.engine.user_agent,
+                            cookie, self._direct_request_ua(identity),
                             timeout=self.cfg.engine.request_timeout_seconds,
                             proxy=proxy,
                             storage_state=dy_base_state,
@@ -513,7 +516,7 @@ class HealthProbeMixin:
                     if bmode in {"api", "hybrid"} and state:
                         bcli = BilibiliClient(
                             state,
-                            identity.ua or self.cfg.engine.user_agent,
+                            self._direct_request_ua(identity),
                             proxy=proxy,
                             timeout=self.cfg.engine.request_timeout_seconds,
                             account_seed=getattr(identity, "fp_seed", "") or str(aid),
@@ -673,7 +676,7 @@ class HealthProbeMixin:
                     if imode in {"api", "hybrid"} and state:
                         icli = InstagramClient(
                             state,
-                            identity.ua or self.cfg.engine.user_agent,
+                            self._direct_request_ua(identity),
                             proxy=proxy,
                             timeout=self.cfg.engine.request_timeout_seconds,
                             account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
@@ -693,8 +696,9 @@ class HealthProbeMixin:
                                 keepalive_notes.append("Instagram 会话已同步")
                     elif imode == "api" and not state:
                         u, err = {}, "logged_out:缺少 Instagram 登录态"
-                    auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
-                    if imode == "browser" or (not u and imode == "hybrid" and not auth_failed):
+                    err_category = classify_platform_error(err)[0] if err else RiskCategory.BUSINESS
+                    hard_block = err_category in {RiskCategory.AUTH, RiskCategory.RISK}
+                    if imode == "browser" or (not u and imode == "hybrid" and not hard_block):
                         u, err = await fetch_ig_self_profile(self.browser, identity)
                         used_browser = True
                     if u and used_browser:
@@ -715,7 +719,7 @@ class HealthProbeMixin:
                     if tmode in {"api", "hybrid"} and state:
                         tcli = TwitterClient(
                             state,
-                            identity.ua or self.cfg.engine.user_agent,
+                            self._direct_request_ua(identity),
                             proxy=proxy,
                             timeout=self.cfg.engine.request_timeout_seconds,
                         )
@@ -757,7 +761,7 @@ class HealthProbeMixin:
                     if fmode in {"api", "hybrid"} and state:
                         fcli = FacebookClient(
                             state,
-                            identity.ua or self.cfg.engine.user_agent,
+                            self._direct_request_ua(identity),
                             proxy=proxy,
                             timeout=self.cfg.engine.request_timeout_seconds,
                         )
@@ -790,6 +794,38 @@ class HealthProbeMixin:
                         ):
                             cookie_refreshed = True
                             keepalive_notes.append("Facebook 浏览器登录态已同步")
+
+                elif platform == "youtube":
+                    ymode = str(getattr(
+                        self.cfg.engine, "youtube_read_mode", "hybrid") or "hybrid").lower()
+                    u, err = {}, ""
+                    used_browser = False
+                    if ymode in {"api", "hybrid"} and state:
+                        ycli = YouTubeClient(
+                            state,
+                            self._direct_request_ua(identity),
+                            proxy=proxy,
+                            timeout=self.cfg.engine.request_timeout_seconds,
+                            locale=identity.locale or "en-US",
+                        )
+                        async with ycli.session_scope():
+                            u, err = await ycli.fetch_self_profile()
+                    elif ymode == "api" and not state:
+                        u, err = {}, "logged_out:缺少 YouTube 登录态"
+                    hard_block = str(err or "").startswith(("verification_required:", "rate_limit:"))
+                    if ymode == "browser" or (not u and ymode == "hybrid" and not hard_block):
+                        u, err = await fetch_youtube_self_profile(self.browser, identity)
+                        used_browser = True
+                    if u and used_browser:
+                        if await self._sync_browser_session_state(
+                            aid, "youtube", identity, state,
+                            expected_creator_state=creator_state,
+                            scope="read",
+                            sync_cookie_str=True,
+                            note="YouTube 浏览器登录态已同步",
+                        ):
+                            cookie_refreshed = True
+                            keepalive_notes.append("YouTube 浏览器登录态已同步")
 
                 else:
                     u, err = await fetch_self_profile(self.browser, identity)
@@ -840,7 +876,7 @@ class HealthProbeMixin:
                         "following_count": int(u.get("following_count") or 0),
                         "aweme_count": int(u.get("video_count") or 0),
                     }
-                elif platform in {"bilibili", "instagram", "twitter", "facebook"}:
+                elif platform in {"bilibili", "instagram", "twitter", "facebook", "youtube"}:
                     parsed = dict(u)
                 else:
                     parsed = parse_self_user(u)
@@ -853,6 +889,11 @@ class HealthProbeMixin:
                     else ("已同步最新登录态" if cookie_refreshed else "登录态有效")
                 )
                 account.keepalive_note = final_note[:200]
+                if platform == "youtube":
+                    if account.sec_uid and "@" in account.sec_uid and not account.sec_uid.startswith("@"):
+                        account.sec_uid = ""
+                    if account.douyin_id and "@" in account.douyin_id and not account.douyin_id.startswith("@"):
+                        account.douyin_id = ""
                 if parsed.get("nickname"):
                     account.nickname = parsed["nickname"]
                 account.sec_uid = parsed.get("sec_uid") or account.sec_uid
@@ -904,6 +945,30 @@ class HealthProbeMixin:
                     account.total_favorited = int(parsed.get("total_favorited") or 0) or account.total_favorited
                     if parsed.get("gender"):
                         account.gender = str(parsed.get("gender") or "")
+                elif platform == "youtube":
+                    works_cnt = len(session.exec(
+                        select(AccountWork.id).where(AccountWork.account_id == aid)
+                    ).all())
+                    following_cnt = len(session.exec(
+                        select(FollowEdge.id).where(
+                            FollowEdge.account_id == aid,
+                            FollowEdge.direction == "following",
+                        )
+                    ).all())
+                    raw_subs = int(parsed.get("follower_count") or 0)
+                    if raw_subs > 0:
+                        account.follower_count = raw_subs
+                    account.following_count = max(
+                        int(parsed.get("following_count") or 0),
+                        int(account.following_count or 0),
+                        following_cnt,
+                    )
+                    account.aweme_count = max(
+                        int(parsed.get("aweme_count") or 0),
+                        int(account.aweme_count or 0),
+                        works_cnt,
+                    )
+                    account.total_favorited = int(parsed.get("total_favorited") or 0) or account.total_favorited
                 else:
                     account.follower_count = parsed.get("follower_count") or account.follower_count
                     account.aweme_count = parsed.get("aweme_count") or account.aweme_count
@@ -1010,6 +1075,8 @@ class HealthProbeMixin:
             states = session.exec(select(AccountRiskState).where(
                 AccountRiskState.risk_level > 0)).all()
             for risk_state in states:
+                if risk_state.manual_review_required:
+                    continue
                 account = session.get(DouyinAccount, risk_state.account_id)
                 if not account or account.status == "invalid" \
                         or not (account.storage_state or account.creator_storage_state):
@@ -1048,10 +1115,21 @@ class HealthProbeMixin:
         if not sweep_due and not sph_due and not self._pending_account_checks:
             return
         with get_session() as session:
+            manual_review_ids: set[int] = set()
+            if self.risk.policy.enabled and self.risk._cooldown_active():
+                manual_review_ids = {
+                    int(aid) for aid in session.exec(
+                        select(AccountRiskState.account_id).where(
+                            AccountRiskState.manual_review_required == True  # noqa: E712
+                        )
+                    ).all()
+                    if aid
+                }
             rows = [
                 account for account in session.exec(select(DouyinAccount)).all()
                 if (account.storage_state or account.creator_storage_state)
                 and account.status != "invalid"
+                and account.id not in manual_review_ids
             ]
             probes = [self._account_probe_tuple(account) for account in rows]
             priority_ids = {
@@ -1115,16 +1193,18 @@ class HealthProbeMixin:
         )
         with get_session() as s:
             accs = [(a.id, a.platform,
-                     (a.sec_uid or a.uid or a.douyin_id or "") if a.platform in {"instagram", "twitter", "facebook"} else (a.sec_uid or ""),
+                     (a.sec_uid or a.uid or a.douyin_id or "") if a.platform in {"instagram", "twitter", "facebook", "youtube"} else (a.sec_uid or ""),
                      self.browser.identity_for(a))
                     for a in s.exec(select(DouyinAccount)).all()
                     if a.status != "invalid" and (a.storage_state or a.creator_storage_state)]
         for aid, platform, uid, identity in accs:
+            if await has_active_open_browser(aid) or self.browser.lock_for(f"acc:{aid}").locked():
+                continue
             decision = self.risk.preflight(aid, OperationKind.READ_HEAVY)
             if not decision.allowed:
                 continue
             try:
-                async with self._operation_guard(aid, OperationKind.READ_HEAVY):
+                async with self._operation_guard(aid, OperationKind.READ_HEAVY, skip_busy=True):
                     if not self.risk.preflight(
                             aid, OperationKind.READ_HEAVY).allowed:
                         continue
@@ -1132,7 +1212,7 @@ class HealthProbeMixin:
                         with get_session() as s:
                             acc_row = s.get(DouyinAccount, aid)
                             state = (acc_row.storage_state or acc_row.creator_storage_state or "") if acc_row else ""
-                            ua = (acc_row.ua or self.cfg.engine.user_agent) if acc_row else self.cfg.engine.user_agent
+                            ua = self._direct_request_ua(identity if identity is not None else acc_row)
                             proxy = (acc_row.proxy or "") if acc_row else ""
                         items, err = await fetch_douyin_account_works_api(
                             dy_cookie_from_state(state), ua, uid,
@@ -1150,6 +1230,8 @@ class HealthProbeMixin:
                         self.risk.record_failure(aid, OperationKind.READ_HEAVY, err)
                     else:
                         self.risk.record_success(aid, OperationKind.READ_HEAVY)
+            except _AccountCheckBusy:
+                continue
             except Exception as e:
                 self.risk.record_failure(aid, OperationKind.READ_HEAVY, e)
                 log.warning("作品健康:账号 %s 抓取失败 %s", aid, e)

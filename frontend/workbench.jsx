@@ -30,16 +30,15 @@ document.querySelectorAll("main > [data-panel]").forEach(panel => {
 });
 
 const composerSpecs = {
-  monitors: ["t-url", "新建作品监控", "粘贴目标，选择账号与采集策略。"],
-  collections: ["col-keywords", "新建作品采集", "设置来源与采集上限，提交后在列表查看进度。"],
-  comments: ["w-url", "新建评论监控", "选择作品或账号，持续收集评论。"],
-  danmaku: ["d-w-url", "新建弹幕监控", "保留弹幕时间点，分别设置来源与采集范围。"],
+  monitors: ["t-url", "新建主页作品监控", "粘贴创作者主页链接或 ID，选择账号与下载策略（单条作品请前往「链接下载」）。"],
+  collections: ["col-keywords", "新建关键词采集", "输入关键词并设置采集上限与筛选条件，提交后在列表查看进度。"],
+  comments: ["w-url", "新建评论监控", "粘贴单条作品或创作者主页链接，将自动识别对象类型并持续收集评论。"],
+  danmaku: ["d-w-url", "新建弹幕监控", "粘贴视频或账号主页链接，自动识别对象类型并保留视频时间点弹幕。"],
   autocomment: ["ac-templates", "新建评论规则", "规则默认关闭，先试跑、检查文案，再手动启用。"],
   notifications: ["n-name", "添加通知渠道", "配置推送渠道，添加后可发送测试通知。"],
 };
 const composerTitle = (key, platform) => key === "collections"
-  ? platform === "shipinhao" ? "新建视频号作品采集"
-    : `新建${({ douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook" })[platform] || "平台"}关键词采集`
+  ? `新建${({ douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook", youtube: "YouTube" })[platform] || "平台"}关键词采集`
   : composerSpecs[key]?.[1] || "新建任务";
 // Notifications previously mixed configuration and saved objects in one card.
 const notificationCard = $("n-name").closest(".card");
@@ -78,9 +77,10 @@ const groupSpecs = {
   comments: [["targets", "监控目标"], ["records", "评论记录"]],
   danmaku: [["targets", "监控目标"], ["records", "弹幕记录"]],
   autocomment: [["rules", "评论规则"], ["tasks", "任务与审核"]],
-  publish: [["matrix", "矩阵多号群发"], ["editor", "单号精细发布", null, true], ["records", "发布记录"], ["published", "已发布作品", ["xhs", "rednote"], true]],
+  publish: [["editor", "单号精细发布", null, true], ["matrix", "矩阵多号群发", null, false, "同平台多号群发"], ["records", "发布记录"], ["published", "已发布作品", ["xhs", "rednote"], true]],
   notifications: [["channels", "通知渠道"], ["webhooks", "Webhook 订阅"]],
   "risk-control": [["status", "账号状态"], ["rules", "风控规则"]],
+  "youtube-tools": [["yt-interact", "互动操作"], ["yt-watch", "真实观看"], ["yt-warmup", "关键词养号"], ["yt-discover", "发现与多频道"]],
 };
 const groups = Object.entries(groupSpecs).map(([key, spec]) => {
   const panel = panels.get(key);
@@ -90,8 +90,8 @@ const groups = Object.entries(groupSpecs).map(([key, spec]) => {
   panel.prepend(target);
   // Match stable section keys, not card positions: inserting a card must never
   // put its content under another tab's label.
-  const items = spec.map(([value, label, platforms, singlePfOnly]) => ({
-    value, label, platforms, singlePfOnly: !!singlePfOnly, node: nodes.find(node => node.dataset.section === value),
+  const items = spec.map(([value, label, platforms, singlePfOnly, singleLabel]) => ({
+    value, label, singleLabel: singleLabel || "", platforms, singlePfOnly: !!singlePfOnly, node: nodes.find(node => node.dataset.section === value),
   })).filter(x => x.node);
   items.forEach(item => parking.append(item.node));
   // Risk counts belong with status, not above every configuration view.
@@ -186,14 +186,25 @@ function NodeHost({ node, className = "" }) {
 }
 const tabSetters = new Map();
 function SectionTabs({ group, platform, globalMode }) {
-  const [value, setValue] = useState(group.items[0].value);
-  const root = useRef(null), list = useRef(null), previous = useRef(value);
-  const visible = group.items.filter(item => (!item.singlePfOnly || !globalMode) && !item.node.hidden && (!item.platforms || item.platforms.includes(platform)));
+  const visible = group.items
+    .filter(item => (!item.singlePfOnly || !globalMode) && !item.node.hidden && (!item.platforms || item.platforms.includes(platform)))
+    .map(item => ({ ...item, label: !globalMode && item.singleLabel ? item.singleLabel : item.label }));
+  const [value, setValue] = useState(() => visible[0]?.value || group.items[0].value);
+  const root = useRef(null), list = useRef(null), previous = useRef(value), prevGlobal = useRef(globalMode);
   useLayoutEffect(() => {
     tabSetters.set(group.key, setValue);
     return () => tabSetters.delete(group.key);
   }, [group]);
-  useEffect(() => { if (visible.length && !visible.some(item => item.value === value)) setValue(visible[0].value); }, [platform, globalMode]);
+  useEffect(() => {
+    const modeChanged = prevGlobal.current !== globalMode;
+    prevGlobal.current = globalMode;
+    if (!visible.length) return;
+    if (!visible.some(item => item.value === value)) {
+      setValue(visible[0].value);
+    } else if (modeChanged && group.key === "publish" && !globalMode && value === "matrix") {
+      setValue(visible[0].value);
+    }
+  }, [platform, globalMode]);
   useLayoutEffect(() => selectionMarker(list.current, '[data-state="active"]', "line"), []);
   useLayoutEffect(() => {
     if (previous.current !== value) {
@@ -476,8 +487,6 @@ function App() {
         <button type="button" className="ghost wb-icon-button" aria-label="刷新当前页面" title="刷新当前页面" aria-busy={retrying} data-feedback={refreshFeedback === "已刷新" ? "success" : undefined} onClick={retry} disabled={retrying || !online}><Icon name={refreshFeedback === "已刷新" ? "check" : "refresh"} /></button>
         <span className="wb-refresh-feedback" role="status">{retrying ? "正在刷新…" : refreshFeedback}</span>
       </span>
-      {ctx.tab === "accounts" && !ctx.globalMode && <ActionMenu label="添加平台账号" triggerLabel="添加账号" heading="选择登录方式" icon="plus"
-        buttons={[...loginChoices.querySelectorAll("button")].filter(button => !button.classList.contains("hidden"))} onOpenChange={open => { menuOpen = open; }} />}
       {composers[ctx.tab] && !ctx.globalMode && <button type="button" id="wb-create" onClick={() => openComposer(ctx.tab)}><Icon name="plus" />{composerTitle(ctx.tab, ctx.platform)}</button>}
       {ctx.tab === "overview" && <button type="button" onClick={() => bridge.navigate("publish", true)}><Icon name="plus" />{ctx.globalMode ? "矩阵群发" : "创作内容"}</button>}
     </div>, actionTarget)}
@@ -556,7 +565,7 @@ const badgeObserver = new MutationObserver(records => records.forEach(record => 
 }));
 document.querySelectorAll(".nav-badge").forEach(badge => { badge.classList.toggle("wb-zero", badge.textContent.trim() === "0"); badgeObserver.observe(badge, { childList: true, characterData: true, subtree: true }); });
 // Stacked record rows on narrow screens keep column context and every action.
-for (const id of ["mon-table", "watch-table", "danmaku-watch-table", "queue-table", "pub-table", "ac-rule-table", "ac-task-table", "n-table", "risk-account-table", "runtime-table", "proxy-table", "wh-table", "wh-event-table", "tk-user-results", "following-table", "fans-table"]) {
+for (const id of ["mon-table", "watch-table", "danmaku-watch-table", "queue-table", "pub-table", "ac-rule-table", "ac-task-table", "n-table", "risk-account-table", "runtime-table", "proxy-table", "wh-table", "wh-event-table", "tk-user-results", "yt-search-results", "yt-channel-results", "yt-warmup-results", "following-table", "fans-table"]) {
   const node = $(id), table = node.tagName === "TABLE" ? node : node.closest("table");
   table.dataset.objectTable = "";
   const labelRows = () => {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Icon, SelectBox } from "../ui/primitives";
 import {
   PLATFORMS,
@@ -14,7 +14,12 @@ export function MatrixBatchPublisher({ ctx }) {
   const [selectedAccIds, setSelectedAccIds] = useState(() => new Set(window.__chPublishPresetAccounts || []));
   const [mediaType, setMediaType] = useState("video");
   const [uploadedFiles, setUploadedFiles] = useState([]); // [{ path, name }]
+  const [coverFile, setCoverFile] = useState(null); // { path, name, previewUrl }
+  const [uploadingCover, setUploadingCover] = useState(false);
+  const [publishAction, setPublishAction] = useState("publish"); // publish | draft
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(null); // { percent, loaded, total, speedBps, etaSeconds }
+  const uploadAbortRef = useRef(null);
   const [submitting, setSubmitting] = useState(false);
 
   const [title, setTitle] = useState("");
@@ -69,6 +74,43 @@ export function MatrixBatchPublisher({ ctx }) {
     };
   }, [loadAccounts]);
 
+  const pfMeta = PF_MAP[ctx.platform] || PLATFORMS[0];
+  const pfName = pfMeta.name;
+  const videoOnlyPlatform = !ctx.globalMode && (ctx.platform === "tiktok" || ctx.platform === "youtube");
+
+  const scopedAccounts = useMemo(
+    () => (ctx.globalMode ? accounts : accounts.filter(a => a.platform === ctx.platform)),
+    [accounts, ctx.globalMode, ctx.platform]
+  );
+
+  const scopedGroups = useMemo(() => {
+    if (ctx.globalMode) return groups;
+    const used = new Set(scopedAccounts.map(a => a.group_name).filter(Boolean));
+    return groups.filter(g => used.has(g.name));
+  }, [groups, scopedAccounts, ctx.globalMode]);
+
+  useEffect(() => {
+    if (videoOnlyPlatform && mediaType !== "video") {
+      setMediaType("video");
+      setUploadedFiles([]);
+    }
+  }, [videoOnlyPlatform, mediaType]);
+
+  useEffect(() => {
+    if (ctx.globalMode || !accounts.length) return;
+    const allowedIds = new Set(scopedAccounts.map(a => a.id));
+    setSelectedAccIds(prev => {
+      if (!prev.size) return prev;
+      let changed = false;
+      const next = new Set();
+      prev.forEach(id => {
+        if (allowedIds.has(id)) next.add(id);
+        else changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [ctx.globalMode, ctx.platform, accounts.length, scopedAccounts]);
+
   const toggleAcc = id => {
     setSelectedAccIds(prev => {
       const next = new Set(prev);
@@ -78,7 +120,7 @@ export function MatrixBatchPublisher({ ctx }) {
   };
 
   const selectByGroup = groupName => {
-    const matching = accounts.filter(a => a.group_name === groupName && a.status !== "invalid").map(a => a.id);
+    const matching = scopedAccounts.filter(a => a.group_name === groupName && a.status !== "invalid").map(a => a.id);
     if (!matching.length) {
       matrixToast("该分组下暂无可用的在线账号", "info");
       return;
@@ -92,9 +134,9 @@ export function MatrixBatchPublisher({ ctx }) {
   };
 
   const selectAllPublishRoles = () => {
-    const ids = accounts.filter(a => a.status !== "invalid" && a.account_role === "publish").map(a => a.id);
+    const ids = scopedAccounts.filter(a => a.status !== "invalid" && a.account_role === "publish").map(a => a.id);
     if (!ids.length) {
-      const fallback = accounts.filter(a => a.status !== "invalid" && a.account_role !== "crawler").map(a => a.id);
+      const fallback = scopedAccounts.filter(a => a.status !== "invalid" && a.account_role !== "crawler").map(a => a.id);
       setSelectedAccIds(new Set(fallback));
       return;
     }
@@ -105,24 +147,69 @@ export function MatrixBatchPublisher({ ctx }) {
     const rawFiles = Array.from(e.target.files || []);
     if (!rawFiles.length) return;
     setUploading(true);
+    const totalBytes = rawFiles.reduce((s, f) => s + (f.size || 0), 0);
+    setUploadProgress({ loaded: 0, total: totalBytes, percent: 0, speedBps: 0, etaSeconds: null });
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
     try {
       const fd = new FormData();
       rawFiles.forEach(f => fd.append("files", f));
-      const res = await matrixApi("/api/publish/upload", { method: "POST", body: fd });
+      const res = typeof window.apiUploadWithProgress === "function"
+        ? await window.apiUploadWithProgress("/api/publish/upload", fd, {
+            signal: controller.signal,
+            onProgress: prog => setUploadProgress(prog),
+          })
+        : await matrixApi("/api/publish/upload", { method: "POST", body: fd });
       const saved = Array.isArray(res.files) ? res.files : [];
       setUploadedFiles(prev => (mediaType === "video" ? saved.slice(0, 1) : [...prev, ...saved].slice(0, 18)));
       matrixToast(`已上传准备 ${saved.length} 个素材文件`, "ok");
     } catch (err) {
       matrixToast("素材上传失败：" + err.message, "err");
     } finally {
+      uploadAbortRef.current = null;
       setUploading(false);
+      setUploadProgress(null);
       e.target.value = "";
     }
   };
 
+  const handleCoverChange = async e => {
+    const file = (e.target.files || [])[0];
+    if (!file) return;
+    setUploadingCover(true);
+    try {
+      const fd = new FormData();
+      fd.append("files", file);
+      const res = await matrixApi("/api/publish/upload", { method: "POST", body: fd });
+      const saved = Array.isArray(res.files) ? res.files[0] : null;
+      if (!saved?.path) throw new Error("封面上传返回为空");
+      setCoverFile(prev => {
+        if (prev?.previewUrl) {
+          try { URL.revokeObjectURL(prev.previewUrl); } catch (_) {}
+        }
+        return { path: saved.path, name: saved.name || file.name, previewUrl: URL.createObjectURL(file) };
+      });
+      matrixToast(`已上传自定义封面：${file.name}`, "ok");
+    } catch (err) {
+      matrixToast("自定义封面上传失败：" + err.message, "err");
+    } finally {
+      setUploadingCover(false);
+      e.target.value = "";
+    }
+  };
+
+  const clearCover = () => {
+    setCoverFile(prev => {
+      if (prev?.previewUrl) {
+        try { URL.revokeObjectURL(prev.previewUrl); } catch (_) {}
+      }
+      return null;
+    });
+  };
+
   const selectedAccounts = useMemo(
-    () => accounts.filter(a => selectedAccIds.has(a.id)),
-    [accounts, selectedAccIds]
+    () => scopedAccounts.filter(a => selectedAccIds.has(a.id)),
+    [scopedAccounts, selectedAccIds]
   );
 
   const selectedPlatforms = useMemo(
@@ -132,19 +219,19 @@ export function MatrixBatchPublisher({ ctx }) {
 
   const crawlerSelectedCount = selectedAccounts.filter(a => a.account_role === "crawler").length;
 
-  const submitBatch = async e => {
-    e.preventDefault();
+  const submitBatch = async (e, { saveAsDraft = false } = {}) => {
+    if (e?.preventDefault) e.preventDefault();
     if (!selectedAccounts.length) {
       matrixToast("请至少勾选 1 个目标发布账号", "err");
       return;
     }
     const requiresMedia = selectedAccounts.some(a => a.platform !== "twitter" && a.platform !== "facebook");
-    if (requiresMedia && uploadedFiles.length === 0) {
+    if (!saveAsDraft && requiresMedia && uploadedFiles.length === 0) {
       matrixToast("所选平台需要上传至少 1 个视频或图片素材", "err");
       return;
     }
-    if (!requiresMedia && uploadedFiles.length === 0 && !(title.trim() || desc.trim())) {
-      matrixToast("纯文本发布请填写标题或正文内容，或上传图片/视频素材", "err");
+    if (uploadedFiles.length === 0 && !(title.trim() || desc.trim() || coverFile?.path)) {
+      matrixToast(saveAsDraft ? "暂存本地草稿请填写标题/正文，或上传媒体/封面" : "纯文本发布请填写标题或正文内容，或上传图片/视频素材", "err");
       return;
     }
     setSubmitting(true);
@@ -162,6 +249,9 @@ export function MatrixBatchPublisher({ ctx }) {
           account_ids: selectedAccounts.map(a => a.id),
           media_type: mediaType,
           media_paths: uploadedFiles.map(f => f.path),
+          cover_path: coverFile?.path || "",
+          publish_action: publishAction,
+          save_as_draft: Boolean(saveAsDraft),
           title,
           desc,
           topics,
@@ -172,8 +262,11 @@ export function MatrixBatchPublisher({ ctx }) {
           platform_overrides: overrides,
         }),
       });
+      const kindLabel = saveAsDraft
+        ? "本地草稿"
+        : (publishAction === "draft" ? "平台草稿推送任务" : "跨账号发布任务");
       matrixToast(
-        `已成功创建 ${res.created_count} 条跨账号发布任务${res.skipped_count ? `（跳过 ${res.skipped_count} 个不满足条件的账号）` : ""}`,
+        `已成功创建 ${res.created_count} 条${kindLabel}${res.skipped_count ? `（跳过 ${res.skipped_count} 个不满足条件的账号）` : ""}`,
         "ok",
         6000
       );
@@ -181,6 +274,7 @@ export function MatrixBatchPublisher({ ctx }) {
       setDesc("");
       setTopics("");
       setUploadedFiles([]);
+      clearCover();
       setSourceMeta({ source_platform: "", source_content_id: null });
       if (typeof window.refreshPublish === "function") window.refreshPublish();
       window.CreatorHubWorkbench?.showSection?.("publish", "records");
@@ -195,20 +289,26 @@ export function MatrixBatchPublisher({ ctx }) {
     <form className="mx-pub-wrap" onSubmit={submitBatch}>
       <div className="mx-sec-head">
         <div>
-          <h3><Icon name="send" />跨平台 / 多账号矩阵错峰群发</h3>
+          <h3><Icon name="send" />{ctx.globalMode ? "跨平台 / 多账号矩阵错峰群发" : `${pfName} · 同平台多账号错峰群发`}</h3>
           <p className="mut" style={{ margin: "4px 0 0", fontSize: "12.5px" }}>
-            一次上传素材与主文案，按「跨平台矩阵组」一键勾选多号，自动适配各平台标题上限并按设定间隔错峰入队。
+            {ctx.globalMode
+              ? "一次上传素材与主文案，按「跨平台矩阵组」一键勾选多号，自动适配各平台标题上限并按设定间隔错峰入队。"
+              : `一次上传素材与主文案，勾选多个 ${pfName} 账号按设定间隔错峰入队。`}
           </p>
         </div>
       </div>
 
-      {/* Multi-Platform Account Matrix Picker */}
+      {/* Account Matrix Picker */}
       <div className="mx-pub-step">
         <div className="mx-pub-step-head">
-          <b>1. 选择分发目标账号（已选 {selectedAccounts.length} 个账号，跨 {selectedPlatforms.length} 个平台）</b>
+          <b>
+            {ctx.globalMode
+              ? `1. 选择分发目标账号（已选 ${selectedAccounts.length} 个账号，跨 ${selectedPlatforms.length} 个平台）`
+              : `1. 选择 ${pfName} 发布账号（已选 ${selectedAccounts.length} 个账号）`}
+          </b>
           <div className="mx-pub-quick-picks">
             <button type="button" className="ghost sm" onClick={selectAllPublishRoles}>一键勾选创作主号</button>
-            {groups.map(g => (
+            {scopedGroups.map(g => (
               <button key={g.name} type="button" className="ghost sm" onClick={() => selectByGroup(g.name)}>
                 <Icon name="folder" /><span>{g.name}</span>
               </button>
@@ -227,18 +327,24 @@ export function MatrixBatchPublisher({ ctx }) {
         )}
 
         <div className="mx-pub-acc-grid">
-          {accounts.length === 0 ? (
-            <div className="mx-empty-compact">暂无已接入账号，请先前往「账号矩阵」扫码添加账号。</div>
+          {scopedAccounts.length === 0 ? (
+            <div className="mx-empty-compact">
+              {ctx.globalMode
+                ? "暂无已接入账号，请先前往「账号矩阵」扫码添加账号。"
+                : `暂无已接入的 ${pfName} 账号，请先前往「账号矩阵」添加账号。`}
+            </div>
           ) : (
-            accounts.map(acc => {
+            scopedAccounts.map(acc => {
               const pf = PF_MAP[acc.platform] || { short: acc.platform, color: "#64748b" };
               const checked = selectedAccIds.has(acc.id);
-              const disabled = acc.status === "invalid" || (acc.platform === "xhs" && !acc.has_creator) || (mediaType === "images" && acc.platform === "tiktok");
+              const disabled = acc.status === "invalid"
+                || (acc.platform === "xhs" && !acc.has_creator)
+                || (mediaType === "images" && (acc.platform === "tiktok" || acc.platform === "youtube"));
               return (
                 <label
                   key={acc.id}
                   className={`mx-pub-acc-item ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}`}
-                  title={disabled ? "登录失效、缺创作者授权或 TikTok 仅支持视频" : acc.display_name}
+                  title={disabled ? "登录失效、缺创作者授权或该平台仅支持视频" : acc.display_name}
                 >
                   <input
                     type="checkbox"
@@ -268,9 +374,11 @@ export function MatrixBatchPublisher({ ctx }) {
                 value={mediaType}
                 onChange={val => { setMediaType(val); setUploadedFiles([]); }}
                 ariaLabel="素材载体类型"
-                options={[
-                  { value: "video", label: "短视频（单视频全平台通用）", icon: "film" },
-                  { value: "images", label: "图文 / 图集（多图轮播，TikTok 除外）", icon: "image" },
+                options={videoOnlyPlatform ? [
+                  { value: "video", label: `视频（${pfName} 仅支持视频）`, icon: "film" },
+                ] : [
+                  { value: "video", label: ctx.globalMode ? "短视频（单视频全平台通用）" : "视频", icon: "film" },
+                  { value: "images", label: ctx.globalMode ? "图文 / 图集（多图轮播，TikTok / YouTube 除外）" : "图文 / 图集（多图轮播）", icon: "image" },
                 ]}
               />
             </div>
@@ -284,8 +392,31 @@ export function MatrixBatchPublisher({ ctx }) {
                   onChange={handleFileChange}
                 />
                 <Icon name="download" />
-                <span>{uploading ? "正在上传素材…" : (mediaType === "video" ? "点击选择本地视频文件" : "点击选择图片（支持多选）")}</span>
+                <span>{uploading ? `正在上传素材${uploadProgress?.percent != null ? ` ${uploadProgress.percent}%` : ""}…` : (mediaType === "video" ? "点击选择本地视频文件" : "点击选择图片（支持多选）")}</span>
               </label>
+              {uploading && uploadProgress && (() => {
+                const P = window.CreatorHubProgress;
+                const pct = uploadProgress.percent != null ? Math.round(uploadProgress.percent) : null;
+                const meta = [
+                  uploadProgress.total > 0 && P ? `${P.fmtBytes(uploadProgress.loaded)} / ${P.fmtBytes(uploadProgress.total)}` : "",
+                  uploadProgress.speedBps > 0 && P ? P.fmtSpeed(uploadProgress.speedBps) : "",
+                  uploadProgress.etaSeconds > 0 && P ? P.fmtEta(uploadProgress.etaSeconds) : "",
+                ].filter(Boolean).join(" · ");
+                return (
+                  <div className="pub-upload-progress">
+                    <div className="pub-upload-progress-head">
+                      <span className="mut progress-num">{meta || "正在写入本地素材…"}</span>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
+                        <b className="progress-num">{pct != null ? `${pct}%` : "上传中"}</b>
+                        <button type="button" className="ghost sm danger" style={{ minHeight: "22px", padding: "1px 7px" }} onClick={() => uploadAbortRef.current?.abort()}>取消</button>
+                      </span>
+                    </div>
+                    <div className={`progress-track is-compact ${pct == null ? "is-indeterminate" : ""}`}>
+                      <div className="progress-fill" style={pct != null ? { width: `${pct}%` } : undefined} />
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
@@ -300,6 +431,43 @@ export function MatrixBatchPublisher({ ctx }) {
               ))}
             </div>
           )}
+
+          <div className="form-grid">
+            <div className="form-field">
+              <label>自定义封面（可选，JPG / PNG / WEBP）{uploadingCover ? "（上传中…）" : ""}</label>
+              <label className="mx-file-drop">
+                <input
+                  type="file"
+                  accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                  onChange={handleCoverChange}
+                />
+                <Icon name="image" />
+                <span>{uploadingCover ? "正在上传封面图…" : (coverFile ? `更换封面（已选：${coverFile.name}）` : "点击选择自定义封面图（留空用默认/首帧）")}</span>
+              </label>
+              {coverFile && (
+                <div className="mx-uploaded-pills" style={{ marginTop: "6px" }}>
+                  <span className="mx-file-pill mx-cover-pill">
+                    {coverFile.previewUrl && <img src={coverFile.previewUrl} alt="" />}
+                    <span>{coverFile.name}</span>
+                    <button type="button" onClick={clearCover} aria-label="移除封面"><Icon name="x" /></button>
+                  </span>
+                </div>
+              )}
+            </div>
+            <div className="form-field">
+              <label>各平台执行动作</label>
+              <SelectBox
+                full
+                value={publishAction}
+                onChange={setPublishAction}
+                ariaLabel="各平台执行动作"
+                options={[
+                  { value: "publish", label: "直接发布作品", icon: "send" },
+                  { value: "draft", label: "暂存到各平台草稿箱（不直接公开）", icon: "edit" },
+                ]}
+              />
+            </div>
+          </div>
 
           <div>
             <label className="field">通用主标题（各平台超出上限将自动安全截断，也可在右侧单独定制）</label>
@@ -357,9 +525,13 @@ export function MatrixBatchPublisher({ ctx }) {
 
         {/* Right Preview & Per-Platform Title Cap / Override Inspector */}
         <aside className="mx-pub-side">
-          <h4>各平台适配检查与微调</h4>
+          <h4>{ctx.globalMode ? "各平台适配检查与微调" : `${pfName} 标题字数校验与微调`}</h4>
           {selectedPlatforms.length === 0 ? (
-            <p className="mut" style={{ fontSize: "12.5px" }}>先在上方勾选账号，这里会实时显示各目标平台的字数校验与单独改写框。</p>
+            <p className="mut" style={{ fontSize: "12.5px" }}>
+              {ctx.globalMode
+                ? "先在上方勾选账号，这里会实时显示各目标平台的字数校验与单独改写框。"
+                : `先在上方勾选 ${pfName} 账号，这里会实时显示标题字数上限校验。`}
+            </p>
           ) : (
             <div className="mx-pf-overrides">
               {selectedPlatforms.map(pfId => {
@@ -390,9 +562,24 @@ export function MatrixBatchPublisher({ ctx }) {
           )}
 
           <div className="mx-pub-submit-box">
-            <button type="submit" disabled={submitting || uploading || selectedAccounts.length === 0}>
+            <button type="submit" disabled={submitting || uploading || uploadingCover || selectedAccounts.length === 0}>
               <Icon name="send" />
-              <span>{submitting ? "正在拆分入队…" : `一键入队分发 (${selectedAccounts.length} 个账号)`}</span>
+              <span>
+                {submitting
+                  ? "正在拆分入队…"
+                  : (publishAction === "draft"
+                    ? `一键推送平台草稿 (${selectedAccounts.length} 个账号)`
+                    : `一键入队分发 (${selectedAccounts.length} 个账号)`)}
+              </span>
+            </button>
+            <button
+              type="button"
+              className="ghost"
+              disabled={submitting || uploading || uploadingCover || selectedAccounts.length === 0}
+              onClick={ev => submitBatch(ev, { saveAsDraft: true })}
+            >
+              <Icon name="edit" />
+              <span>存为本地草稿 ({selectedAccounts.length} 个账号)</span>
             </button>
           </div>
         </aside>

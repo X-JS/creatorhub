@@ -27,6 +27,7 @@ class EngineSettingsPatch(BaseModel):
 
     worker_pool_size: int | None = Field(None, ge=1, le=16)
     scan_concurrency: int | None = Field(None, ge=1, le=16)
+    collection_concurrency: int | None = Field(None, ge=1, le=8)
     active_accounts: int | None = Field(None, ge=1, le=32)
     max_live_contexts: int | None = Field(None, ge=1, le=32)
     resident_browser_sessions: bool | None = None
@@ -45,6 +46,8 @@ class EngineSettingsPatch(BaseModel):
     twitter_write_mode: Literal["browser"] | None = None
     facebook_read_mode: Literal["hybrid", "api", "browser"] | None = None
     facebook_write_mode: Literal["browser"] | None = None
+    youtube_read_mode: Literal["hybrid", "api", "browser"] | None = None
+    youtube_write_mode: Literal["browser"] | None = None
     douyin_profile_mode: Literal["hybrid", "api", "browser"] | None = None
     douyin_followers_mode: Literal["hybrid", "api", "browser"] | None = None
     douyin_dm_sync_mode: Literal["hybrid", "api", "browser"] | None = None

@@ -24,6 +24,8 @@ engine:
   twitter_write_mode: browser      # X (Twitter) 写操作与发布统一走隔离浏览器原生签名通道
   facebook_read_mode: hybrid       # hybrid=SSR与动态GraphQL协议直采优先、冷启动或异常回退隔离浏览器;api=纯协议直连;browser=全程浏览器
   facebook_write_mode: browser     # Facebook 写操作与发布（个人/公共主页/群组/快拍）统一走隔离浏览器通道
+  youtube_read_mode: hybrid        # hybrid=SSR(ytInitialData)与Innertube直采优先、兼容失败回退隔离浏览器;api=仅直连;browser=全程浏览器
+  youtube_write_mode: browser      # YouTube 写操作（Studio发布、赞评、订阅与观看养号）统一走隔离浏览器通道
   douyin_profile_mode: hybrid      # 手动刷新资料:hybrid/API/browser
   douyin_followers_mode: hybrid    # 粉丝同步:hybrid/API/browser
   douyin_dm_sync_mode: hybrid      # 私信会话同步:hybrid/API/browser
@@ -99,7 +101,7 @@ engine:
   comment_jitter: 0                    # 评论排队随机错峰比例(0=关闭)
   comment_risk_cooldown_seconds: 21600 # 平台拒绝/验证后暂停该账号写操作参考时长(默认6小时)
   xhs_comment_write_mode: browser      # browser=页面发布;api=显式兼容;manual=只保存草稿
-  xhs_comment_review_before_publish: true # true=人工审核后自动发布;false=生成后直接发布
+  xhs_comment_review_before_publish: false # 全局强制保险锁:false=按各规则自身「发布前审核」开关决定;true=强制所有小红书评论先存草稿人工审核
   channels_read_mode: auto             # auto=优先桌面微信 Finder 原生协议,回退创作者助手;protocol=仅原生协议;browser=仅助手页面
   channels_cdp_endpoint: ""            # 可选:本机回环微信 Finder CDP 端点(如 http://127.0.0.1:9222)
   channels_cdp_endpoint_file: ""       # 可选:wmpf_cdp 生成的单会话本地回环端点描述文件路径

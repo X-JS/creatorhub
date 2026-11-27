@@ -18,6 +18,7 @@ from sqlmodel import select
 from app import runtime as app_runtime
 from app.account_lifecycle import active_account_task, retire_account_tasks
 from app.browser.backends import ACCOUNT_BROWSER_BACKENDS, LOCAL_BACKEND, fingerprint_seed_u32
+from app.browser.identity import resolve_effective_fingerprint_traits
 from app.browser.ip_fingerprint import derive_ip_fingerprint
 from app.db import get_session
 from app.models import AccountRiskState, AccountWork, DouyinAccount, FollowEdge, MonitorTarget
@@ -188,7 +189,7 @@ async def list_accounts(platform: str | None = None):
                     environment_check = None
             has_creator = (
                 bool(a.creator_storage_state)
-                or (a.platform in ("kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "rednote", "instagram", "twitter", "facebook")
+                or (a.platform in ("kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "rednote", "instagram", "twitter", "facebook", "youtube")
                     and bool(a.storage_state))
                 or (a.platform == "xhs" and has_creator_cookies(a.storage_state))
             )
@@ -310,6 +311,15 @@ async def account_browser_environment(account_id: int):
 
 
 def _account_fingerprint_payload(account: DouyinAccount) -> dict:
+    effective_traits = {}
+    effective_ua = account.ua or ""
+    if app_runtime.browser is not None:
+        try:
+            ident = app_runtime.browser.identity_for(account)
+            effective_traits = resolve_effective_fingerprint_traits(ident)
+            effective_ua = app_runtime.browser.direct_request_user_agent(ident)
+        except Exception:
+            effective_traits = {}
     return {
         "account_id": account.id,
         "fingerprint_id": (account.fp_seed or "")[:12],
@@ -334,6 +344,13 @@ def _account_fingerprint_payload(account: DouyinAccount) -> dict:
         "brand": account.fp_brand,
         "brand_version": account.fp_brand_version,
         "hardware_concurrency": account.fp_hardware_concurrency,
+        "effective_platform": effective_traits.get("platform", account.fp_platform),
+        "effective_platform_version": effective_traits.get(
+            "platform_version", account.fp_platform_version),
+        "effective_brand": effective_traits.get("brand", account.fp_brand),
+        "effective_hardware_concurrency": effective_traits.get(
+            "hardware_concurrency", account.fp_hardware_concurrency),
+        "effective_ua": effective_ua,
         "gpu_vendor": account.fp_gpu_vendor,
         "gpu_renderer": account.fp_gpu_renderer,
         "disable_spoofing": [
@@ -345,7 +362,7 @@ def _account_fingerprint_payload(account: DouyinAccount) -> dict:
         "geolocation_permission": account.fp_geolocation_permission,
         "webrtc_mode": account.fp_webrtc_mode,
         "extra_args": account.fp_extra_args,
-        "actual_ua": account.ua,
+        "actual_ua": effective_ua or account.ua,
         "generated_at": (account.fp_generated_at.isoformat()
                          if account.fp_generated_at else None),
         "browser_backend": account.browser_backend,
@@ -628,9 +645,7 @@ async def refresh_account_profile(account_id: int):
         profile_transport = (resolve_transport(
             app_runtime.cfg, "douyin", "account_profile", acc)
             if platform == "douyin" else None)
-    manual_browser = app_runtime.open_browsers.get(account_id)
-    if (manual_browser is not None
-            and bool(getattr(manual_browser, "active", True))
+    if (await login_sessions_service.has_active_open_browser(account_id)
             and (profile_transport is None or profile_transport["opens_browser"])):
         return {
             "ok": True,
@@ -660,6 +675,7 @@ async def refresh_account_profile(account_id: int):
                else "[ig_self_profile]" if platform == "instagram"
                else "[tw_self_profile]" if platform == "twitter"
                else "[fb_self_profile]" if platform == "facebook"
+               else "[yt_self_profile]" if platform == "youtube"
                else "[self_profile]")
         raise HTTPException(400, f"未能获取账号资料:请看服务端控制台 {tag} 那行日志"
                                  "(含它实际看到的请求),把它发我即可定位")
@@ -674,7 +690,7 @@ async def refresh_account_profile(account_id: int):
         )
         has_creator_login = bool(acc and (
             acc.creator_storage_state
-            or (acc.platform in ("kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "rednote", "instagram", "twitter", "facebook")
+            or (acc.platform in ("kuaishou", "douyin", "shipinhao", "tiktok", "bilibili", "rednote", "instagram", "twitter", "facebook", "youtube")
                 and acc.storage_state)
             or (acc.platform == "xhs" and has_creator_cookies(acc.storage_state))
         ))
@@ -730,8 +746,7 @@ async def keepalive_single_account(account_id: int):
         if not (acc.storage_state or acc.creator_storage_state):
             raise HTTPException(400, "该账号缺少持久化登录态，请先扫码登录")
         platform = acc.platform
-    manual_browser = app_runtime.open_browsers.get(account_id)
-    if manual_browser is not None and bool(getattr(manual_browser, "active", True)):
+    if await login_sessions_service.has_active_open_browser(account_id):
         return {
             "ok": True,
             "skipped": True,

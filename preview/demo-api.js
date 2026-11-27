@@ -12,6 +12,7 @@
     instagram_read_mode: "hybrid", instagram_write_mode: "hybrid",
     twitter_read_mode: "hybrid", twitter_write_mode: "browser",
     facebook_read_mode: "hybrid", facebook_write_mode: "browser",
+    youtube_read_mode: "hybrid", youtube_write_mode: "browser",
     douyin_profile_mode: "hybrid", douyin_followers_mode: "hybrid",
     douyin_dm_sync_mode: "hybrid", douyin_creator_danmaku_mode: "hybrid",
     douyin_publish_mode: "browser",
@@ -49,7 +50,7 @@
     { id: "friendly_cs", name: "亲切客服答疑", description: "适合回复自己作品下的提问、咨询、求攻略类评论，礼貌高效。", style_prompt: "以作品作者身份亲切回复粉丝，先回应对方具体问题或夸奖，表达感谢。", max_chars: 75, temperature: 0.7, language_mode: "auto", builtin: true },
     { id: "xhs_seeding", name: "小红书种草共鸣", description: "轻松有网感、强调情绪共鸣与体验分享，适配小红书社区氛围。", style_prompt: "贴合小红书社区的轻松真实分享风格，多从个人感受或共鸣点切入。", max_chars: 55, temperature: 0.9, language_mode: "zh", builtin: true },
     { id: "bili_humor", name: "B站轻松玩梗", description: "适合 B 站评论区互动，接地气、简洁带一点轻松幽默。", style_prompt: "贴近 B 站评论区接地气、轻松友好的互动感，结合作品或评论内容简短接话。", max_chars: 55, temperature: 0.9, language_mode: "zh", builtin: true },
-    { id: "global_social", name: "海外社媒自然互动", description: "适合 Instagram / X / Facebook，自动跟随原文语种写出地道简短互动。", style_prompt: "Write a concise, genuine, conversational social-media comment or reply.", max_chars: 120, temperature: 0.85, language_mode: "auto", builtin: true },
+    { id: "global_social", name: "海外社媒自然互动", description: "适合 Instagram / X / Facebook / YouTube，自动跟随原文语种写出地道简短互动。", style_prompt: "Write a concise, genuine, conversational social-media comment or reply.", max_chars: 120, temperature: 0.85, language_mode: "auto", builtin: true },
   ];
   const demoAiChannels = {
     active_channel_id: "default",
@@ -187,11 +188,12 @@
     { id: 8, platform: "instagram", nickname: "Instagram 示例号", douyin_id: "ig_creator_demo", sec_uid: "900100200", aweme_count: 31, follower_count: 2150, login_type: "browser", has_storage: true, has_creator: true, status: "active", monitor_count: 1, created_at: iso(86400 * 2), has_proxy: true, proxy: "http://***:***@HOST:PORT", proxy_status: "ok" },
     { id: 9, platform: "twitter", nickname: "Twitter 示例号", douyin_id: "x_creator_demo", sec_uid: "x_creator_demo", aweme_count: 48, follower_count: 3420, login_type: "browser", has_storage: true, has_creator: true, status: "active", monitor_count: 1, created_at: iso(86400 * 2), has_proxy: true, proxy: "http://***:***@HOST:PORT", proxy_status: "ok" },
     { id: 10, platform: "facebook", nickname: "Facebook 示例号", douyin_id: "fb_creator_demo", sec_uid: "100080012345678", aweme_count: 27, follower_count: 4180, login_type: "browser", has_storage: true, has_creator: true, status: "active", monitor_count: 1, created_at: iso(86400 * 2), has_proxy: true, proxy: "http://***:***@HOST:PORT", proxy_status: "ok" },
+    { id: 11, platform: "youtube", nickname: "YouTube 示例频道", douyin_id: "yt_creator_demo", sec_uid: "UC_DEMO_YOUTUBE_CHANNEL", aweme_count: 34, follower_count: 6850, login_type: "browser", has_storage: true, has_creator: true, status: "active", monitor_count: 1, created_at: iso(86400 * 2), has_proxy: true, proxy: "http://***:***@HOST:PORT", proxy_status: "ok" },
   ];
 
   const platformAccount = (platform) => accounts.find((item) => item.platform === platform) || accounts[0];
-  const platformName = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook" };
-  const monitoredName = { douyin: "示例创作者", xhs: "城市生活研究所", rednote: "Studio Nomad", kuaishou: "影像日记", shipinhao: "本账号内容", tiktok: "GlobalCreator", bilibili: "科技美学示例 UP", instagram: "StudioVisuals", twitter: "IndieBuilder", facebook: "CreatorPageHub" };
+  const platformName = { douyin: "抖音", xhs: "小红书", rednote: "海外小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok", bilibili: "哔哩哔哩", instagram: "Instagram", twitter: "Twitter", facebook: "Facebook", youtube: "YouTube" };
+  const monitoredName = { douyin: "示例创作者", xhs: "城市生活研究所", rednote: "Studio Nomad", kuaishou: "影像日记", shipinhao: "本账号内容", tiktok: "GlobalCreator", bilibili: "科技美学示例 UP", instagram: "StudioVisuals", twitter: "IndieBuilder", facebook: "CreatorPageHub", youtube: "TechLabChannel" };
 
   function monitor(platform) {
     const account = platformAccount(platform);
@@ -342,7 +344,7 @@
     };
     return { settings: { ...engineValues }, rows: [
       row("douyin", "keyword_collection", "关键词采集", "douyin_read_mode", true, true),
-      row("douyin", "public_monitor", "公开作品/评论/弹幕监控", "douyin_read_mode", true, true),
+      row("douyin", "public_monitor", "公开主页作品/评论/弹幕监控", "douyin_read_mode", true, true),
       row("douyin", "account_works", "本账号作品同步", "douyin_read_mode", true, true),
       row("douyin", "own_work_comments", "本账号作品评论抓取", "douyin_read_mode", true, true),
       row("douyin", "following_list", "关注列表同步", "douyin_read_mode", true, true),
@@ -357,7 +359,7 @@
       row("xhs", "public_monitor", "作品/关键词/公开评论读取", "xhs_read_mode", true, true),
       row("xhs", "comment_write", "评论/回复发送", "xhs_comment_write_mode", true, true),
       row("xhs", "publish", "发布作品", "xhs_publish_mode", true, true),
-      row("rednote", "public_monitor", "作品/关键词/收藏/只读评论读取", "rednote_read_mode", true, true),
+      row("rednote", "public_monitor", "主页作品/关键词/只读评论读取", "rednote_read_mode", true, true),
       row("rednote", "account_works", "本账号作品同步与可见性/删除管理", "rednote_read_mode", true, true),
       row("rednote", "publish", "图文与视频笔记发布", "rednote_publish_mode", true, true, "支持 creator.rednote.com 页面流或实验性 XYS + b1 纯协议直发"),
       row("rednote", "comment_write", "自动评论/回复规则", "", false, false, "海外版暂未开放自动评论与互动写入"),
@@ -389,6 +391,10 @@
       row("facebook", "comment_write", "评论/7种表情赞/分享/关注/加群", "facebook_write_mode", false, true),
       row("facebook", "dm_send", "Messenger 私信发送", "facebook_write_mode", false, true),
       row("facebook", "publish", "个人动态/公共主页(i_user)/群组/Story与首评", "facebook_write_mode", false, true),
+      row("youtube", "public_monitor", "频道视频/Shorts/搜索/评论读取", "youtube_read_mode", true, true),
+      row("youtube", "account_works", "本频道视频/订阅列表/多频道切换列表", "youtube_read_mode", true, true),
+      row("youtube", "comment_write", "视频评论/回复/点赞/点踩/订阅/观看养号", "youtube_write_mode", false, true),
+      row("youtube", "publish", "YouTube Studio 视频/Shorts 上传、品牌频道与首评", "youtube_write_mode", false, true),
     ], accounts: accounts.map(account => ({
       account_id: account.id, platform: account.platform, nickname: account.nickname,
       profile_isolated: true, credential_isolated: true, api_session_isolated: true,
@@ -501,7 +507,7 @@
       return { items, unread: items.reduce((s, x) => s + x.unread_count, 0) };
     }
     if (path === "/api/matrix/overview") {
-      const pfs = ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"];
+      const pfs = ["douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"];
       const strip = pfs.map((pf, idx) => {
         const pfAccs = accounts.filter(a => a.platform === pf);
         return {
@@ -520,7 +526,7 @@
         uid: `monitor:${pf}-${c.id}`, source_kind: "monitor", id: c.id, platform: pf,
         aweme_id: c.aweme_id, desc: c.desc, cover_url: c.cover_url || "", media_type: c.media_type,
         like_count: c.like_count, comment_count: c.comment_count || 26, author_name: "示例监控源",
-        source_label: "作品监控", download_status: c.download_status, local_ready: c.download_status === "done",
+        source_label: "主页作品监控", download_status: c.download_status, local_ready: c.download_status === "done",
         create_time: c.create_time, captured_at: c.captured_at,
       })));
       return {
@@ -578,7 +584,7 @@
     if (path === "/api/matrix/media-hub") {
       const items = ["douyin", "xhs", "bilibili"].flatMap(pf => contents(pf).map(c => ({
         uid: `monitor:${c.id}-${pf}`, source_kind: "monitor", id: c.id, platform: pf, aweme_id: c.aweme_id,
-        desc: c.desc, author_name: "示例创作者", group_name: "行业精选", source_label: "作品监控",
+        desc: c.desc, author_name: "示例创作者", group_name: "行业精选", source_label: "主页作品监控",
         media_type: c.media_type, cover_url: c.cover_url || "", duration: 42,
         like_count: c.like_count, comment_count: 28, play_count: 0, download_status: c.download_status,
         local_ready: c.download_status === "done", local_path: c.local_path || "", create_time: c.create_time, captured_at: c.captured_at,
@@ -668,7 +674,11 @@
     return [];
   }
 
-  function actionData(path) {
+  function actionData(path, rawBody) {
+    let body = {};
+    if (typeof rawBody === "string" && rawBody.trim()) {
+      try { body = JSON.parse(rawBody); } catch (_) {}
+    }
     if (path === "/api/channels/protocol/probe") return { ok: false, ready: false, configured: false, error: "在线演示模式不连接本机微信进程" };
     if (path === "/api/channels/protocol/proxy/start") {
       channelsProto.ca_trusted = true;
@@ -700,6 +710,20 @@
     if (path === "/api/channels/protocol/config" || path === "/api/channels/protocol/bridge/start" || path === "/api/channels/protocol/bridge/stop") {
       return getData(new URL("/api/channels/protocol/status", window.location.href));
     }
+    if (path === "/api/targets/detect") {
+      const text = String(body.raw_input || "").trim();
+      const pf = String(body.platform || "douyin").toLowerCase();
+      const isVideo = /\/video\/|\/explore\/|\/short-video\/|\/BV[0-9A-Za-z]+|\/status\/|\/p\/|\/reel\/|\/watch|youtu\.be\/|\/shorts\//i.test(text);
+      const isUser = /\/user\/|\/profile\/|space\.bilibili\.com\/|\/@[^/\s]+|\/channel\/|\/groups\//i.test(text);
+      const target_kind = isVideo ? "video" : isUser ? "user" : "unknown";
+      const kind_label = target_kind === "video" ? "单条作品" : target_kind === "user" ? "创作者主页" : "";
+      const is_bili_opus = pf === "bilibili" && (/\/opus\//i.test(text) || /t\.bilibili\.com/i.test(text));
+      return {
+        ok: Boolean(text), mismatch: false, platform: pf, platform_name: platformName[pf] || pf,
+        cleaned: text, resolved_url: text, short_expanded: false,
+        target_kind, kind_label, can_extract_creator: false, is_bili_opus, links: [],
+      };
+    }
     if (path === "/api/share-download/links") return { count: 1, links: [{ platform: "douyin", host: "v.douyin.com", url: "https://v.douyin.com/DEMO/" }] };
     if (path === "/api/share-download") return { ok: true, results: [{ ok: true, platform: "douyin", title: "示例作品", author: "示例创作者", media_type: "video", media_count: 1, output_dir: "data/media/demo", files: [] }] };
     if (/^\/api\/comment-rules\/\d+\/preview$/.test(path)) {
@@ -715,6 +739,14 @@
     if (/^\/api\/comment-rules\/\d+\/duplicate$/.test(path)) return { ...commentRules("douyin")[0], id: 62, name: "示例自动回复规则（副本）" };
     if (/^\/api\/comment-tasks\/\d+\/regenerate$/.test(path)) return { ok: true, content: "感谢支持，后续会持续更新更多实用内容！", content_source: "template" };
     if (path === "/api/comment-tasks/batch-cancel") return { ok: true, canceled: 1 };
+    if (path === "/api/collections/batch-delete") {
+      const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(n => n > 0) : [];
+      return { ok: true, deleted: ids.length, deleted_ids: ids, skipped_running: [] };
+    }
+    if (path === "/api/monitors/batch-delete" || path === "/api/comment-watches/batch-delete" || path === "/api/danmaku-watches/batch-delete") {
+      const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(n => n > 0) : [];
+      return { ok: true, deleted: ids.length };
+    }
     if (path === "/api/accounts/keepalive-all") return { ok: true, platform: "all", queued: accounts.length, pending_total: accounts.length };
     if (/^\/api\/accounts\/\d+\/keepalive$/.test(path)) return { ok: true, status: "active", refreshed: false, message: "在线演示：会话状态正常" };
     if (path === "/api/settings/ai-test") return { ok: false, error: "在线演示模式不连接外部大模型接口，请在本地运行后测试" };
@@ -765,6 +797,34 @@
     if (method === "POST" && (url.pathname === "/api/diagnostics/open-dir" || url.pathname === "/api/diagnostics/clear-logs")) {
       return new Response(JSON.stringify({ ok: true, cleared: 2, log_dir: "./logs" }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
     }
+    if (method === "POST" && url.pathname === "/api/youtube/channels") {
+      return new Response(JSON.stringify({
+        items: [
+          { name: "YouTube 示例主频道", handle: "@yt_creator_demo", channel_id: "UC_DEMO_YOUTUBE_CHANNEL", subscribers_text: "6.85K subscribers", subscribers_count: 6850, is_selected: true },
+          { name: "TechLab 品牌副频道", handle: "@techlab_brand_demo", channel_id: "UC_DEMO_BRAND_CHANNEL", subscribers_text: "1.92K subscribers", subscribers_count: 1920, is_selected: false },
+        ],
+        source: "api", error: "",
+      }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
+    }
+    if (method === "POST" && url.pathname === "/api/youtube/search") {
+      const body = JSON.parse(init.body || "{}");
+      const items = body.scope === "channels"
+        ? [{ nickname: "TechLabChannel", unique_id: "@TechLabChannel", sec_uid: "@TechLabChannel", follower_count: 128000, aweme_count: 214, signature: "示例科技评测与开源工具频道", url: "https://www.youtube.com/@TechLabChannel" }]
+        : [{ video_id: "dQw4w9WgXcQ", title: `YouTube 示例搜索结果 · ${body.keyword || "AI"}`, author_name: "TechLabChannel", channel_handle: "@TechLabChannel", play_count: 48200, duration: 542, published_text: "2 days ago", source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" }];
+      return new Response(JSON.stringify({ items, scope: body.scope || "videos", source: "api", error: "" }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
+    }
+    if (method === "POST" && url.pathname === "/api/youtube/interact") {
+      const body = JSON.parse(init.body || "{}");
+      return new Response(JSON.stringify({ ok: true, action: body.action || "like", target: body.target_url || "", result: body.action === "like_video_comments" ? { liked_count: body.like_count || 3 } : body.action }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
+    }
+    if (method === "POST" && url.pathname === "/api/youtube/watch") {
+      const body = JSON.parse(init.body || "{}");
+      return new Response(JSON.stringify({ ok: true, video_id: "dQw4w9WgXcQ", stats: { view_time: body.duration_seconds || 35, view_percentage: 42.5, video_duration: 212, liked: !!body.like_video, subscribed: !!body.subscribe_channel, commented: !!body.comment_text } }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
+    }
+    if (method === "POST" && url.pathname === "/api/youtube/warmup") {
+      const body = JSON.parse(init.body || "{}");
+      return new Response(JSON.stringify({ ok: true, keyword: body.keyword || "tech", summary: { watched_count: 2, liked_count: 1, videos: [{ url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", watched_seconds: 22, liked: true }, { url: "https://www.youtube.com/watch?v=jNQXAC9IVRw", watched_seconds: 19, liked: false }] } }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
+    }
     if (method === "PUT" && url.pathname === "/api/settings/engine") Object.assign(engineValues, JSON.parse(init.body));
     if (method === "PUT" && url.pathname === "/api/risk-control/config") {
       const body = JSON.parse(init.body || "{}");
@@ -792,7 +852,7 @@
       }
       return new Response(JSON.stringify(channelsProtoPayload()), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
     }
-    const data = method === "GET" || url.pathname === "/api/settings/engine" ? getData(url) : actionData(url.pathname);
+    const data = method === "GET" || url.pathname === "/api/settings/engine" ? getData(url) : actionData(url.pathname, init && init.body);
     return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
   };
 

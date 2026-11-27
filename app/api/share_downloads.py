@@ -1,9 +1,13 @@
 """多平台分享链接识别、无水印媒体下载及下载历史管理接口。"""
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 import asyncio
 import json
+import threading
+import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -15,6 +19,7 @@ from app.db import get_session
 from app.engine.share_downloader import ShareDownloadError, ShareDownloadFallback, ShareDownloader, ShareLinkError, extract_share_urls, normalize_share_text, require_share_urls
 from app.models import DouyinAccount, ShareDownloadRecord
 from app.platforms.channels import inspect_or_download_channels_share
+from app.progress_hub import progress_hub
 from app.services import contents as contents_service
 from app.services import share_downloads as share_downloads_service
 from app.services import share_native as share_native_service
@@ -29,6 +34,291 @@ router = APIRouter()
 class ShareLinksIn(BaseModel):
     share_text: str
     limit: int = 10
+
+
+class TargetDetectIn(BaseModel):
+    raw_input: str
+    platform: str = ""
+    account_id: int | None = None
+    expand_short_links: bool = True
+
+
+_DETECT_PLATFORM_NAMES = {
+    "douyin": "抖音",
+    "xhs": "小红书",
+    "rednote": "海外小红书",
+    "kuaishou": "快手",
+    "shipinhao": "视频号",
+    "wechat": "视频号",
+    "tiktok": "TikTok",
+    "bilibili": "哔哩哔哩",
+    "instagram": "Instagram",
+    "twitter": "X (Twitter)",
+    "facebook": "Facebook",
+    "youtube": "YouTube",
+    "generic": "其他站点",
+}
+
+_SHORT_LINK_HOSTS = {
+    "douyin": ("v.douyin.com",),
+    "xhs": ("xhslink.com",),
+    "kuaishou": ("v.kuaishou.com",),
+    "bilibili": ("b23.tv", "bili2233.cn"),
+    "tiktok": ("vm.tiktok.com", "vt.tiktok.com"),
+    "twitter": ("t.co",),
+    "facebook": ("fb.watch", "fb.me"),
+}
+
+
+async def _expand_short_url_once(url: str, platform: str, account_id: int | None = None) -> tuple[str, bool]:
+    """安全展开平台短链以判定是单条作品还是创作者主页（严格隔离系统代理）。"""
+    import re as _re
+    from urllib.parse import urlsplit as _urlsplit
+    from app.services import metadata as metadata_service
+
+    raw = str(url or "").strip()
+    if "://" not in raw:
+        return raw, False
+    parsed = _urlsplit(raw)
+    host = (parsed.hostname or "").lower()
+    path_low = (parsed.path or "").lower()
+    short_hosts = _SHORT_LINK_HOSTS.get(platform, ())
+    is_short = any(host == h or host.endswith("." + h) for h in short_hosts)
+    if not is_short:
+        if platform == "kuaishou" and "/f/" in path_low:
+            is_short = True
+        elif platform == "tiktok" and _re.match(r"^/t/[a-z0-9_-]+", path_low):
+            is_short = True
+        elif platform == "facebook" and _re.match(r"^/share/[a-z0-9/_-]+", path_low):
+            is_short = True
+    if not is_short:
+        return raw, False
+    eff_proxy = metadata_service._resolve_ephemeral_proxy(platform, account_id)
+    try:
+        from curl_cffi.requests import AsyncSession
+        from app.netfp import curl_proxies
+
+        async with AsyncSession(
+            impersonate="chrome136",
+            trust_env=False,
+            proxies=curl_proxies(eff_proxy),
+            timeout=8,
+            headers={"User-Agent": app_runtime.cfg.engine.user_agent},
+        ) as client:
+            resp = await client.get(raw, allow_redirects=True)
+            final_url = str(getattr(resp, "url", "") or "").strip()
+            if final_url and final_url != raw:
+                return final_url, True
+    except Exception:
+        pass
+    return raw, False
+
+
+def _classify_target_kind(platform: str, text: str) -> tuple[str, str, bool]:
+    """返回 (target_kind, kind_label, can_extract_creator)。
+    target_kind ∈ {"video", "user", "unknown"}。
+    """
+    import re as _re
+    from urllib.parse import parse_qs as _parse_qs, urlsplit as _urlsplit
+
+    raw = str(text or "").strip()
+    if not raw:
+        return "unknown", "", False
+    low = raw.lower()
+    is_url = "://" in raw
+    parsed = _urlsplit(raw) if is_url else None
+    path = (parsed.path or "") if parsed else ""
+    path_low = path.lower()
+    qs = _parse_qs(parsed.query) if parsed else {}
+
+    if platform == "douyin":
+        if is_url:
+            if qs.get("modal_id") or qs.get("vid") or _re.search(r"/(video|note|slides|share/video|share/note|share/slides)/", path_low):
+                return "video", "单条视频/图文", False
+            if _re.search(r"/(user|share/user)/", path_low):
+                return "user", "创作者主页", False
+            return "unknown", "", False
+        if raw.startswith("MS4wLjABAAAA") and len(raw) >= 20:
+            return "user", "创作者 sec_uid", False
+        if _re.fullmatch(r"\d{15,21}", raw):
+            return "video", "单条视频 ID", False
+        return "unknown", "", False
+
+    if platform in ("xhs", "rednote"):
+        if is_url:
+            if _re.search(r"/(explore|discovery/item|note)/", path_low):
+                return "video", "单条笔记", False
+            if "/user/profile/" in path_low:
+                return "user", "创作者主页", False
+        return "unknown", "", False
+
+    if platform == "kuaishou":
+        if is_url:
+            if _re.search(r"/(short-video|fw/photo|photo)/", path_low) or qs.get("photoId") or qs.get("photo_id"):
+                return "video", "单条作品", False
+            if "/profile/" in path_low:
+                return "user", "创作者主页", False
+            return "unknown", "", False
+        if _re.fullmatch(r"3x[a-z0-9]{10,}", raw, _re.I):
+            return "user", "创作者 user_id", False
+        return "unknown", "", False
+
+    if platform == "shipinhao":
+        from app.platforms.channels import looks_like_photo as channels_looks_like_photo, parse_channels_url
+
+        ref = parse_channels_url(raw)
+        if ref is not None:
+            if ref.kind == "creator":
+                return "user", "创作者主页", False
+            return "video", "单条视频号作品", True
+        if raw.startswith("v2_") and "@finder" in raw:
+            return "user", "视频号创作者", False
+        if channels_looks_like_photo(raw):
+            return "video", "单条视频号作品", True
+        return "unknown", "", False
+
+    if platform == "tiktok":
+        from app.platforms.tiktok.urls import parse_profile_reference, parse_video_reference
+
+        if parse_video_reference(raw):
+            return "video", "单条视频", True
+        if (is_url or raw.startswith("@")) and parse_profile_reference(raw):
+            return "user", "创作者主页", False
+        return "unknown", "", False
+
+    if platform == "bilibili":
+        from app.platforms.bilibili import looks_like_bili_work
+
+        if is_url:
+            host = (parsed.hostname or "").lower()
+            if host == "space.bilibili.com" and _re.search(r"/\d+", path_low):
+                return "user", "UP 主空间", False
+            if "/opus/" in path_low or host == "t.bilibili.com":
+                return "video", "单条图文动态", False
+            if looks_like_bili_work(raw):
+                return "video", "单条视频", False
+            return "unknown", "", False
+        if _re.fullmatch(r"BV1[0-9A-Za-z]{9}", raw, _re.I) or _re.fullmatch(r"av\d+", raw, _re.I):
+            return "video", "单条视频 BV/av 号", False
+        if _re.fullmatch(r"\d{1,14}", raw):
+            return "user", "UP 主 UID", False
+        return "unknown", "", False
+
+    if platform == "instagram":
+        from app.platforms.instagram import looks_like_ig_work, resolve_ig_user_target
+
+        if looks_like_ig_work(raw):
+            return "video", "单条帖子/Reels", False
+        if (is_url or raw.startswith("@")) and resolve_ig_user_target(raw):
+            return "user", "创作者主页", False
+        return "unknown", "", False
+
+    if platform == "twitter":
+        from app.platforms.twitter import looks_like_twitter_tweet, resolve_twitter_user_target
+
+        if looks_like_twitter_tweet(raw):
+            return "video", "单条推文", False
+        if (is_url or raw.startswith("@")) and resolve_twitter_user_target(raw):
+            return "user", "创作者主页", False
+        return "unknown", "", False
+
+    if platform == "facebook":
+        from app.platforms.facebook import looks_like_facebook_post, resolve_facebook_user_target
+
+        if looks_like_facebook_post(raw):
+            return "video", "单条帖子/视频", False
+        if (is_url or low.startswith("groups/")) and resolve_facebook_user_target(raw):
+            label = "Facebook 群组" if "/groups/" in low or low.startswith("groups/") else "Facebook 主页"
+            return "user", label, False
+        return "unknown", "", False
+
+    if platform == "youtube":
+        from app.platforms.youtube import looks_like_youtube_video, resolve_youtube_channel_target
+
+        if looks_like_youtube_video(raw):
+            return "video", "单条视频/Shorts", False
+        if is_url or raw.startswith("@") or _re.fullmatch(r"UC[0-9A-Za-z_-]{20,}", raw):
+            ch_key, _ = resolve_youtube_channel_target(raw)
+            if ch_key:
+                return "user", "频道主页", False
+        return "unknown", "", False
+
+    return "unknown", "", False
+
+
+@router.post("/api/targets/detect")
+async def detect_target_input(body: TargetDetectIn):
+    """清洗粘贴文本、按需展开短链，并自动判断是单条作品链接还是创作者主页链接。"""
+    text = str(body.raw_input or "").strip()
+    if not text:
+        return {"ok": False, "error": "请输入链接、分享文案或目标 ID"}
+    req_platform = str(body.platform or "").strip().lower()
+    normalized = normalize_share_text(text)
+    links = extract_share_urls(normalized, limit=5)
+
+    def _canon_pf(p: str) -> str:
+        return "shipinhao" if p == "wechat" else p
+
+    if req_platform and links:
+        expected_share_pf = "wechat" if req_platform == "shipinhao" else req_platform
+        matched = [item for item in links if item.platform == expected_share_pf]
+        if not matched:
+            found_names = "、".join(
+                dict.fromkeys(_DETECT_PLATFORM_NAMES.get(item.platform, item.platform) for item in links)
+            )
+            cur_name = _DETECT_PLATFORM_NAMES.get(req_platform, req_platform)
+            return {
+                "ok": False,
+                "mismatch": True,
+                "platform": _canon_pf(links[0].platform),
+                "platform_name": found_names,
+                "target_kind": "unknown",
+                "cleaned": text,
+                "links": [item.to_dict() for item in links],
+                "error": f"检测到{found_names}链接，但当前页面是{cur_name}；请切换到对应平台或粘贴{cur_name}链接",
+            }
+        cleaned = matched[0].url
+        detected_pf = req_platform
+    elif links:
+        cleaned = links[0].url
+        detected_pf = _canon_pf(links[0].platform)
+    else:
+        cleaned = text
+        detected_pf = req_platform
+
+    inspect_target = cleaned
+    short_expanded = False
+    target_kind, kind_label, can_extract_creator = _classify_target_kind(detected_pf, inspect_target)
+    if (
+        target_kind == "unknown"
+        and body.expand_short_links
+        and "://" in cleaned
+        and detected_pf in _SHORT_LINK_HOSTS
+    ):
+        expanded_url, short_expanded = await _expand_short_url_once(
+            cleaned, detected_pf, account_id=body.account_id
+        )
+        if short_expanded and expanded_url:
+            inspect_target = expanded_url
+            target_kind, kind_label, can_extract_creator = _classify_target_kind(detected_pf, inspect_target)
+
+    return {
+        "ok": True,
+        "mismatch": False,
+        "platform": detected_pf,
+        "platform_name": _DETECT_PLATFORM_NAMES.get(detected_pf, detected_pf),
+        "cleaned": cleaned,
+        "resolved_url": inspect_target if short_expanded else cleaned,
+        "short_expanded": short_expanded,
+        "target_kind": target_kind,
+        "kind_label": kind_label,
+        "can_extract_creator": can_extract_creator,
+        "is_bili_opus": bool(
+            detected_pf == "bilibili"
+            and ("/opus/" in inspect_target.lower() or "t.bilibili.com" in inspect_target.lower())
+        ),
+        "links": [item.to_dict() for item in links],
+    }
 
 
 class ShareDownloadIn(BaseModel):
@@ -61,9 +351,7 @@ async def parse_share_links(body: ShareLinksIn):
     }
 
 
-@router.post("/api/share-download")
-async def share_download(body: ShareDownloadIn):
-    """解析分享文案，并下载媒体/封面/字幕/元数据，或只读取作品信息。"""
+def _prepare_share_context(body: ShareDownloadIn):
     text = share_downloads_service._share_input(body.share_text)
     try:
         normalized = normalize_share_text(text)
@@ -87,6 +375,247 @@ async def share_download(body: ShareDownloadIn):
         output_root.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         raise HTTPException(400, f"下载目录不可用：{exc}")
+    return normalized, links, selected, output_root
+
+
+async def _process_one_share_link(
+    link,
+    *,
+    body: ShareDownloadIn,
+    output_root: Path,
+    downloader: ShareDownloader,
+    proxy: str,
+    user_agent: str,
+    cookie_file: str,
+    proxy_override_warning: str,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    if cancel_event is not None and cancel_event.is_set():
+        return {
+            "ok": False,
+            "canceled": True,
+            "url": link.url,
+            "input_platform": link.platform,
+            "error": "下载已取消",
+        }
+
+    def report_stage(stage: str, label: str, **extra: Any) -> None:
+        if on_progress is not None:
+            try:
+                on_progress({"status": stage, "phase_label": label, **extra})
+            except Exception:
+                pass
+
+    fallback_error = ""
+    try:
+        item = None
+        report_stage("resolving", "正在解析链接与作品信息")
+        if link.platform == "douyin":
+            try:
+                item = await share_native_service._douyin_native_share(
+                    link.url,
+                    account_id=body.account_id,
+                    output_root=output_root,
+                    quality=body.quality,
+                    should_download=body.download,
+                    save_metadata=body.save_metadata,
+                    save_thumbnail=body.save_thumbnail,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                )
+            except ShareDownloadFallback as exc:
+                fallback_error = str(exc)
+        elif link.platform == "xhs":
+            item = await share_native_social_service._xhs_native_share(
+                link.url,
+                account_id=body.account_id,
+                output_root=output_root,
+                quality=body.quality,
+                should_download=body.download,
+                save_metadata=body.save_metadata,
+                save_thumbnail=body.save_thumbnail,
+                proxy=proxy,
+            )
+        elif link.platform == "rednote":
+            item = await share_native_social_service._rednote_native_share(
+                link.url,
+                account_id=body.account_id,
+                output_root=output_root,
+                quality=body.quality,
+                should_download=body.download,
+                save_metadata=body.save_metadata,
+                save_thumbnail=body.save_thumbnail,
+                proxy=proxy,
+            )
+        elif link.platform == "instagram":
+            try:
+                item = await share_native_social_service._instagram_native_share(
+                    link.url,
+                    account_id=body.account_id,
+                    output_root=output_root,
+                    quality=body.quality,
+                    should_download=body.download,
+                    save_metadata=body.save_metadata,
+                    save_thumbnail=body.save_thumbnail,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                )
+            except ShareDownloadFallback as exc:
+                fallback_error = str(exc)
+        elif link.platform == "twitter":
+            try:
+                item = await share_native_social_service._twitter_native_share(
+                    link.url,
+                    account_id=body.account_id,
+                    output_root=output_root,
+                    quality=body.quality,
+                    should_download=body.download,
+                    save_metadata=body.save_metadata,
+                    save_thumbnail=body.save_thumbnail,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                )
+            except ShareDownloadFallback as exc:
+                fallback_error = str(exc)
+        elif link.platform == "facebook":
+            try:
+                item = await share_native_social_service._facebook_native_share(
+                    link.url,
+                    account_id=body.account_id,
+                    output_root=output_root,
+                    quality=body.quality,
+                    should_download=body.download,
+                    save_metadata=body.save_metadata,
+                    save_thumbnail=body.save_thumbnail,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                )
+            except ShareDownloadFallback as exc:
+                fallback_error = str(exc)
+        elif link.platform == "youtube":
+            try:
+                item = await share_native_social_service._youtube_native_share(
+                    link.url,
+                    account_id=body.account_id,
+                    output_root=output_root,
+                    quality=body.quality,
+                    should_download=body.download,
+                    save_metadata=body.save_metadata,
+                    save_thumbnail=body.save_thumbnail,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                )
+            except ShareDownloadFallback as exc:
+                fallback_error = str(exc)
+        elif link.platform == "wechat":
+            account_state = ""
+            if body.account_id:
+                with get_session() as s_acc:
+                    acc = s_acc.get(DouyinAccount, body.account_id)
+                    if acc:
+                        account_state = (
+                            acc.storage_state
+                            or acc.creator_storage_state
+                            or ""
+                        )
+            try:
+                item = await inspect_or_download_channels_share(
+                    link.url,
+                    cfg=app_runtime.cfg,
+                    output_root=output_root,
+                    quality=body.quality,
+                    should_download=body.download,
+                    save_metadata=body.save_metadata,
+                    save_thumbnail=body.save_thumbnail,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                    account_storage_state=account_state,
+                )
+            except ShareDownloadFallback:
+                item = None
+        safe_ytdlp_cookie = (
+            "" if link.platform in {
+                "douyin", "xhs", "rednote", "kuaishou", "wechat",
+                "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"
+            } else cookie_file
+        )
+        if item is not None:
+            pass
+        elif body.download:
+            report_stage("downloading", "正在下载媒体文件")
+            item = await downloader.download(
+                link.url,
+                quality=body.quality,
+                save_metadata=body.save_metadata,
+                save_thumbnail=body.save_thumbnail,
+                save_subtitles=body.save_subtitles,
+                proxy=proxy,
+                cookie_file=safe_ytdlp_cookie,
+                max_filesize_mb=body.max_filesize_mb,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+        else:
+            item = await downloader.inspect(
+                link.url, proxy=proxy, cookie_file=safe_ytdlp_cookie
+            )
+        item["input_platform"] = link.platform
+        item_warnings = list(item.get("warnings") or [])
+        if proxy_override_warning and proxy_override_warning not in item_warnings:
+            item_warnings.append(proxy_override_warning)
+        if not proxy and link.platform in {"tiktok", "rednote", "instagram", "twitter", "facebook", "youtube"}:
+            direct_warn = "提醒：当前未配置代理（走本机直连），海外平台若遇到连接超时建议配置代理"
+            if direct_warn not in item_warnings:
+                item_warnings.append(direct_warn)
+        item["warnings"] = item_warnings
+        if fallback_error:
+            item.setdefault("warnings", []).append(
+                fallback_error + "；已改用通用提取器完成处理")
+    except asyncio.CancelledError:
+        return {
+            "ok": False,
+            "canceled": True,
+            "url": link.url,
+            "input_platform": link.platform,
+            "error": "下载已取消",
+        }
+    except ShareDownloadError as exc:
+        item = {
+            "ok": False,
+            "canceled": "下载已取消" in str(exc),
+            "url": link.url,
+            "input_platform": link.platform,
+            "error": ((fallback_error + "；通用提取器：") if fallback_error else "") + str(exc),
+        }
+        if getattr(exc, "diagnostics", None):
+            item["diagnostics"] = dict(exc.diagnostics)
+    except Exception as exc:
+        item = {
+            "ok": False,
+            "url": link.url,
+            "input_platform": link.platform,
+            "error": str(exc) or repr(exc),
+        }
+    if body.download and not item.get("canceled"):
+        try:
+            item["history_id"] = share_downloads_service._save_share_download_history(
+                source_url=link.url,
+                platform=link.platform,
+                account_id=body.account_id,
+                item=item,
+            )
+        except Exception as exc:
+            item.setdefault("warnings", []).append(
+                f"下载已处理，但历史记录写入失败：{exc}"
+            )
+    return item
+
+
+@router.post("/api/share-download")
+async def share_download(body: ShareDownloadIn):
+    """解析分享文案，并下载媒体/封面/字幕/元数据，或只读取作品信息（同步兼容接口）。"""
+    normalized, links, selected, output_root = _prepare_share_context(body)
 
     cookie_file = ""
     try:
@@ -114,177 +643,16 @@ async def share_download(body: ShareDownloadIn):
         results = []
         async with app_runtime._share_download_sem:
             for link in selected:
-                fallback_error = ""
-                try:
-                    item = None
-                    if link.platform == "douyin":
-                        try:
-                            item = await share_native_service._douyin_native_share(
-                                link.url,
-                                account_id=body.account_id,
-                                output_root=output_root,
-                                quality=body.quality,
-                                should_download=body.download,
-                                save_metadata=body.save_metadata,
-                                save_thumbnail=body.save_thumbnail,
-                                proxy=proxy,
-                                user_agent=user_agent,
-                            )
-                        except ShareDownloadFallback as exc:
-                            # Only inconclusive metadata reads may fall back.
-                            # Auth/risk denials and partial media downloads stop.
-                            fallback_error = str(exc)
-                    elif link.platform == "xhs":
-                        item = await share_native_social_service._xhs_native_share(
-                            link.url,
-                            account_id=body.account_id,
-                            output_root=output_root,
-                            quality=body.quality,
-                            should_download=body.download,
-                            save_metadata=body.save_metadata,
-                            save_thumbnail=body.save_thumbnail,
-                            proxy=proxy,
-                        )
-                    elif link.platform == "rednote":
-                        item = await share_native_social_service._rednote_native_share(
-                            link.url,
-                            account_id=body.account_id,
-                            output_root=output_root,
-                            quality=body.quality,
-                            should_download=body.download,
-                            save_metadata=body.save_metadata,
-                            save_thumbnail=body.save_thumbnail,
-                            proxy=proxy,
-                        )
-                    elif link.platform == "instagram":
-                        try:
-                            item = await share_native_social_service._instagram_native_share(
-                                link.url,
-                                account_id=body.account_id,
-                                output_root=output_root,
-                                quality=body.quality,
-                                should_download=body.download,
-                                save_metadata=body.save_metadata,
-                                save_thumbnail=body.save_thumbnail,
-                                proxy=proxy,
-                                user_agent=user_agent,
-                            )
-                        except ShareDownloadFallback as exc:
-                            fallback_error = str(exc)
-                    elif link.platform == "twitter":
-                        try:
-                            item = await share_native_social_service._twitter_native_share(
-                                link.url,
-                                account_id=body.account_id,
-                                output_root=output_root,
-                                quality=body.quality,
-                                should_download=body.download,
-                                save_metadata=body.save_metadata,
-                                save_thumbnail=body.save_thumbnail,
-                                proxy=proxy,
-                                user_agent=user_agent,
-                            )
-                        except ShareDownloadFallback as exc:
-                            fallback_error = str(exc)
-                    elif link.platform == "facebook":
-                        try:
-                            item = await share_native_social_service._facebook_native_share(
-                                link.url,
-                                account_id=body.account_id,
-                                output_root=output_root,
-                                quality=body.quality,
-                                should_download=body.download,
-                                save_metadata=body.save_metadata,
-                                save_thumbnail=body.save_thumbnail,
-                                proxy=proxy,
-                                user_agent=user_agent,
-                            )
-                        except ShareDownloadFallback as exc:
-                            fallback_error = str(exc)
-                    elif link.platform == "wechat":
-                        account_state = ""
-                        if body.account_id:
-                            with get_session() as s_acc:
-                                acc = s_acc.get(DouyinAccount, body.account_id)
-                                if acc:
-                                    account_state = (
-                                        acc.storage_state
-                                        or acc.creator_storage_state
-                                        or ""
-                                    )
-                        try:
-                            item = await inspect_or_download_channels_share(
-                                link.url,
-                                cfg=app_runtime.cfg,
-                                output_root=output_root,
-                                quality=body.quality,
-                                should_download=body.download,
-                                save_metadata=body.save_metadata,
-                                save_thumbnail=body.save_thumbnail,
-                                proxy=proxy,
-                                user_agent=user_agent,
-                                account_storage_state=account_state,
-                            )
-                        except ShareDownloadFallback:
-                            # 非视频号的 qq.com 链接(如 v.qq.com)直接交由通用提取器处理
-                            item = None
-                    # 10 大核心平台严禁把账号登录态 Cookie 交给 yt-dlp(Python OpenSSL TLS 栈)，避免同会话 TLS 指纹突变触发风控
-                    safe_ytdlp_cookie = (
-                        "" if link.platform in {
-                            "douyin", "xhs", "rednote", "kuaishou", "wechat",
-                            "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"
-                        } else cookie_file
-                    )
-                    if item is not None:
-                        pass
-                    elif body.download:
-                        item = await downloader.download(
-                            link.url,
-                            quality=body.quality,
-                            save_metadata=body.save_metadata,
-                            save_thumbnail=body.save_thumbnail,
-                            save_subtitles=body.save_subtitles,
-                            proxy=proxy,
-                            cookie_file=safe_ytdlp_cookie,
-                            max_filesize_mb=body.max_filesize_mb,
-                        )
-                    else:
-                        item = await downloader.inspect(
-                            link.url, proxy=proxy, cookie_file=safe_ytdlp_cookie
-                        )
-                    item["input_platform"] = link.platform
-                    item_warnings = list(item.get("warnings") or [])
-                    if proxy_override_warning and proxy_override_warning not in item_warnings:
-                        item_warnings.append(proxy_override_warning)
-                    if not proxy and link.platform in {"tiktok", "rednote", "instagram", "twitter", "facebook"}:
-                        direct_warn = "提醒：当前未配置代理（走本机直连），海外平台若遇到连接超时建议配置代理"
-                        if direct_warn not in item_warnings:
-                            item_warnings.append(direct_warn)
-                    item["warnings"] = item_warnings
-                    if fallback_error:
-                        item.setdefault("warnings", []).append(
-                            fallback_error + "；已改用通用提取器完成处理")
-                except ShareDownloadError as exc:
-                    item = {
-                        "ok": False,
-                        "url": link.url,
-                        "input_platform": link.platform,
-                        "error": ((fallback_error + "；通用提取器：") if fallback_error else "") + str(exc),
-                    }
-                    if getattr(exc, "diagnostics", None):
-                        item["diagnostics"] = dict(exc.diagnostics)
-                if body.download:
-                    try:
-                        item["history_id"] = share_downloads_service._save_share_download_history(
-                            source_url=link.url,
-                            platform=link.platform,
-                            account_id=body.account_id,
-                            item=item,
-                        )
-                    except Exception as exc:
-                        item.setdefault("warnings", []).append(
-                            f"下载已处理，但历史记录写入失败：{exc}"
-                        )
+                item = await _process_one_share_link(
+                    link,
+                    body=body,
+                    output_root=output_root,
+                    downloader=downloader,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                    cookie_file=cookie_file,
+                    proxy_override_warning=proxy_override_warning,
+                )
                 results.append(item)
     finally:
         if cookie_file:
@@ -301,13 +669,402 @@ async def share_download(body: ShareDownloadIn):
     }
 
 
+def _sync_share_job_to_hub(job: dict[str, Any], *, immediate: bool = False) -> None:
+    items = job.get("items") or []
+    total_links = max(1, len(items))
+    done_count = sum(1 for it in items if it.get("status") in {"completed", "failed", "canceled"})
+    ok_count = sum(1 for it in items if it.get("status") == "completed")
+    fail_count = sum(1 for it in items if it.get("status") == "failed")
+    total_speed = sum(float(it.get("speed_bps") or 0) for it in items if it.get("status") == "running")
+    active_etas = [int(it["eta_seconds"]) for it in items if it.get("status") == "running" and it.get("eta_seconds") is not None]
+    eta = max(active_etas) if active_etas else None
+
+    # 聚合进度：单链接直接映射真实字节进度；多链接按每条链接权重平均。
+    if total_links == 1:
+        only = items[0]
+        determinate = bool(only.get("determinate")) or only.get("status") == "completed"
+        percent = 100.0 if only.get("status") == "completed" else only.get("percent")
+        current = only.get("downloaded_bytes") or 0
+        total = only.get("total_bytes") or 0
+        unit = "bytes" if total > 0 or current > 0 else ""
+        phase_label = str(only.get("phase_label") or job.get("phase_label") or "处理中")
+        title = str(only.get("title") or only.get("host") or only.get("url") or "链接下载")
+        detail = str(only.get("host") or "")
+    else:
+        frac = 0.0
+        has_any_pct = done_count > 0
+        for it in items:
+            st = it.get("status")
+            if st in {"completed", "failed", "canceled"}:
+                frac += 1.0
+            elif it.get("percent") is not None:
+                frac += max(0.0, min(100.0, float(it["percent"]))) / 100.0
+                has_any_pct = True
+        determinate = has_any_pct or job.get("status") == "completed"
+        percent = round(min(100.0, (frac * 100.0) / total_links), 1) if determinate else None
+        current = done_count
+        total = total_links
+        unit = "items"
+        running_items = [it for it in items if it.get("status") == "running"]
+        phase_label = (
+            f"并发处理 {len(running_items)} 条 · 已完成 {done_count}/{total_links}"
+            if job.get("status") == "running"
+            else str(job.get("phase_label") or "处理完成")
+        )
+        title = f"批量链接下载（{total_links} 条）"
+        detail = f"成功 {ok_count}" + (f" · 失败 {fail_count}" if fail_count else "")
+
+    public_items = [
+        {
+            "index": it["index"],
+            "url": it["url"],
+            "platform": it["platform"],
+            "host": it["host"],
+            "title": it.get("title") or "",
+            "status": it.get("status") or "queued",
+            "phase_label": it.get("phase_label") or "排队中",
+            "determinate": bool(it.get("determinate")),
+            "percent": it.get("percent"),
+            "downloaded_bytes": int(it.get("downloaded_bytes") or 0),
+            "total_bytes": int(it.get("total_bytes") or 0),
+            "speed_bps": it.get("speed_bps"),
+            "eta_seconds": it.get("eta_seconds"),
+            "error": it.get("error") or "",
+            "history_id": it.get("history_id"),
+        }
+        for it in items
+    ]
+    progress_hub.upsert(
+        f"share:{job['id']}",
+        immediate=immediate,
+        category="share_download",
+        title=title[:140],
+        platform=str(items[0]["platform"] if total_links == 1 else ""),
+        account_id=job.get("account_id"),
+        source_tab="share-download",
+        status=str(job.get("status") or "running"),
+        phase=str(job.get("phase") or "running"),
+        phase_label=phase_label,
+        detail=detail,
+        error=str(job.get("error") or ""),
+        determinate=determinate,
+        percent=percent,
+        current=current,
+        total=total,
+        unit=unit,
+        speed_bps=total_speed if total_speed > 0 else None,
+        eta_seconds=eta,
+        metrics={"total": total_links, "done": done_count, "ok": ok_count, "failed": fail_count},
+        cancelable=job.get("status") in {"queued", "running"},
+        extra={
+            "job_id": job["id"],
+            "download": bool(job.get("download", True)),
+            "items": public_items,
+            "results": job.get("results") if job.get("status") in {"completed", "failed", "canceled"} else None,
+        },
+    )
+
+
+async def _run_share_download_job(
+    job_id: str,
+    body: ShareDownloadIn,
+    selected: list,
+    output_root: Path,
+    cancel_event: threading.Event,
+) -> None:
+    job = app_runtime._share_download_jobs[job_id]
+    cookie_file = ""
+    try:
+        from app.browser.manager import normalize_proxy
+        cookie_file, account_proxy, account_ua = share_downloads_service._write_account_cookie_file(body.account_id)
+        req_proxy = body.proxy.strip()
+        proxy_override_warning = ""
+        if body.account_id is not None and req_proxy and normalize_proxy(req_proxy) != normalize_proxy(account_proxy):
+            proxy_override_warning = "提醒：本次下载使用了与所选账号绑定环境不同的临时代理出口，请注意跨 IP 登录态关联风险"
+            proxy = req_proxy
+        else:
+            proxy = account_proxy if body.account_id is not None else req_proxy
+        if not proxy:
+            with get_session() as s_pool:
+                from app.profiles import _pool_urls
+                pool_candidates = _pool_urls(s_pool, app_runtime.cfg)
+                if pool_candidates and body.account_id is None:
+                    proxy = pool_candidates[0]
+        user_agent = account_ua or app_runtime.cfg.engine.user_agent
+        downloader = ShareDownloader(
+            output_root,
+            user_agent=user_agent,
+            timeout=app_runtime.cfg.engine.request_timeout_seconds,
+        )
+        job["status"] = "running"
+        job["phase"] = "running"
+        job["phase_label"] = "正在处理链接"
+        _sync_share_job_to_hub(job, immediate=True)
+
+        # 绑定同一账号时强制按账号串行，避免批量多链接在同一账号下并发撞风控；
+        # 匿名多链接保持最多 3 路并发，但每条启动前加轻度随机错峰。
+        from app.pacing import jittered_sleep
+        link_sem = asyncio.Semaphore(
+            1 if body.account_id is not None else min(3, max(1, len(selected)))
+        )
+
+        async def run_one(idx: int, link):
+            entry = job["items"][idx]
+            if cancel_event.is_set():
+                entry["status"] = "canceled"
+                entry["phase_label"] = "已取消"
+                _sync_share_job_to_hub(job)
+                return {
+                    "ok": False, "canceled": True, "url": link.url,
+                    "input_platform": link.platform, "error": "下载已取消",
+                }
+            async with link_sem:
+                if idx > 0 and len(selected) > 1:
+                    await jittered_sleep(
+                        1.1 if body.account_id is not None else 0.45,
+                        ratio=0.45,
+                        min_delay=0.2,
+                    )
+                async with app_runtime._share_download_sem:
+                    if cancel_event.is_set():
+                        entry["status"] = "canceled"
+                        entry["phase_label"] = "已取消"
+                        _sync_share_job_to_hub(job)
+                        return {
+                            "ok": False, "canceled": True, "url": link.url,
+                            "input_platform": link.platform, "error": "下载已取消",
+                        }
+                    entry["status"] = "running"
+                    entry["phase_label"] = "正在解析作品信息"
+                    _sync_share_job_to_hub(job, immediate=True)
+
+                    def on_item_progress(data: dict[str, Any]) -> None:
+                        st = str(data.get("status") or "")
+                        if data.get("title"):
+                            entry["title"] = str(data["title"])[:160]
+                        dl = data.get("downloaded_bytes")
+                        tot = data.get("total_bytes") or data.get("total_bytes_estimate")
+                        if dl is not None:
+                            entry["downloaded_bytes"] = int(dl)
+                        if tot is not None and float(tot) > 0:
+                            entry["total_bytes"] = int(tot)
+                            entry["determinate"] = True
+                            entry["percent"] = round(min(99.5, (float(dl or 0) * 100.0) / float(tot)), 1)
+                        if data.get("speed") is not None:
+                            entry["speed_bps"] = float(data["speed"])
+                        if data.get("eta") is not None:
+                            entry["eta_seconds"] = int(data["eta"])
+                        if st == "postprocessing":
+                            entry["phase_label"] = "正在合并/封装音视频"
+                            entry["speed_bps"] = None
+                            entry["eta_seconds"] = None
+                        elif st == "finished":
+                            entry["phase_label"] = "下载完成，正在收尾"
+                            entry["percent"] = 99.0
+                            entry["determinate"] = True
+                        elif st == "downloading":
+                            entry["phase_label"] = "正在下载媒体"
+                        elif data.get("phase_label"):
+                            entry["phase_label"] = str(data["phase_label"])
+                        _sync_share_job_to_hub(job)
+
+                    result = await _process_one_share_link(
+                        link,
+                        body=body,
+                        output_root=output_root,
+                        downloader=downloader,
+                        proxy=proxy,
+                        user_agent=user_agent,
+                        cookie_file=cookie_file,
+                        proxy_override_warning=proxy_override_warning,
+                        on_progress=on_item_progress,
+                        cancel_event=cancel_event,
+                    )
+                    meta = result.get("metadata") or {}
+                    if meta.get("title") and not entry.get("title"):
+                        entry["title"] = str(meta["title"])[:160]
+                    entry["history_id"] = result.get("history_id")
+                    entry["speed_bps"] = None
+                    entry["eta_seconds"] = None
+                    if result.get("canceled"):
+                        entry["status"] = "canceled"
+                        entry["phase_label"] = "已取消"
+                        entry["error"] = ""
+                    elif result.get("ok"):
+                        entry["status"] = "completed"
+                        entry["phase_label"] = "下载完成" if body.download else "读取完成"
+                        entry["determinate"] = True
+                        entry["percent"] = 100.0
+                        entry["error"] = ""
+                    else:
+                        entry["status"] = "failed"
+                        entry["phase_label"] = "下载失败"
+                        entry["error"] = str(result.get("error") or "未知错误")[:500]
+                    _sync_share_job_to_hub(job, immediate=True)
+                    return result
+
+        results = await asyncio.gather(*(run_one(i, link) for i, link in enumerate(selected)))
+        job["results"] = list(results)
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        if cancel_event.is_set() and not any(r.get("ok") for r in results):
+            job["status"] = "canceled"
+            job["phase"] = "canceled"
+            job["phase_label"] = "已取消"
+        elif all(r.get("ok") for r in results):
+            job["status"] = "completed"
+            job["phase"] = "completed"
+            job["phase_label"] = "下载完成" if body.download else "读取完成"
+        elif any(r.get("ok") for r in results):
+            job["status"] = "completed"
+            job["phase"] = "partial"
+            ok_n = sum(1 for r in results if r.get("ok"))
+            job["phase_label"] = f"部分完成（{ok_n}/{len(results)} 成功）"
+            first_err = next((r.get("error") for r in results if not r.get("ok")), "")
+            job["error"] = str(first_err or "")[:400]
+        else:
+            job["status"] = "failed"
+            job["phase"] = "failed"
+            job["phase_label"] = "下载失败"
+            job["error"] = str((results[0].get("error") if results else "") or "未知错误")[:500]
+        _sync_share_job_to_hub(job, immediate=True)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        job["status"] = "canceled"
+        job["phase"] = "canceled"
+        job["phase_label"] = "已取消"
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        for entry in job.get("items") or []:
+            if entry.get("status") in {"queued", "running"}:
+                entry["status"] = "canceled"
+                entry["phase_label"] = "已取消"
+        _sync_share_job_to_hub(job, immediate=True)
+        raise
+    except Exception as exc:
+        job["status"] = "failed"
+        job["phase"] = "failed"
+        job["phase_label"] = "下载异常"
+        job["error"] = str(exc) or repr(exc)
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        _sync_share_job_to_hub(job, immediate=True)
+    finally:
+        if cookie_file:
+            try:
+                Path(cookie_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+@router.post("/api/share-download/jobs", status_code=202)
+async def create_share_download_job(body: ShareDownloadIn):
+    """创建后台异步链接下载任务，立即返回 job_id，通过 /api/progress/stream 实时推送字节/速率/阶段进度。"""
+    normalized, links, selected, output_root = _prepare_share_context(body)
+    finished_keys = [
+        key for key, value in app_runtime._share_download_jobs.items()
+        if value.get("status") in {"completed", "failed", "canceled"}
+    ]
+    for old_key in finished_keys[:-50]:
+        app_runtime._share_download_jobs.pop(old_key, None)
+        app_runtime._share_download_tasks.pop(old_key, None)
+
+    job_id = uuid.uuid4().hex[:12]
+    cancel_event = threading.Event()
+    job: dict[str, Any] = {
+        "id": job_id,
+        "download": bool(body.download),
+        "account_id": body.account_id,
+        "status": "queued",
+        "phase": "queued",
+        "phase_label": "排队中",
+        "error": "",
+        "normalized_text": normalized,
+        "links": [item.to_dict() for item in links],
+        "items": [
+            {
+                "index": idx,
+                "url": link.url,
+                "platform": link.platform,
+                "host": link.host,
+                "title": "",
+                "status": "queued",
+                "phase_label": "等待下载",
+                "determinate": False,
+                "percent": None,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "speed_bps": None,
+                "eta_seconds": None,
+                "error": "",
+                "history_id": None,
+            }
+            for idx, link in enumerate(selected)
+        ],
+        "results": [],
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "completed_at": None,
+        "_cancel_event": cancel_event,
+    }
+    app_runtime._share_download_jobs[job_id] = job
+    _sync_share_job_to_hub(job, immediate=True)
+
+    def _cancel_job():
+        cancel_event.set()
+        t = app_runtime._share_download_tasks.get(job_id)
+        if t is not None and not t.done():
+            t.cancel()
+        return {"ok": True, "job_id": job_id}
+
+    progress_hub.register_cancel(f"share:{job_id}", _cancel_job)
+    task = asyncio.create_task(
+        _run_share_download_job(job_id, body, selected, output_root, cancel_event)
+    )
+    app_runtime._share_download_tasks[job_id] = task
+    task.add_done_callback(lambda _t, k=job_id: app_runtime._share_download_tasks.pop(k, None))
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+@router.get("/api/share-download/jobs")
+async def list_share_download_jobs():
+    jobs = [
+        {k: v for k, v in job.items() if not k.startswith("_")}
+        for job in reversed(list(app_runtime._share_download_jobs.values()))
+    ]
+    return {"jobs": jobs[:30]}
+
+
+@router.get("/api/share-download/jobs/{job_id}")
+async def get_share_download_job(job_id: str):
+    job = app_runtime._share_download_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "下载任务不存在")
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+@router.post("/api/share-download/jobs/{job_id}/cancel")
+async def cancel_share_download_job(job_id: str):
+    job = app_runtime._share_download_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "下载任务不存在")
+    ev = job.get("_cancel_event")
+    if isinstance(ev, threading.Event):
+        ev.set()
+    task = app_runtime._share_download_tasks.get(job_id)
+    if task is not None and not task.done():
+        task.cancel()
+    return {"ok": True, "job_id": job_id}
+
+
 @router.get("/api/share-download/history")
 async def get_share_download_history(limit: int = 100, platform: str = ""):
     limit = max(1, min(int(limit or 100), 500))
     with get_session() as s:
         query = select(ShareDownloadRecord)
         if platform.strip():
-            query = query.where(ShareDownloadRecord.platform == platform.strip())
+            pf_key = platform.strip()
+            pf_aliases = {
+                "shipinhao": ("shipinhao", "wechat", "channels"),
+                "twitter": ("twitter", "x"),
+            }.get(pf_key, (pf_key,))
+            query = query.where(ShareDownloadRecord.platform.in_(pf_aliases))
         rows = s.exec(
             query.order_by(ShareDownloadRecord.created_at.desc()).limit(limit)
         ).all()

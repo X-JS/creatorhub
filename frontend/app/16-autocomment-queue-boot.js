@@ -3,6 +3,8 @@
 let AC_RULES = [];
 let AC_TASKS = [];
 let AC_POLICY_META = null;
+let AC_REVIEW_USER_CHOICE = null;
+let AC_REVIEW_PLATFORM = "";
 const AC_SELECTED_TASKS = new Set();
 
 const AC_MODE_T = { auto_reply: "自动回复", auto_comment: "自动评论" };
@@ -23,7 +25,7 @@ const AC_SRC_META = {
 };
 const AC_TASK_ST = { draft: "草稿待审", pending: "排队中", doing: "发送中", uncertain: "结果待确认", done: "已发送", failed: "失败", canceled: "已取消" };
 const AC_TASK_PILL = { draft: "downloading", pending: "pending", doing: "downloading", uncertain: "downloading", done: "done", failed: "failed", canceled: "invalid" };
-const AC_KEYWORD_PLATFORMS = ["xhs", "bilibili", "instagram", "twitter", "facebook"];
+const AC_KEYWORD_PLATFORMS = ["xhs", "bilibili", "instagram", "twitter", "facebook", "youtube"];
 
 function acKindOptionsFor(platform, mode) {
   if (mode === "auto_comment") {
@@ -34,26 +36,26 @@ function acKindOptionsFor(platform, mode) {
   return '<option value="self">自己近期作品</option><option value="work">指定作品</option>';
 }
 function acTargetMeta(platform, mode, kind) {
-  const xhs = platform === "xhs", bili = platform === "bilibili", ig = platform === "instagram", tw = platform === "twitter", fb = platform === "facebook";
+  const xhs = platform === "xhs", bili = platform === "bilibili", ig = platform === "instagram", tw = platform === "twitter", fb = platform === "facebook", yt = platform === "youtube";
   if (mode === "auto_reply") {
     if (kind === "self") return { show: false, label: "目标", ph: "" };
     return {
       show: true,
-      label: xhs ? "笔记链接 / id" : tw ? "推文链接 / status_id" : fb ? "帖子 / Reel / Watch 链接" : "作品链接 / id",
-      ph: xhs ? "explore 链接 / xhslink / note_id" : bili ? "视频链接 / BV或av号 / opus链接" : ig ? "instagram.com/p/... 或 /reel/... 链接" : tw ? "x.com/.../status/... 链接或数字推文 ID" : fb ? "facebook.com 帖子/Reel/Watch 链接或 fb.watch 短链" : "作品链接 / 短链 / 数字 id",
+      label: xhs ? "笔记链接 / id" : tw ? "推文链接 / status_id" : fb ? "帖子 / Reel / Watch 链接" : yt ? "YouTube 视频 / Shorts 链接" : "作品链接 / id",
+      ph: xhs ? "explore 链接 / xhslink / note_id" : bili ? "视频链接 / BV或av号 / opus链接" : ig ? "instagram.com/p/... 或 /reel/... 链接" : tw ? "x.com/.../status/... 链接或数字推文 ID" : fb ? "facebook.com 帖子/Reel/Watch 链接或 fb.watch 短链" : yt ? "youtube.com/watch?v=...、youtu.be/... 或 /shorts/..." : "作品链接 / 短链 / 数字 id",
     };
   }
   if (kind === "keyword") {
     return {
       show: true,
       label: "搜索关键词",
-      ph: tw ? "例如:AI agent / #buildinpublic" : fb ? "例如:跨境电商 / marketing tips" : ig ? "例如:#travel / skincare" : "例如:露营装备 / 口红试色",
+      ph: tw ? "例如:AI agent / #buildinpublic" : fb ? "例如:跨境电商 / marketing tips" : yt ? "例如:AI tutorial / tech review" : ig ? "例如:#travel / skincare" : "例如:露营装备 / 口红试色",
     };
   }
   return {
     show: true,
-    label: xhs ? "博主主页 / id" : bili ? "UP 主空间主页 / mid" : (ig || tw) ? "创作者主页 / @username" : fb ? "主页 / 公共主页 / 群组链接" : "博主主页 / sec_uid",
-    ph: xhs ? "主页链接 / xhslink / user_id" : bili ? "space.bilibili.com 链接 / mid" : ig ? "instagram.com/<username> 或 @username" : tw ? "x.com/<username> 或 @username" : fb ? "facebook.com/<page>、/groups/<id> 或 profile.php?id=..." : "主页链接 / 短链 / sec_uid",
+    label: xhs ? "博主主页 / id" : bili ? "UP 主空间主页 / mid" : (ig || tw) ? "创作者主页 / @username" : fb ? "主页 / 公共主页 / 群组链接" : yt ? "YouTube 频道 / @handle" : "博主主页 / sec_uid",
+    ph: xhs ? "主页链接 / xhslink / user_id" : bili ? "space.bilibili.com 链接 / mid" : ig ? "instagram.com/<username> 或 @username" : tw ? "x.com/<username> 或 @username" : fb ? "facebook.com/<page>、/groups/<id> 或 profile.php?id=..." : yt ? "youtube.com/@handle 或 /channel/UC..." : "主页链接 / 短链 / sec_uid",
   };
 }
 function acParseKwInput(text) {
@@ -100,10 +102,37 @@ function populateAcAiSelectors() {
   }
   csSyncAll();
 }
+function openAcEngineReviewSettings(policyOverride = null) {
+  const p = policyOverride || AC_POLICY_META?.policy;
+  const pf = p?.platform || PLATFORM;
+  const focusId = p?.xhs_manual_only
+    ? "engine-xhs_comment_write_mode"
+    : (pf === "xhs" ? "engine-xhs_comment_review_before_publish" : "");
+  if ($("uimodal") && getComputedStyle($("uimodal")).display !== "none" && typeof _uiClose === "function") {
+    _uiClose(null);
+  }
+  if (typeof openEngineSettingsSection === "function") {
+    openEngineSettingsSection(focusId);
+  }
+}
+function resetAcReviewDefaultForPlatform(pf = PLATFORM) {
+  AC_REVIEW_PLATFORM = pf;
+  AC_REVIEW_USER_CHOICE = null;
+  const cb = $("ac-review");
+  if (cb) {
+    cb.disabled = false;
+    cb.checked = pf === "xhs";
+  }
+  syncAcCreatePolicySummary();
+}
+function onAcReviewToggle() {
+  AC_REVIEW_PLATFORM = PLATFORM;
+  AC_REVIEW_USER_CHOICE = Boolean($("ac-review")?.checked);
+  syncAcCreatePolicySummary();
+}
 function renderAcPolicyBars() {
   const p = AC_POLICY_META?.policy;
-  if (!p) return;
-  const aiOk = p.ai_enabled && p.ai_route?.ready;
+  if (!p || p.platform !== PLATFORM) return;
   const aiTxt = !p.ai_enabled
     ? "AI 文案总开关未开启"
     : p.ai_route?.ready
@@ -116,29 +145,65 @@ function renderAcPolicyBars() {
     capParts.push(`全局最小间隔 ${Math.max(p.risk_comment_min_gap_seconds, p.legacy_comment_min_gap_seconds)} 秒`);
   }
   const limitTxt = capParts.length ? capParts.join(" · ") : "风控评论限额未开启（仅按规则自身参数）";
+  const xhsLocked = Boolean(p.xhs_manual_only || p.xhs_review_forced);
   const reviewTxt = p.xhs_manual_only
-    ? "小红书当前为「仅保存草稿」模式，不会自动发送"
+    ? "小红书当前为「仅保存草稿」模式，不会自动发送（可在采集与运行设置修改）"
     : p.xhs_review_forced
-      ? "小红书已开启「全局先审后发」，所有规则生成后均先入草稿"
-      : "审核状态由各规则单独控制";
+      ? "小红书已开启「全局强制先审」，将覆盖单条规则设置并全部先入草稿（可在采集与运行设置关闭）"
+      : "审核状态由各规则自身「发布前审核」开关决定";
 
   const rulesBar = $("ac-rules-policy-bar");
   if (rulesBar) {
-    rulesBar.dataset.state = (p.ai_enabled && !p.ai_route?.ready) ? "warn" : "ok";
+    rulesBar.dataset.state = ((p.ai_enabled && !p.ai_route?.ready) || xhsLocked) ? "warn" : "ok";
     if ($("ac-rules-policy-title")) $("ac-rules-policy-title").textContent = `${PF_NAME[PLATFORM] || PLATFORM} 生效策略 · ${aiTxt}`;
     if ($("ac-rules-policy-desc")) $("ac-rules-policy-desc").textContent = `${limitTxt} · ${reviewTxt}`;
   }
   syncAcCreatePolicySummary();
 }
 function syncAcCreatePolicySummary() {
-  const p = AC_POLICY_META?.policy;
+  const rawPolicy = AC_POLICY_META?.policy;
+  const p = (rawPolicy && rawPolicy.platform === PLATFORM) ? rawPolicy : null;
+  if (AC_REVIEW_PLATFORM !== PLATFORM) {
+    AC_REVIEW_PLATFORM = PLATFORM;
+    AC_REVIEW_USER_CHOICE = null;
+  }
+  const userReviewChoice = AC_REVIEW_USER_CHOICE !== null ? AC_REVIEW_USER_CHOICE : (PLATFORM === "xhs");
+  const xhsManualOnly = Boolean(p?.xhs_manual_only);
+  const xhsReviewForced = Boolean(p?.xhs_review_forced);
+  const reviewLocked = xhsManualOnly || xhsReviewForced;
+
+  const reviewCb = $("ac-review");
+  if (reviewCb) {
+    reviewCb.disabled = reviewLocked;
+    reviewCb.checked = reviewLocked ? true : userReviewChoice;
+  }
+  if ($("ac-review-row")) $("ac-review-row").classList.toggle("is-locked", reviewLocked);
+  if ($("ac-review-title")) {
+    $("ac-review-title").textContent = reviewLocked
+      ? "发布前先存草稿人工审核（已被全局设置锁定）"
+      : "发布前先存草稿人工审核";
+  }
+  if ($("ac-review-unlock-btn")) {
+    $("ac-review-unlock-btn").hidden = !reviewLocked;
+    $("ac-review-unlock-btn").textContent = xhsManualOnly ? "去修改发送方式 →" : "去设置关闭 →";
+  }
+  if ($("ac-review-help")) {
+    $("ac-review-help").textContent = xhsManualOnly
+      ? "当前小红书评论通道为「仅保存草稿」，无论单条规则如何设置，所有任务均只存草稿不会自动发送。"
+      : xhsReviewForced
+        ? "当前「设置 → 采集与运行」开启了小红书全局强制先审，将覆盖单条规则设置；关闭全局锁后即可自由切换。"
+        : PLATFORM === "xhs"
+          ? "小红书新建规则默认勾选以降低风控；取消勾选后，新生成的评论将直接排队发送。"
+          : "推荐开启：生成后进入「任务与审核」核对原文与拟发文案，通过后再按节流发出。";
+  }
+
   const banner = $("ac-create-policy-banner");
   if (!banner || !p) return;
   const cm = $("ac-compose-mode")?.value || "template_only";
   const ruleGap = Math.max(1, Number($("ac-gap")?.value) || 90);
   const ruleCap = Math.max(0, Number($("ac-cap")?.value) || 0);
   const effGap = Math.max(ruleGap, p.risk_comment_min_gap_seconds || 0, p.legacy_comment_min_gap_seconds || 0);
-  const reviewOn = Boolean($("ac-review")?.checked) || p.xhs_review_forced || p.xhs_manual_only;
+  const reviewOn = reviewLocked || userReviewChoice;
   const warnReasons = [];
   if (acUsesAi(cm) && !p.ai_enabled) warnReasons.push("当前选了 AI 生成，但「设置 → AI 文案」总开关尚未开启");
   else if (acUsesAi(cm) && !p.ai_route?.ready) warnReasons.push(`AI 模型未就绪（${p.ai_route?.reason || "请先配置"}）`);
@@ -148,12 +213,10 @@ function syncAcCreatePolicySummary() {
   if ($("ac-mode")?.value === "auto_comment" && acc && String(acc.account_role || "hybrid").toLowerCase() === "publish") {
     warnReasons.push("所选账号为「发布主号 (publish)」，不允许创建主动评论规则");
   }
-  if ($("ac-review-help")) {
-    $("ac-review-help").textContent = p.xhs_manual_only
-      ? "当前小红书评论通道为「仅保存草稿」，无论是否勾选均只存草稿。"
-      : p.xhs_review_forced
-        ? "当前「设置 → 采集与运行」开启了小红书全局先审后发，本规则会自动先存草稿。"
-        : "推荐开启：生成后进入「任务与审核」核对原文与拟发文案，通过后再按节流发出。";
+  if (xhsManualOnly) {
+    warnReasons.push("小红书评论发送方式为「仅保存草稿」，生成的任务不会自动发送");
+  } else if (xhsReviewForced) {
+    warnReasons.push("小红书已开启「全局强制先审」，将覆盖单条规则设置并全部先入草稿");
   }
   banner.dataset.state = warnReasons.length ? "warn" : "ok";
   if ($("ac-create-policy-title")) {
@@ -168,8 +231,10 @@ function syncAcCreatePolicySummary() {
   }
 }
 async function refreshAcPolicyMeta() {
+  const reqPlatform = PLATFORM;
   try {
-    const data = await api("/api/comment-rules/effective-policy?platform=" + encodeURIComponent(PLATFORM));
+    const data = await api("/api/comment-rules/effective-policy?platform=" + encodeURIComponent(reqPlatform));
+    if (reqPlatform !== PLATFORM) return;
     AC_POLICY_META = data;
     populateAcAiSelectors();
     renderAcPolicyBars();
@@ -202,6 +267,22 @@ function onAcMode() {
   if ([...k.options].some(o => o.value === prev)) k.value = prev;
   onAcKind();
 }
+function syncAcFilterLinkage() {
+  const matchMode = $("ac-match-mode")?.value || "any";
+  const kwInput = $("ac-include-kw");
+  const kwWrap = $("ac-include-kw-wrap");
+  const disabled = matchMode === "all";
+  if (kwInput) {
+    kwInput.disabled = disabled;
+    kwInput.placeholder = disabled
+      ? "当前为「不过滤」模式，包含关键词不生效"
+      : "例如：链接, 哪里买, 教程, 多少钱（留空=不限）";
+  }
+  if (kwWrap) kwWrap.style.opacity = disabled ? "0.55" : "";
+  const isSingleWork = $("ac-mode")?.value === "auto_reply" && $("ac-kind")?.value === "work";
+  if ($("ac-recent-works-wrap")) $("ac-recent-works-wrap").style.display = isSingleWork ? "none" : "";
+  if ($("ac-recent-days-wrap")) $("ac-recent-days-wrap").style.display = isSingleWork ? "none" : "";
+}
 function onAcKind() {
   const mode = $("ac-mode").value, kind = $("ac-kind").value;
   const meta = acTargetMeta(PLATFORM, mode, kind);
@@ -210,6 +291,7 @@ function onAcKind() {
   $("ac-target").placeholder = meta.ph;
   if ($("ac-scope-wrap")) $("ac-scope-wrap").style.display = mode === "auto_reply" ? "" : "none";
   onAcComposeModeChange();
+  syncAcFilterLinkage();
   syncAcCreatePolicySummary();
   csSyncAll();
 }
@@ -231,6 +313,11 @@ async function addCommentRule() {
   }
   const inc = acParseKwInput($("ac-include-kw")?.value || "");
   const exc = acParseKwInput($("ac-skip")?.value || "");
+  const activePolicy = (AC_POLICY_META?.policy?.platform === PLATFORM) ? AC_POLICY_META.policy : null;
+  const reviewLocked = Boolean(activePolicy && (activePolicy.xhs_review_forced || activePolicy.xhs_manual_only));
+  const requireReviewVal = reviewLocked
+    ? Boolean(AC_REVIEW_USER_CHOICE !== null ? AC_REVIEW_USER_CHOICE : (PLATFORM === "xhs"))
+    : Boolean($("ac-review").checked);
   const body = {
     platform: PLATFORM,
     name: ($("ac-name")?.value || "").trim(),
@@ -246,7 +333,7 @@ async function addCommentRule() {
     ai_preset_id: $("ac-ai-preset")?.value || "",
     ai_prompt: ($("ac-ai-prompt")?.value || "").trim(),
     ai_max_chars: Math.max(0, Number($("ac-ai-max-chars")?.value) || 0),
-    require_review: $("ac-review").checked,
+    require_review: requireReviewVal,
     match_mode: $("ac-match-mode")?.value || "any",
     include_keywords: inc,
     exclude_keywords: exc,
@@ -271,6 +358,7 @@ async function addCommentRule() {
       if ($("ac-ai-prompt")) $("ac-ai-prompt").value = "";
       if ($("ac-include-kw")) $("ac-include-kw").value = "";
       if ($("ac-skip")) $("ac-skip").value = "";
+      resetAcReviewDefaultForPlatform(PLATFORM);
       $("ac-msg").textContent = "规则已创建（默认关闭），点「试跑预览」核对命中与文案后再启用 ✓";
       toast("规则已创建", "ok"); refreshCommentRules();
       globalThis.CreatorHubWorkbench?.completed?.("autocomment");
@@ -287,6 +375,19 @@ function emOnMode() {
   if ([...k.options].some(o => o.value === prev)) k.value = prev;
   emOnKind();
 }
+function emSyncFilterLinkage() {
+  const disabled = ($("em-match-mode")?.value || "any") === "all";
+  const kwInput = $("em-include-kw");
+  const kwWrap = $("em-include-kw-wrap");
+  if (kwInput) {
+    kwInput.disabled = disabled;
+    kwInput.placeholder = disabled ? "当前为「不过滤」模式，包含关键词不生效" : "逗号/中文逗号/换行分隔，留空不限";
+  }
+  if (kwWrap) kwWrap.style.opacity = disabled ? "0.55" : "";
+  const isSingleWork = $("em-mode")?.value === "auto_reply" && $("em-kind")?.value === "work";
+  if ($("em-recent-works-wrap")) $("em-recent-works-wrap").style.display = isSingleWork ? "none" : "";
+  if ($("em-recent-days-wrap")) $("em-recent-days-wrap").style.display = isSingleWork ? "none" : "";
+}
 function emOnKind() {
   const mode = $("em-mode").value, kind = $("em-kind").value;
   const meta = acTargetMeta(EM_PF, mode, kind);
@@ -294,6 +395,7 @@ function emOnKind() {
   $("em-target-label").textContent = meta.label;
   $("em-target").placeholder = meta.ph;
   if ($("em-scope-wrap")) $("em-scope-wrap").style.display = mode === "auto_reply" ? "" : "none";
+  emSyncFilterLinkage();
   csSyncAll();
 }
 function emOnComposeMode() {
@@ -310,6 +412,10 @@ function editRule(id) {
   const r = AC_RULES.find(x => x.id === id); if (!r) return;
   EM_PF = r.platform;
   const accOpts = accOptions(ACCOUNTS.filter(a => a.platform === EM_PF), `请选择${PF_NAME[EM_PF] || "对应平台"}账号`);
+  const activePolicy = (AC_POLICY_META?.policy?.platform === EM_PF) ? AC_POLICY_META.policy : null;
+  const emManualOnly = EM_PF === "xhs" && Boolean(activePolicy?.xhs_manual_only);
+  const emReviewForced = EM_PF === "xhs" && Boolean(activePolicy?.xhs_review_forced);
+  const emReviewLocked = emManualOnly || emReviewForced;
   new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => {
@@ -330,7 +436,7 @@ function editRule(id) {
         ai_preset_id: $("em-ai-preset").value || "",
         ai_prompt: $("em-ai-prompt").value.trim(),
         ai_max_chars: Math.max(0, Number($("em-ai-max-chars").value) || 0),
-        require_review: $("em-review").checked,
+        require_review: emReviewLocked ? !!r.require_review : $("em-review").checked,
         match_mode: $("em-match-mode").value || "any",
         include_keywords: inc,
         exclude_keywords: exc,
@@ -381,22 +487,36 @@ function editRule(id) {
       </fieldset>
       <fieldset class="ui-form-group"><legend>筛选与发现范围</legend>
         <div class="form-grid">
-          <div><label class="field" for="em-match-mode">包含词匹配方式</label><select id="em-match-mode">
+          <div><label class="field" for="em-match-mode">包含词匹配方式</label><select id="em-match-mode" onchange="emSyncFilterLinkage()">
             <option value="any">命中任一包含词</option><option value="all_terms">同时命中全部词</option><option value="regex">正则匹配</option><option value="all">不过滤</option>
           </select></div>
           <div id="em-scope-wrap"><label class="field" for="em-comment-scope">评论层级</label><select id="em-comment-scope">
             <option value="all">全部评论</option><option value="top_only">仅一级顶层评论</option><option value="reply_only">仅二级子评论</option>
           </select></div>
-          <div><label class="field" for="em-include-kw">包含关键词</label><input id="em-include-kw" placeholder="逗号/中文逗号/换行分隔，留空不限"></div>
+          <div id="em-include-kw-wrap"><label class="field" for="em-include-kw">包含关键词</label><input id="em-include-kw" placeholder="逗号/中文逗号/换行分隔，留空不限"></div>
           <div><label class="field" for="em-skip">排除 / 跳过关键词</label><input id="em-skip" placeholder="命中任一即跳过"></div>
           <div><label class="field" for="em-min-len">最少字数（0=不限）</label><input type="number" id="em-min-len" min="0" max="500"></div>
           <div><label class="field" for="em-max-age">最近 N 小时内（0=按天）</label><input type="number" id="em-max-age" min="0" max="8760"></div>
-          <div><label class="field" for="em-recent-works">扫描近期作品数（0=全局）</label><input type="number" id="em-recent-works" min="0" max="50"></div>
-          <div><label class="field" for="em-recent-days">扫描近期天数（0=全局）</label><input type="number" id="em-recent-days" min="0" max="365"></div>
+          <div id="em-recent-works-wrap"><label class="field" for="em-recent-works">扫描近期作品数（0=全局）</label><input type="number" id="em-recent-works" min="0" max="50"></div>
+          <div id="em-recent-days-wrap"><label class="field" for="em-recent-days">扫描近期天数（0=全局）</label><input type="number" id="em-recent-days" min="0" max="365"></div>
         </div>
       </fieldset>
       <fieldset class="ui-form-group"><legend>审核与执行频率</legend>
-        <label class="ui-toggle"><span><b>发布前审核</b><small>先生成草稿，由你核对原文后通过再发送</small></span><input type="checkbox" role="switch" id="em-review"></label>
+        <label class="ui-toggle${emReviewLocked ? " is-locked" : ""}">
+          <span>
+            <b>发布前审核${emReviewLocked ? "（已被全局设置锁定）" : ""}</b>
+            <small>${emManualOnly
+              ? `当前小红书评论通道为「仅保存草稿」，所有任务均只存草稿；本规则原设置为「${r.require_review ? "开启" : "关闭"}」。`
+              : emReviewForced
+                ? `当前「设置 → 采集与运行」开启了小红书全局强制先审，将覆盖此开关；本规则原设置为「${r.require_review ? "开启" : "关闭"}」。`
+                : "先生成草稿，由你核对原文后通过再发送"}</small>
+          </span>
+          <input type="checkbox" role="switch" id="em-review"${emReviewLocked ? " disabled" : ""}>
+        </label>
+        ${emReviewLocked ? `<div class="ac-lock-notice">
+          <span>如需按本规则设置直接排队发送，请先前往「设置 → 采集与运行」关闭全局限制。</span>
+          <button type="button" class="ghost sm" onclick="openAcEngineReviewSettings()">${emManualOnly ? "去修改发送方式 →" : "去关闭全局强制先审 →"}</button>
+        </div>` : ""}
         <div class="form-grid">
           <div><label class="field" for="em-cap">每日上限（0=跟随账号风控）</label><input type="number" id="em-cap" min="0" inputmode="numeric"></div>
           <div><label class="field" for="em-gap">最小间隔（秒）</label><input type="number" id="em-gap" min="1" inputmode="numeric"></div>
@@ -425,7 +545,8 @@ function editRule(id) {
     $("em-max-age").value = String(r.max_source_age_hours || 0);
     $("em-recent-works").value = String(r.recent_works || 0);
     $("em-recent-days").value = String(r.recent_days || 0);
-    $("em-review").checked = !!r.require_review;
+    emSyncFilterLinkage();
+    $("em-review").checked = emReviewLocked ? true : !!r.require_review;
     $("em-cap").value = r.daily_cap; $("em-gap").value = r.min_gap_seconds;
     $("em-max").value = r.max_per_run;
     if ([...$("em-interval").options].some(o => o.value === String(r.interval_seconds))) $("em-interval").value = String(r.interval_seconds);
@@ -465,12 +586,16 @@ async function duplicateRule(id) {
 async function refreshCommentRules() {
   const isCurrent = beginViewRequest("comment-rules");
   if (!$("ac-rule-table")) return;
-  refreshAcPolicyMeta();
-  const rows = await api("/api/comment-rules?platform=" + PLATFORM);
+  const [, rows] = await Promise.all([
+    refreshAcPolicyMeta(),
+    api("/api/comment-rules?platform=" + PLATFORM),
+  ]);
   if (!isCurrent()) return;
   if ($("tb-ac")) $("tb-ac").textContent = rows.length;
   AC_RULES = rows;
   const presets = AC_POLICY_META?.ai_presets || [];
+  const policy = (AC_POLICY_META?.policy?.platform === PLATFORM) ? AC_POLICY_META.policy : null;
+  const xhsLocked = Boolean(policy && (policy.xhs_manual_only || policy.xhs_review_forced));
   $("ac-rule-table").innerHTML = rows.map(r => {
     const tgt = r.mode === "auto_comment"
       ? (r.target_kind === "keyword" ? "#" + esc(r.keyword) : esc((r.sec_uid || "").slice(0, 14)))
@@ -481,7 +606,11 @@ async function refreshCommentRules() {
     const badges = [
       `<span class="pill ${acUsesAi(cm) ? "downloading" : "skipped"} bare" style="font-size:10px">${esc(AC_COMPOSE_T[cm] || cm)}</span>`,
       presetName ? `<span class="pill bare" style="font-size:10px">${esc(presetName)}</span>` : "",
-      r.require_review ? `<span class="pill pending bare" style="font-size:10px">草稿审核</span>` : "",
+      r.require_review
+        ? `<span class="pill pending bare" style="font-size:10px">草稿审核</span>`
+        : (r.platform === "xhs" && xhsLocked)
+          ? `<span class="pill downloading bare" style="font-size:10px" title="该规则未勾选审核，但正被小红书全局设置强制转草稿">${policy.xhs_manual_only ? "全局仅存草稿" : "全局强制先审"}</span>`
+          : "",
       (r.include_keywords?.length) ? `<span class="pill bare" style="font-size:10px">含 ${r.include_keywords.length} 词</span>` : "",
       (r.comment_scope && r.comment_scope !== "all" && r.mode === "auto_reply") ? `<span class="pill bare" style="font-size:10px">${esc(AC_SCOPE_T[r.comment_scope] || r.comment_scope)}</span>` : "",
     ].filter(Boolean).join("");
@@ -520,16 +649,23 @@ async function previewRule(id) {
   if (!res.ok) { toast("预览未通过：" + (res.error || "未知原因"), "err", 8000); return; }
 
   const items = res.items || [];
+  const ep = res.effective_policy || {};
+  const willReview = Boolean(res.review || res.manual_only);
+  const forcedByGlobal = Boolean(ep.xhs_manual_only || ep.xhs_review_forced);
   const action = await new Promise(resolve => {
-    _uiResolve = resolve; _uiCancelVal = null; _uiGetVal = () => "draft";
+    _uiResolve = resolve; _uiCancelVal = null; _uiGetVal = () => (willReview ? "draft" : "live");
     $("ui-body").innerHTML = `
       <div class="stack" style="gap:10px">
-        <div class="ac-policy-strip" data-state="${res.ai_warning ? "warn" : "ok"}">
+        <div class="ac-policy-strip" data-state="${(res.ai_warning || forcedByGlobal) ? "warn" : "ok"}">
           <div class="ac-policy-copy">
             <b>发现 ${res.candidates || 0} 个候选 · 本次命中 ${items.length} 条（纯预览，未发任何评论）</b>
             <p>${esc(res.note || "所有候选均已按当前筛选与去重条件过滤。")}${res.ai_warning ? ` ⚠️ ${esc(res.ai_warning)}` : ""}</p>
           </div>
         </div>
+        ${forcedByGlobal && !(rule && rule.require_review) ? `<div class="ac-lock-notice">
+          <span>${ep.xhs_manual_only ? "当前小红书评论通道为「仅保存草稿」，正式运行也只会保存草稿。" : "本规则未勾选审核，但「设置 → 采集与运行」已开启小红书全局强制先审，因此仍会先入草稿。"}</span>
+          <button type="button" class="ghost sm" id="ac-prev-open-engine">${ep.xhs_manual_only ? "去修改发送方式 →" : "去关闭全局强制先审 →"}</button>
+        </div>` : ""}
         ${items.length ? `<div class="ac-preview-list">${items.map(it => {
           const [srcLabel, srcCls] = AC_SRC_META[it.content_source] || ["模板", ""];
           return `<div class="ac-preview-item">
@@ -545,15 +681,18 @@ async function previewRule(id) {
             ${it.ai_error ? `<div class="mut" style="color:var(--warn);font-size:11px">AI 提示：${esc(it.ai_error)}</div>` : ""}
           </div>`;
         }).join("")}</div>` : `<div class="empty"><div class="empty-t">本次未命中可生成的目标</div><div class="empty-sub">${esc(res.note || "可检查关键词筛选或近期作品范围")}</div></div>`}
-        ${items.length ? `<div style="display:flex;justify-content:flex-end;gap:8px;padding-top:4px">
-          <button type="button" class="ghost sm" id="ac-prev-run-live">按规则配置正式执行一轮</button>
+        ${items.length && !willReview ? `<div style="display:flex;justify-content:flex-end;gap:8px;padding-top:4px">
+          <button type="button" class="ghost sm" id="ac-prev-run-draft">本次仅存草稿待审</button>
         </div>` : ""}
       </div>`;
-    if ($("ac-prev-run-live")) {
-      $("ac-prev-run-live").onclick = () => { _uiClose("live"); };
+    if ($("ac-prev-run-draft")) {
+      $("ac-prev-run-draft").onclick = () => { _uiClose("draft"); };
     }
-    _uiOpen(`试跑预览 · ${rule ? rule.name : "#" + id}`, "仅抓取与生成样例，不写入队列也不发送。确认满意后再生成草稿或正式运行。", {
-      okText: items.length ? "生成草稿待审" : "关闭",
+    if ($("ac-prev-open-engine")) {
+      $("ac-prev-open-engine").onclick = () => { openAcEngineReviewSettings(ep); };
+    }
+    _uiOpen(`试跑预览 · ${rule ? rule.name : "#" + id}`, "仅抓取与生成样例，不写入队列也不发送。确认满意后再执行本轮。", {
+      okText: items.length ? (willReview ? (res.manual_only ? "生成人工发布草稿" : "生成草稿待审") : "按规则正式执行一轮") : "关闭",
       wide: true,
       icon: "i-sparkles",
     });
@@ -744,6 +883,7 @@ async function delTask(id) {
 }
 window.addEventListener("creatorhub:ai-config:updated", () => refreshAcPolicyMeta());
 window.addEventListener("creatorhub:ai-channels:updated", () => refreshAcPolicyMeta());
+window.addEventListener("creatorhub:engine-settings:updated", () => refreshAcPolicyMeta());
 
 // ─── 统一任务队列 ───
 let TASK_QUEUE_PAGE = 1;
@@ -766,14 +906,26 @@ const TASK_QUEUE_STATE_META = {
 };
 
 function updateTaskQueuePlatformLabel() {
-  const option = $("queue-platform-current");
-  if (option) option.textContent = `当前平台（${PF_NAME[PLATFORM] || PLATFORM}）`;
+  const wrap = $("queue-platform-wrap");
+  if (wrap) wrap.classList.toggle("hidden", !GLOBAL_MODE);
   const select = $("queue-platform");
-  if (select && select._csSync) select._csSync();
+  if (!select) return;
+  if (GLOBAL_MODE) {
+    const prev = select.value;
+    const opts = ['<option value="all">全部平台</option>']
+      .concat(Object.entries(PF_NAME).map(([pf, label]) => `<option value="${esc(pf)}">${esc(label)}</option>`));
+    select.innerHTML = opts.join("");
+    select.value = (prev === "all" || PF_NAME[prev]) ? prev : "all";
+  } else {
+    select.innerHTML = `<option value="${esc(PLATFORM)}">当前平台（${esc(PF_NAME[PLATFORM] || PLATFORM)}）</option>`;
+    select.value = PLATFORM;
+  }
+  if (select._csSync) select._csSync();
 }
 
 function taskQueuePlatform() {
-  const value = $("queue-platform")?.value || "current";
+  if (!GLOBAL_MODE) return PLATFORM;
+  const value = $("queue-platform")?.value || "all";
   return value === "current" ? PLATFORM : value;
 }
 
@@ -789,9 +941,84 @@ function taskQueueDate(value) {
 
 function taskQueueSourceLabel(tab) {
   return ({
-    collections: "采集任务", publish: "发布任务", autocomment: "评论任务",
-    hub: "账号管理", monitors: "作品监控",
+    collections: "关键词采集", publish: "发布任务", autocomment: "评论任务",
+    hub: "账号管理", monitors: "主页作品监控",
   })[tab] || "查看";
+}
+
+function queueProgressTaskKey(item) {
+  const id = Number(item?.id || 0);
+  if (!id) return "";
+  if (item.queue_type === "collections") return `collection:${id}`;
+  if (item.queue_type === "publishes") return `publish:${id}`;
+  if (item.queue_type === "monitor_downloads") return `download:content:${id}`;
+  if (item.queue_type === "collection_downloads") return `download:collection:${id}`;
+  return "";
+}
+
+function renderTaskQueueProgressHtml(item, liveTask = null) {
+  const prog = window.CreatorHubProgress;
+  const p = liveTask
+    ? {
+        percent: liveTask.percent,
+        determinate: !!liveTask.determinate,
+        phase_label: liveTask.phase_label || "",
+        speed_bps: liveTask.speed_bps,
+        eta_seconds: liveTask.eta_seconds,
+        current: liveTask.current,
+        total: liveTask.total,
+        unit: liveTask.unit,
+        status: liveTask.status,
+        next_allowed_at: liveTask.next_allowed_at || item.next_allowed_at,
+      }
+    : (item.progress || null);
+  const st = liveTask?.status === "running"
+    ? "running"
+    : liveTask?.status === "waiting_user" || liveTask?.status === "blocked"
+      ? "blocked"
+      : liveTask?.status === "completed"
+        ? "completed"
+        : liveTask?.status === "failed"
+          ? "failed"
+          : (item.state || "pending");
+  const nextAt = p?.next_allowed_at || item.next_allowed_at;
+  if (st === "blocked" && nextAt) {
+    const cd = prog?.fmtCountdown?.(nextAt) || "等待恢复";
+    const phase = p?.phase_label || "冷却中";
+    return `<div class="queue-progress-cell"><div class="queue-progress-head"><span>${esc(phase)}</span></div><div class="queue-progress-meta progress-num" data-countdown-iso="${esc(nextAt)}">${esc(cd)}</div></div>`;
+  }
+  if (st === "running") {
+    const det = !!(p && p.determinate && p.percent !== null && p.percent !== undefined && Number.isFinite(Number(p.percent)));
+    const pct = det ? Math.max(0, Math.min(100, Math.round(Number(p.percent)))) : null;
+    const bar = prog?.renderProgressBar
+      ? prog.renderProgressBar({ determinate: det, percent: pct, tone: "info", label: item.title || "执行进度", compact: true })
+      : `<div class="progress-track is-compact${det ? "" : " is-indeterminate"}"><div class="progress-fill" style="${det ? `width:${pct}%` : ""}"></div></div>`;
+    const meta = [];
+    if (p?.unit === "bytes" && Number(p.total) > 0) {
+      meta.push(`${prog?.fmtBytes?.(p.current) || ""} / ${prog?.fmtBytes?.(p.total) || ""}`);
+    } else if (p?.unit === "bytes" && Number(p.current) > 0) {
+      meta.push(prog?.fmtBytes?.(p.current) || "");
+    }
+    const spd = p?.speed_bps ? (prog?.fmtSpeed?.(p.speed_bps) || "") : "";
+    if (spd) meta.push(spd);
+    const eta = p?.eta_seconds ? (prog?.fmtEta?.(p.eta_seconds) || "") : "";
+    if (eta) meta.push(eta);
+    return `<div class="queue-progress-cell"><div class="queue-progress-head"><span title="${esc(p?.phase_label || "执行中")}">${esc(p?.phase_label || "执行中")}</span><b class="progress-num">${det ? `${pct}%` : "进行中"}</b></div>${bar}${meta.length ? `<div class="queue-progress-meta progress-num">${esc(meta.join(" · "))}</div>` : ""}</div>`;
+  }
+  if (st === "completed") {
+    return `<div class="queue-progress-cell"><div class="queue-progress-meta">${esc(p?.phase_label || (item.status === "canceled" ? "已取消" : item.status === "skipped" ? "已跳过" : "100% · 已完成"))}</div></div>`;
+  }
+  if (st === "failed") {
+    return `<div class="queue-progress-cell"><div class="queue-progress-meta" style="color:var(--danger)">${esc(p?.phase_label || "执行中断")}</div></div>`;
+  }
+  if (p && p.determinate && Number.isFinite(Number(p.percent)) && Number(p.percent) > 0) {
+    const pct = Math.max(0, Math.min(100, Math.round(Number(p.percent))));
+    const bar = prog?.renderProgressBar
+      ? prog.renderProgressBar({ determinate: true, percent: pct, tone: "warn", label: item.title || "任务进度", compact: true })
+      : `<div class="progress-track is-compact"><div class="progress-fill tone-warn" style="width:${pct}%"></div></div>`;
+    return `<div class="queue-progress-cell"><div class="queue-progress-head"><span>${esc(p.phase_label || "等待继续")}</span><b class="progress-num">${pct}%</b></div>${bar}</div>`;
+  }
+  return `<div class="queue-progress-cell"><div class="queue-progress-meta">${esc(p?.phase_label || "等待调度")}</div></div>`;
 }
 
 function taskQueueRow(item) {
@@ -805,19 +1032,44 @@ function taskQueueRow(item) {
   const reasonClass = item.error && !item.blocked_reason ? " has-error" : "";
   const signal = item.blocked_signal ? `<small>信号：${esc(item.blocked_signal)}</small>` : "";
   const stopKey = `${item.queue_type}:${Number(item.id)}`;
+  const progKey = queueProgressTaskKey(item);
+  const liveTask = progKey ? window.CreatorHubProgress?.getTask?.(progKey) : null;
   const selectable = ["collections", "publishes", "comments", "actions"].includes(item.queue_type)
     && !["done", "canceled", "skipped", "uncertain"].includes(item.status);
-  return `<tr>
+  return `<tr data-queue-key="${esc(stopKey)}"${progKey ? ` data-progress-key="${esc(progKey)}"` : ""}>
     <td><input type="checkbox" class="queue-select" data-queue-type="${esc(item.queue_type)}" data-task-id="${Number(item.id)}" aria-label="选择任务 ${Number(item.id)}" onchange="toggleTaskQueueItem(this)"${selectable ? "" : " disabled"}${TASK_QUEUE_SELECTED.has(stopKey) ? " checked" : ""}></td>
     <td><span class="pill q bare">${esc(item.queue_label)}</span><small class="mut" style="display:block;margin-top:5px">${esc(PF_NAME[item.platform] || item.platform || "—")}</small></td>
     <td><div class="queue-copy"><b title="${esc(item.title)}">${esc(item.title)}</b>${item.detail ? `<small>${esc(item.detail)}</small>` : ""}</div></td>
     <td><div class="queue-account"><b>${esc(account)}</b>${item.account_id ? `<small>ID ${Number(item.account_id)}</small>` : ""}</div></td>
     <td><div class="queue-time">${scheduled || "尽快执行"}${created}</div></td>
     <td><span class="pill ${stateMeta[1]}">${esc(stateMeta[0])}</span><small class="mut" style="display:block;margin-top:5px">${esc(rawStatus)}</small></td>
+    <td class="queue-col-progress" data-queue-prog-cell="${esc(progKey || stopKey)}">${renderTaskQueueProgressHtml(item, liveTask)}</td>
     <td><div class="queue-reason${reasonClass}">${esc(reason)}${signal}${nextAllowed}</div></td>
     <td class="acttd">${item.status === "uncertain" ? `<button type="button" class="ghost sm" onclick="resolveTaskResult(${jsArg(item.queue_type)},${Number(item.id)})">核对结果</button>` : ""}<button type="button" class="ghost sm" onclick="openTaskQueueSource(${jsArg(item.source_tab)})">${esc(taskQueueSourceLabel(item.source_tab))}</button></td>
   </tr>`;
 }
+
+window.addEventListener("creatorhub:progress:update", e => {
+  const task = e?.detail?.task;
+  if (!task || !task.task_key) return;
+  if (typeof CURRENT_TAB !== "undefined" && CURRENT_TAB !== "queue") return;
+  const cells = document.querySelectorAll(`#queue-table td[data-queue-prog-cell]`);
+  for (const cell of cells) {
+    if (cell.dataset.queueProgCell === task.task_key) {
+      cell.innerHTML = renderTaskQueueProgressHtml({ title: task.title, state: task.status, status: task.status, next_allowed_at: task.next_allowed_at }, task);
+    }
+  }
+});
+
+setInterval(() => {
+  if (document.hidden || typeof CURRENT_TAB === "undefined" || CURRENT_TAB !== "queue") return;
+  const prog = window.CreatorHubProgress;
+  if (!prog?.fmtCountdown) return;
+  document.querySelectorAll("#queue-table [data-countdown-iso]").forEach(el => {
+    const iso = el.dataset.countdownIso;
+    if (iso) el.textContent = prog.fmtCountdown(iso) || "即将恢复";
+  });
+}, 1000);
 
 function updateTaskQueueSelection() {
   const button = $("queue-batch-stop");
@@ -927,15 +1179,16 @@ async function refreshTaskQueue(resetPage = false) {
   try {
     const data = await api("/api/task-queue?" + params.toString());
     if (!isCurrent()) return;
-    body.innerHTML = data.items?.length
+    const html = data.items?.length
       ? data.items.map(taskQueueRow).join("")
-      : empty(8, "当前筛选范围内没有任务", "i-inbox", "切换状态或平台范围后再查看");
+      : empty(9, "当前筛选范围内没有任务", "i-inbox", GLOBAL_MODE ? "切换状态或平台范围后再查看" : "切换任务状态或队列类型后再查看");
+    setHtmlIfChanged(body, html);
     updateTaskQueueSelection();
     renderTaskQueueSummary(data.summary || {});
     renderTaskQueuePager(data);
   } catch (e) {
     if (!isCurrent()) return;
-    body.innerHTML = empty(8, "任务队列加载失败", "i-info", e.message || "请稍后重试");
+    setHtmlIfChanged(body, empty(9, "任务队列加载失败", "i-info", e.message || "请稍后重试"));
     if (CURRENT_TAB === "queue") toast("任务队列加载失败：" + e.message, "err");
   } finally {
     TASK_QUEUE_LOADING = false;
@@ -952,8 +1205,8 @@ async function refreshTaskQueueBadge() {
   const isCurrent = beginViewRequest("task-queue-badge");
   TASK_QUEUE_BADGE_LOADING = true;
   try {
-    const params = new URLSearchParams({ platform: GLOBAL_MODE ? "all" : PLATFORM, state: "active", page_size: "1" });
-    const data = await api("/api/task-queue?" + params.toString());
+    const params = new URLSearchParams({ platform: GLOBAL_MODE ? "all" : PLATFORM });
+    const data = await api("/api/task-queue/summary?" + params.toString());
     if (!isCurrent() || CURRENT_TAB === "queue") return;
     globalThis.CreatorHubWorkbench?.queueSummary?.(data.summary || {});
     const badge = $("tb-queue");
@@ -1052,15 +1305,15 @@ $("danmaku-watch-table").innerHTML = skeleton(8);
 $("danmaku-table").innerHTML = skeleton(6);
 $("collection-job-table").innerHTML = collectionTaskSkeleton(3);
 $("collection-content-list").innerHTML = collectionResultSkeleton(4);
-$("queue-table").innerHTML = skeleton(8);
+$("queue-table").innerHTML = skeleton(9);
 
 // restore last-selected platform & global mode BEFORE restoring tab so global-mode tab guards apply cleanly
-PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "rednote", "douyin", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
+PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "rednote", "douyin", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter", "facebook", "youtube"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
 GLOBAL_MODE = (() => { try { const g = localStorage.getItem("dym-global"); return g === null ? true : g === "1"; } catch (e) { return true; } })();
 if ($("queue-platform") && GLOBAL_MODE) $("queue-platform").value = "all";
 
 // restore last-selected section (default: 总览);旧版四个独立页已并入「账号管理」
-const VALID_TABS = ["overview", "media-hub", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "tiktok-tools", "publish", "autocomment", "share-download", "notifications", "settings"];
+const VALID_TABS = ["overview", "media-hub", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "tiktok-tools", "youtube-tools", "publish", "autocomment", "share-download", "notifications", "settings"];
 const LEGACY_HUB_TABS = ["myworks", "following", "fans", "dm"];
 switchTab((() => {
   try {
@@ -1087,8 +1340,9 @@ updateTaskQueuePlatformLabel();
 setupMonitorInterval("t-interval", 300);
 setupMonitorInterval("w-interval", 600);
 setupMonitorInterval("d-w-interval", 0, true);
-onTypeChange(); bindPubFilePicker(); onPubType(); populateWatchAccount(); applyDanmakuForm(); onAcMode(); loadSettings(); refreshAccounts(); refreshBrowserRuntimes(); refreshProxies(); refreshChannels(); loop();
+onTypeChange(); bindPubFilePicker(); onPubType(); populateWatchAccount(); applyDanmakuForm(); resetAcReviewDefaultForPlatform(PLATFORM); onAcMode(); loadSettings(); refreshAccounts(); refreshBrowserRuntimes(); refreshProxies(); refreshChannels(); window.CreatorHubProgress?.start?.(); loop();
 enhanceAllSelects();   // 把所有原生 <select> 升级为美化下拉
+if (typeof syncShareHistoryPlatformControl === "function") syncShareHistoryPlatformControl();
 enhanceAllMetaControls(); // 分组/标签：当前平台词库下拉，可搜索并新增
 enhanceAllDateTime();  // 把 datetime-local 升级为自定义日期选择器
 // 编辑弹窗和异步列表会动态插入控件；统一做渐进增强，避免新旧样式混用。
@@ -1116,9 +1370,11 @@ window.addEventListener("hashchange", () => {
 });
 document.querySelector(".pswitch").addEventListener("keydown", e => {
   if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
-  e.preventDefault();
-  const buttons = [...document.querySelectorAll(".pswitch button")];
+  const buttons = [...document.querySelectorAll('.pswitch button[role="tab"]:not(.ps-overflow-hidden):not(.ps-idle-hidden)')];
+  if (!buttons.length) return;
   let index = buttons.indexOf(document.activeElement);
+  if (index < 0) return;
+  e.preventDefault();
   if (e.key === "Home") index = 0;
   else if (e.key === "End") index = buttons.length - 1;
   else index = (index + (e.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
@@ -1160,6 +1416,7 @@ function launchPlatformLogin(pf, mode = "main") {
   if (pf === "instagram") return startInstagramLogin();
   if (pf === "twitter") return startTwitterLogin();
   if (pf === "facebook") return startFacebookLogin();
+  if (pf === "youtube") return startYouTubeLogin();
   return creator ? startCreatorLogin() : startLogin();
 }
 
@@ -1190,7 +1447,11 @@ window.CreatorHubBridge = {
     refreshAll: () => { refreshAccounts(); refreshProxies(); },
   },
   openQueue(state, allPlatforms = GLOBAL_MODE) {
-    if ($("queue-platform")) { $("queue-platform").value = allPlatforms ? "all" : "current"; $("queue-platform")._csSync?.(); }
+    updateTaskQueuePlatformLabel();
+    if ($("queue-platform")) {
+      $("queue-platform").value = GLOBAL_MODE ? (allPlatforms ? "all" : PLATFORM) : PLATFORM;
+      $("queue-platform")._csSync?.();
+    }
     $("queue-state").value = state; $("queue-state")._csSync?.();
     $("queue-query").value = ""; $("queue-type").value = ""; $("queue-type")._csSync?.();
     TASK_QUEUE_PAGE = 1;

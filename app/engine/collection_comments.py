@@ -1,19 +1,21 @@
 """采集作品入库、媒体下载与各短视频/笔记平台评论抓取持久化。"""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import math
 
 from sqlmodel import select
 
-from app.browser import fetch_channels_comments, fetch_comments, fetch_ks_comments, fetch_xhs_comments
+from app.browser import fetch_comments, fetch_ks_comments, fetch_xhs_comments
 from app.browser.tiktok_fetcher import fetch_tiktok_comments
 from app.db import get_session
 from app.engine.collection_helpers import _content_error_after_download, _media_json, _tiktok_download_session
 from app.engine.monitor_helpers import log
 from app.models import KeywordCollectionComment, KeywordCollectionContent, KeywordCollectionJob
+from app.progress_hub import progress_hub
 from app.platforms.bilibili import cookie_map_from_state as bili_cookie_map
-from app.platforms.channels import ChannelsProtocolClient, flatten_channels_comments, parse_channels_comment
+from app.platforms.channels import ChannelsProtocolClient
 from app.platforms.douyin import DouyinClient, parse_comment, safe_title
 from app.platforms.douyin.extract import Aweme
 from app.platforms.kuaishou import flatten_ks_comments, parse_ks_comment
@@ -81,12 +83,32 @@ class CollectionCommentsMixin:
                         proxy: str, *, account=None, identity=None) -> None:
         if not job.download_media or not aweme.medias or content.download_status == "done":
             return
+        task_key = f"download:collection:{content.id}"
+        title = (content.desc or aweme.desc or f"作品 {content.aweme_id}")[:80]
         with get_session() as session:
             row = session.get(KeywordCollectionContent, content.id)
             if row:
                 row.download_status = "downloading"
                 session.add(row)
                 session.commit()
+        progress_hub.upsert(
+            task_key,
+            immediate=True,
+            category="collection_download",
+            title=title,
+            platform=str(job.platform or ""),
+            account_id=job.account_id,
+            source_tab="collections",
+            status="running",
+            phase="downloading",
+            phase_label="准备下载媒体",
+            detail=f"采集任务 #{job.id} · {content.keyword}",
+            determinate=False,
+            percent=None,
+            unit="bytes",
+            cancelable=False,
+            extra={"job_id": job.id, "content_id": content.id},
+        )
         root = Path(job.download_dir).expanduser() if job.download_dir else \
             Path(self.cfg.engine.media_dir) / "keyword-collections"
         base_dir = root / f"job_{job.id}" / safe_title(content.keyword)
@@ -116,12 +138,74 @@ class CollectionCommentsMixin:
             if account is not None:
                 download_ua = download_ua or str(getattr(account, "ua", "") or "")
             download_referer = "https://www.facebook.com/"
-        ok, local_path, error = await self.downloader.download_aweme(
-            aweme, str(base_dir), routed_proxy,
-            user_agent=download_ua,
-            cookies=download_cookies,
-            referer=download_referer,
-        )
+        elif job.platform == "youtube":
+            if account is not None:
+                from app.platforms.youtube import cookie_map_from_state as yt_cookie_map
+                download_ua = download_ua or str(getattr(account, "ua", "") or "")
+                raw_st = account.storage_state or account.creator_storage_state or account.cookie or ""
+                if raw_st:
+                    download_cookies = yt_cookie_map(raw_st)
+            download_referer = "https://www.youtube.com/"
+
+        def _on_dl_progress(info: dict) -> None:
+            downloaded = int(info.get("downloaded_bytes") or 0)
+            total = int(info.get("total_bytes") or 0)
+            pct = info.get("percent")
+            if pct is None and total > 0:
+                pct = round(min(99.5, downloaded * 100.0 / total), 1)
+            progress_hub.upsert(
+                task_key,
+                category="collection_download",
+                title=title,
+                platform=str(job.platform or ""),
+                account_id=job.account_id,
+                source_tab="collections",
+                status="running",
+                phase=str(info.get("phase") or "downloading"),
+                phase_label=str(info.get("phase_label") or "正在下载媒体"),
+                detail=f"采集任务 #{job.id} · {content.keyword}",
+                determinate=bool(pct is not None),
+                percent=float(pct) if pct is not None else None,
+                current=downloaded,
+                total=total,
+                unit="bytes",
+                speed_bps=info.get("speed_bps"),
+                eta_seconds=info.get("eta_seconds"),
+                cancelable=False,
+                extra={"job_id": job.id, "content_id": content.id},
+            )
+
+        try:
+            ok, local_path, error = await self.downloader.download_aweme(
+                aweme, str(base_dir), routed_proxy,
+                user_agent=download_ua,
+                cookies=download_cookies,
+                referer=download_referer,
+                on_progress=_on_dl_progress,
+            )
+        except asyncio.CancelledError:
+            with get_session() as session:
+                row = session.get(KeywordCollectionContent, content.id)
+                if row and row.download_status == "downloading":
+                    row.download_status = "pending"
+                    session.add(row)
+                    session.commit()
+            progress_hub.upsert(
+                task_key,
+                immediate=True,
+                category="collection_download",
+                title=title,
+                platform=str(job.platform or ""),
+                account_id=job.account_id,
+                source_tab="collections",
+                status="canceled",
+                phase="canceled",
+                phase_label="已取消",
+                determinate=False,
+                percent=None,
+                cancelable=False,
+            )
+            raise
         with get_session() as session:
             row = session.get(KeywordCollectionContent, content.id)
             if row:
@@ -130,6 +214,24 @@ class CollectionCommentsMixin:
                 row.error = _content_error_after_download(row.error, error)
                 session.add(row)
                 session.commit()
+        progress_hub.upsert(
+            task_key,
+            immediate=True,
+            category="collection_download",
+            title=title,
+            platform=str(job.platform or ""),
+            account_id=job.account_id,
+            source_tab="collections",
+            status="completed" if ok else "failed",
+            phase="done" if ok else "failed",
+            phase_label="下载完成" if ok else "下载失败",
+            detail=f"采集任务 #{job.id} · {content.keyword}",
+            error="" if ok else str(error or "下载器未返回成功状态")[:300],
+            determinate=ok,
+            percent=100.0 if ok else None,
+            cancelable=False,
+            extra={"job_id": job.id, "content_id": content.id},
+        )
         if not ok:
             if aweme.cover:
                 thumb_cache.schedule_thumb_prewarm([aweme.cover], platform=job.platform, proxy=routed_proxy)
@@ -289,26 +391,13 @@ class CollectionCommentsMixin:
                                  include_replies: bool, *,
                                  object_nonce_id: str = "",
                                  proto_client: ChannelsProtocolClient | None = None,
-                                 source_type: str = "account_works") -> tuple[list[dict], str]:
+                                 source_type: str = "keyword") -> tuple[list[dict], str]:
         if limit <= 0:
             return [], ""
         mode = self._channels_read_mode()
         max_proto_pages = max(2, min(50, math.ceil(limit / 15) + 2))
         counts_cache = self.__dict__.setdefault("_last_channels_counts", {})
-        if mode == "protocol":
-            if proto_client is None:
-                return [], "视频号原生评论采集尚未连接本机微信通道（请在「设置 → 视频号微信通道」开启一键本地代理或配置 CDP）"
-            comments, audit, err = await proto_client.collect_comments(
-                object_id,
-                object_nonce_id,
-                limit=limit,
-                include_replies=include_replies,
-                max_pages=max_proto_pages,
-            )
-            counts_cache[object_id] = self._extract_channels_audit_counts(audit)
-            return self._dedupe_comments(comments, limit), err
-
-        if mode == "auto" and proto_client is not None:
+        if mode in {"protocol", "auto"} and proto_client is not None:
             comments, audit, proto_err = await proto_client.collect_comments(
                 object_id,
                 object_nonce_id,
@@ -317,29 +406,12 @@ class CollectionCommentsMixin:
                 max_pages=max_proto_pages,
             )
             counts_cache[object_id] = self._extract_channels_audit_counts(audit)
-            if comments or not proto_err or source_type != "account_works":
-                return self._dedupe_comments(comments, limit), proto_err
+            return self._dedupe_comments(comments, limit), proto_err
 
-        if source_type != "account_works":
-            return (
-                [],
-                "非本账号视频号作品评论采集需要连接本机已登录微信（请在「设置 → 视频号微信通道」开启一键本地代理并在微信内打开一次视频号页面）",
-            )
-
-        raw, error = await fetch_channels_comments(
-            self.browser,
-            identity,
-            object_id,
-            set(),
-            max_scrolls=max(1, min(20, math.ceil(limit / 10) + 1)),
-            block_media=self.cfg.engine.block_media_resources,
+        return (
+            [],
+            "视频号关键词作品评论采集需要连接本机已登录微信（请在「设置 → 视频号微信通道」开启一键本地代理并在微信内打开一次视频号页面）",
         )
-        values = flatten_channels_comments(raw) if include_replies else raw
-        parsed = [item for item in
-                  (parse_channels_comment(value) for value in values) if item]
-        if not include_replies:
-            parsed = [item for item in parsed if not item.get("reply_to")]
-        return self._dedupe_comments(parsed, limit), error
 
     async def _tiktok_comments(self, identity, aweme_id: str, limit: int,
                                include_replies: bool, *, author_unique_id: str = "",
